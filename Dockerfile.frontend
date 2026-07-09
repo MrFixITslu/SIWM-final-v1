@@ -1,0 +1,31 @@
+# Stage 1: Build the static frontend assets
+FROM node:20-slim AS builder
+
+WORKDIR /app
+
+# Copy dependency manifests
+COPY package*.json tsconfig.json ./
+
+# Install dependencies (including devDependencies required for Vite and TypeScript builds)
+RUN npm ci
+
+# Copy source files
+COPY . .
+
+# Build the frontend static bundle
+RUN npx vite build
+
+# Stage 2: Serve using Nginx
+FROM nginx:alpine
+
+# Copy built assets to Nginx html directory
+COPY --from=builder /app/dist /usr/share/nginx/html
+
+# Copy Nginx server block configuration
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+
+# Expose port 80 inside the container
+EXPOSE 80
+
+# Start Nginx
+CMD ["nginx", "-g", "daemon off;"]
