@@ -1,0 +1,8 @@
+{
+  "name": "Smart Inventory & Warehouse Management (SIWM)",
+  "description": "A premium warehouse and inventory management platform to track items, categories, suppliers, warehouse layout zones, occupancy levels, and inbound/outbound stock transaction logs.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}

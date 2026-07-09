@@ -1,0 +1,35 @@
+{
+  "name": "siwmfinal",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx server.ts",
+    "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
+    "start": "node dist/server.cjs",
+    "lint": "tsc --noEmit"
+  },
+  "dependencies": {
+    "canvas-confetti": "^1.9.3",
+    "express": "^5.2.1",
+    "lucide-react": "^0.446.0",
+    "pg": "^8.22.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "recharts": "^2.12.7"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.0.0-alpha.30",
+    "@types/canvas-confetti": "^1.6.4",
+    "@types/express": "^5.0.6",
+    "@types/pg": "^8.20.0",
+    "@types/react": "^18.3.10",
+    "@types/react-dom": "^18.3.0",
+    "@vitejs/plugin-react": "^4.3.2",
+    "esbuild": "^0.28.1",
+    "tailwindcss": "^4.0.0-alpha.30",
+    "tsx": "^4.23.0",
+    "typescript": "^5.5.4",
+    "vite": "^5.4.8"
+  }
+}
