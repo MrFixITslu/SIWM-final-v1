@@ -245,7 +245,8 @@ async function startServer() {
 
   if (process.env.NODE_ENV !== 'production') {
     // Integrate Vite as middleware in development
-    const { createServer } = await import('vite');
+    const viteModule = 'vite';
+    const { createServer } = await import(viteModule);
     const vite = await createServer({
       server: { middlewareMode: true },
       appType: 'spa'
