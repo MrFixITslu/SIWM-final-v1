@@ -1,0 +1,27 @@
+version: '3.8'
+
+services:
+  siwm-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: siwm-app
+    restart: unless-stopped
+    ports:
+      - "4000:4000"
+    environment:
+      - NODE_ENV=production
+      - PORT=4000
+      # Use container hostname 'postgres' to connect to the existing PostgreSQL database on 'proxy_network'
+      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/postgres
+      - PGHOST=postgres
+      - PGPORT=5432
+      - PGUSER=postgres
+      - PGPASSWORD=postgres
+      - PGDATABASE=postgres
+    networks:
+      - proxy_network
+
+networks:
+  proxy_network:
+    external: true
