@@ -71,8 +71,8 @@ function authenticateToken(req: any, res: any, next: any) {
 async function startServer() {
   const app = express();
   
-  // Configure the port: runs on PORT (3000) inside AI Studio, but defaults to 4001 in the user's container
-  const PORT = parseInt(process.env.PORT || '4001', 10);
+  // Configure the port: runs on PORT (3000) inside AI Studio
+  const PORT = parseInt(process.env.PORT || '3000', 10);
 
   // Middleware for parsing JSON requests
   app.use(express.json());

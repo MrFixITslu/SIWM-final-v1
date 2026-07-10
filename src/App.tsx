@@ -1015,7 +1015,7 @@ export default function App() {
   const zoneAllocations = zones.map(z => {
     const zoneItems = items.filter(i => i.warehouseLocation.zone.toLowerCase().includes(z.id.toLowerCase()) || i.warehouseLocation.zone.toLowerCase().includes(z.name.toLowerCase()));
     const allocatedQty = zoneItems.reduce((sum, i) => sum + i.quantity, 0);
-    const rate = Math.round((allocatedQty / z.maxCapacity) * 100);
+    const rate = z.maxCapacity > 0 ? Math.round((allocatedQty / z.maxCapacity) * 100) : 0;
     return {
       id: z.id,
       name: z.name,
@@ -1027,7 +1027,7 @@ export default function App() {
 
   const totalCapacity = zones.reduce((sum, z) => sum + z.maxCapacity, 0);
   const totalAllocated = zoneAllocations.reduce((sum, z) => sum + z.allocated, 0);
-  const overallOccupancyRate = Math.round((totalAllocated / totalCapacity) * 100);
+  const overallOccupancyRate = totalCapacity > 0 ? Math.round((totalAllocated / totalCapacity) * 100) : 0;
 
   // Recharts Chart 1: Category breakdown (Stock Value)
   const categoryChartData = categories.map(cat => {

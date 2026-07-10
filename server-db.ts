@@ -99,67 +99,34 @@ export function decryptText(encryptedText: string | null | undefined, warehouseI
 }
 
 // --- Multi-Tenant In-Memory Storage Fallbacks ---
-let memUserWarehouses: any[] = [
-  { user_id: 'usr-demo', warehouse_id: 'wh-demo' }
-];
+let memUserWarehouses: any[] = [];
 
-let memWarehouses: any[] = [
-  { 
-    id: 'wh-demo', 
-    name: 'Demo Central Warehouse', 
-    code: 'DEMO123', 
-    address: '123 Logistics Way, Chicago, IL', 
-    createdAt: new Date().toISOString() 
-  }
-];
+let memWarehouses: any[] = [];
 
-let memUsers: any[] = [
-  { 
-    id: 'usr-demo', 
-    email: 'demo@siwm.org', 
-    passwordHash: '$2a$10$W2G6k18vI.hQO639C0YxXuzX3Uj3m7T0O7jV38kXyV1YxW3G03vIq', // bcrypt hash for 'demo123'
-    name: 'Demo Operator', 
-    warehouseId: 'wh-demo', 
-    provider: 'email', 
-    createdAt: new Date().toISOString() 
-  }
-];
+let memUsers: any[] = [];
 
 // Initialize in-memory arrays with 'wh-demo' mappings for initial seed data
-let memCategories: any[] = INITIAL_CATEGORIES.map(cat => ({
-  ...cat,
-  id: `${cat.id}-wh-demo`,
-  warehouse_id: 'wh-demo'
-}));
+let memCategories: any[] = [];
 
-let memSuppliers: any[] = INITIAL_SUPPLIERS.map(sup => ({
-  ...sup,
-  id: `${sup.id}-wh-demo`,
-  warehouse_id: 'wh-demo'
-}));
+let memSuppliers: any[] = [];
 
-let memZones: any[] = INITIAL_ZONES.map(z => ({
-  ...z,
-  id: `${z.id}-wh-demo`,
-  warehouse_id: 'wh-demo'
-}));
+let memZones: any[] = [];
 
-let memItems: any[] = INITIAL_ITEMS.map(item => ({
-  ...item,
-  id: `${item.id}-wh-demo`,
-  warehouse_id: 'wh-demo',
-  supplierId: item.supplierId ? `${item.supplierId}-wh-demo` : undefined
-}));
+let memItems: any[] = [];
 
-let memTransactions: any[] = INITIAL_TRANSACTIONS.map(tx => ({
-  ...tx,
-  id: `${tx.id}-wh-demo`,
-  warehouse_id: 'wh-demo',
-  itemId: `${tx.itemId}-wh-demo`
-}));
+let memTransactions: any[] = [];
 
 export async function initDb() {
   console.log('Initializing database connectivity...');
+  
+  const hasPgEnv = !!(process.env.DATABASE_URL || process.env.DB_HOST || process.env.PGHOST);
+  if (!hasPgEnv) {
+    console.log('No PostgreSQL environment variables (DATABASE_URL, DB_HOST, PGHOST) detected.');
+    console.log('Immediately falling back to memory-backed multi-tenant storage for sandbox AI Studio preview.\n');
+    usePostgres = false;
+    return;
+  }
+
   console.log(`Database config target: host=${dbConfig.host}:${dbConfig.port}, user=${dbConfig.user}, database=${dbConfig.database}`);
   
   try {
