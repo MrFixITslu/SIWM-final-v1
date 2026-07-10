@@ -1,0 +1,28 @@
+# Backend API container - Express server on port 4001
+
+# ---- Stage 1: build ----
+FROM node:20-slim AS builder
+WORKDIR /app
+
+COPY package*.json tsconfig.json ./
+RUN npm ci
+
+COPY . .
+RUN npx esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs
+
+# ---- Stage 2: production runtime ----
+FROM node:20-slim
+WORKDIR /app
+ENV NODE_ENV=production
+ENV PORT=4001
+
+COPY package*.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+
+COPY --from=builder /app/dist/server.cjs ./dist/server.cjs
+
+RUN chown -R node:node /app
+USER node
+
+EXPOSE 4001
+CMD ["node", "dist/server.cjs"]

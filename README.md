@@ -1,7 +1,8 @@
 # SIWM - Smart Warehouse Management System
 
 A multi-tenant shipping/inventory/warehouse management app. React + Vite
-frontend, Express + PostgreSQL backend, served from a single container.
+frontend (nginx, port 4000) and an Express + PostgreSQL backend (port 4001),
+each in its own container.
 
 ## Local development
 
@@ -29,14 +30,26 @@ See `.env.example` for the full list. The important ones:
 
 ```bash
 cp .env.example .env
-# edit .env: JWT_SECRET, DB_*, PORT to match your existing NPM proxy target
+# edit .env: JWT_SECRET, DATA_ENCRYPTION_SECRET, DB_*
 docker compose up -d --build
 ```
 
-This builds one image (multi-stage `Dockerfile`) that serves the API and the
-built frontend from a single Express process on one port, and runs on the
-external `proxy_network` so Nginx Proxy Manager can reach it by container
-name - no ports are published to the host.
+This builds two images:
+
+- **`siwm-backend`** (`Dockerfile.backend`) - the Express API, port 4001.
+- **`siwm-frontend`** (`Dockerfile.frontend`) - the built Vite assets served
+  by nginx, port 4000. Its `nginx.conf` proxies `/api/` requests to
+  `siwm-backend:4001` internally.
+
+Assumes an existing PostgreSQL container reachable at `postgres:5432` on the
+same `proxy_network` - see `.env.example`.
+
+Both containers run on the external `proxy_network` with no host ports
+published; point your Nginx Proxy Manager host for
+`siwm.v79sl.duckdns.org` at `siwm-frontend:4000`. If you'd rather publish
+port 4000 on the host directly instead of going through NPM's internal
+network, add a `ports:` block to the `siwm-frontend` service in
+`docker-compose.yml`.
 
 ## Starting fresh / clearing existing accounts
 

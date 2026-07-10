@@ -1,23 +1,37 @@
 services:
-  siwm:
+  siwm-backend:
     build:
       context: .
-      dockerfile: Dockerfile
-    container_name: siwm
+      dockerfile: Dockerfile.backend
+    container_name: siwm-backend
     restart: unless-stopped
     env_file:
       - .env
     environment:
       - NODE_ENV=production
-      # If your Nginx Proxy Manager host for siwm.v79sl.duckdns.org already
-      # targets a specific port (e.g. 3060 from an earlier deployment), set
-      # PORT to that same value in .env so you don't have to touch NPM.
-      - PORT=${PORT:-4001}
+      - PORT=4001
     networks:
       - proxy_network
-    # No ports: published to the host on purpose - Nginx Proxy Manager reaches
-    # this container over proxy_network by container name + PORT, the same
-    # pattern used by this operator's other apps (FFPRO, GIBD, Tiquet).
+
+  siwm-frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: siwm-frontend
+    restart: unless-stopped
+    depends_on:
+      - siwm-backend
+    networks:
+      - proxy_network
+    # No host port published on purpose - Nginx Proxy Manager (listening on
+    # 80/443 on the host) reaches this container over proxy_network by
+    # container name (siwm-frontend) + port 4000, the same pattern used by
+    # this operator's other apps. Point your NPM proxy host for
+    # siwm.v79sl.duckdns.org at siwm-frontend:4000.
+    #
+    # If you'd rather publish the port directly on the host instead, add:
+    # ports:
+    #   - "4000:4000"
 
 networks:
   proxy_network:

@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import fs from 'fs';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import { 
@@ -896,12 +897,23 @@ async function startServer() {
     });
     app.use(vite.middlewares);
   } else {
-    // Serve static compiled UI files in production
+    // Serve static compiled UI files in production, if this container has
+    // them. In a split-container deployment (separate frontend/backend
+    // images), this backend container only has dist/server.cjs - the
+    // frontend container serves the built UI instead, so there's nothing to
+    // fall back to here beyond the API routes already registered above.
     const distPath = path.join(process.cwd(), 'dist');
-    app.use(express.static(distPath));
-    app.get('*all', (req, res) => {
-      res.sendFile(path.join(distPath, 'index.html'));
-    });
+    const indexPath = path.join(distPath, 'index.html');
+    if (fs.existsSync(indexPath)) {
+      app.use(express.static(distPath));
+      app.get('*all', (req, res) => {
+        res.sendFile(indexPath);
+      });
+    } else {
+      app.get('*all', (req, res) => {
+        res.status(404).json({ error: 'API server only - no frontend bundled in this container.' });
+      });
+    }
   }
 
   app.listen(PORT, '0.0.0.0', () => {
