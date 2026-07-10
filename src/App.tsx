@@ -25,7 +25,12 @@ import {
   FileText,
   ShoppingBag,
   ExternalLink,
-  RotateCcw
+  RotateCcw,
+  Lock,
+  Building2,
+  KeyRound,
+  Copy,
+  ArrowRight
 } from 'lucide-react';
 import { 
   PieChart, 
@@ -70,9 +75,55 @@ export default function App() {
   const [zones, setZones] = useState<WarehouseZone[]>(INITIAL_ZONES);
   const [loading, setLoading] = useState(true);
 
-  const fetchData = async () => {
+  // --- Authentication & Multi-Tenancy States ---
+  const [token, setToken] = useState<string | null>(() => localStorage.getItem('siwm_token'));
+  const [user, setUser] = useState<any>(() => {
+    const saved = localStorage.getItem('siwm_user');
+    return saved ? JSON.parse(saved) : null;
+  });
+  const [warehouse, setWarehouse] = useState<any>(() => {
+    const saved = localStorage.getItem('siwm_warehouse');
+    return saved ? JSON.parse(saved) : null;
+  });
+
+  // Auth form states
+  const [isRegisterMode, setIsRegisterMode] = useState(false);
+  const [authEmail, setAuthEmail] = useState('');
+  const [authPassword, setAuthPassword] = useState('');
+  const [authName, setAuthName] = useState('');
+  const [warehouseOption, setWarehouseOption] = useState<'create' | 'join'>('create');
+  const [warehouseName, setWarehouseName] = useState('');
+  const [warehouseAddress, setWarehouseAddress] = useState('');
+  const [warehouseCode, setWarehouseCode] = useState('');
+  const [authSubmitting, setAuthSubmitting] = useState(false);
+  const [authError, setAuthError] = useState('');
+
+  const handleLogout = () => {
+    localStorage.removeItem('siwm_token');
+    localStorage.removeItem('siwm_user');
+    localStorage.removeItem('siwm_warehouse');
+    setToken(null);
+    setUser(null);
+    setWarehouse(null);
+    setItems([]);
+    setTransactions([]);
+    setSuppliers([]);
+    setCategories([]);
+    showToast("Signed out securely.", "info");
+  };
+
+  const fetchData = async (activeToken?: string) => {
+    const tokenToUse = activeToken || token;
+    if (!tokenToUse) {
+      setLoading(false);
+      return;
+    }
     try {
-      const res = await fetch('/api/data');
+      const res = await fetch('/api/data', {
+        headers: {
+          'Authorization': `Bearer ${tokenToUse}`
+        }
+      });
       if (res.ok) {
         const data = await res.json();
         setItems(data.items || []);
@@ -80,8 +131,11 @@ export default function App() {
         setSuppliers(data.suppliers || []);
         setCategories(data.categories || []);
         setZones(data.zones || INITIAL_ZONES);
+      } else if (res.status === 401 || res.status === 403) {
+        handleLogout();
+        showToast("Your session has expired. Please sign in again.", "error");
       } else {
-        showToast("Failed to connect to the central Postgres database layer.", "error");
+        showToast("Failed to retrieve your registered warehouse dataset.", "error");
       }
     } catch (err) {
       console.error("Database fetch error:", err);
@@ -92,8 +146,167 @@ export default function App() {
   };
 
   useEffect(() => {
-    fetchData();
-  }, []);
+    if (token) {
+      fetchData();
+    } else {
+      setLoading(false);
+    }
+  }, [token]);
+
+  // --- Auth Handlers ---
+  const [oauthDialog, setOauthDialog] = useState<{ isOpen: boolean; provider: string; step: 'connecting' | 'verifying' | 'complete' }>({
+    isOpen: false,
+    provider: '',
+    step: 'connecting'
+  });
+
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setAuthError('');
+    setAuthSubmitting(true);
+
+    try {
+      if (isRegisterMode) {
+        if (!authEmail || !authPassword || !authName) {
+          setAuthError('Please fill out all required register fields.');
+          setAuthSubmitting(false);
+          return;
+        }
+        if (warehouseOption === 'create' && !warehouseName) {
+          setAuthError('Warehouse designation is required to establish a new tenant space.');
+          setAuthSubmitting(false);
+          return;
+        }
+        if (warehouseOption === 'join' && !warehouseCode) {
+          setAuthError('Warehouse clearance access code is required to join an existing tenant.');
+          setAuthSubmitting(false);
+          return;
+        }
+
+        const res = await fetch('/api/auth/register', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: authEmail,
+            password: authPassword,
+            name: authName,
+            warehouseOption,
+            warehouseName,
+            warehouseAddress,
+            warehouseCode: warehouseCode.toUpperCase().trim()
+          })
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          localStorage.setItem('siwm_token', data.token);
+          localStorage.setItem('siwm_user', JSON.stringify(data.user));
+          localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
+          setToken(data.token);
+          setUser(data.user);
+          setWarehouse(data.warehouse);
+          showToast(`Workspace Established: Welcome to ${data.warehouse.name}`, 'success');
+          confetti({ particleCount: 50, spread: 60 });
+        } else {
+          setAuthError(data.error || 'Failed to complete tenant registration.');
+        }
+      } else {
+        if (!authEmail || !authPassword) {
+          setAuthError('Please enter both your email address and password.');
+          setAuthSubmitting(false);
+          return;
+        }
+        const res = await fetch('/api/auth/login', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            email: authEmail,
+            password: authPassword
+          })
+        });
+
+        const data = await res.json();
+        if (res.ok) {
+          localStorage.setItem('siwm_token', data.token);
+          localStorage.setItem('siwm_user', JSON.stringify(data.user));
+          localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
+          setToken(data.token);
+          setUser(data.user);
+          setWarehouse(data.warehouse);
+          showToast(`Access Granted: Welcome back, ${data.user.name}!`, 'success');
+          confetti({ particleCount: 40, spread: 40 });
+        } else {
+          setAuthError(data.error || 'Invalid authentication credentials.');
+        }
+      }
+    } catch (err) {
+      setAuthError('Unable to connect to central authentication endpoint.');
+    } finally {
+      setAuthSubmitting(false);
+    }
+  };
+
+  const handleOAuthSimulate = (provider: 'google' | 'facebook') => {
+    setOauthDialog({
+      isOpen: true,
+      provider: provider === 'google' ? 'Google Workspace ID' : 'Facebook Secure Access',
+      step: 'connecting'
+    });
+
+    setTimeout(() => {
+      setOauthDialog(prev => ({ ...prev, step: 'verifying' }));
+
+      setTimeout(async () => {
+        try {
+          const mockEmail = provider === 'google' ? 'Vision79SLU@gmail.com' : 'vision.fb.operator@meta-tenant.org';
+          const mockName = provider === 'google' ? 'Vision79 Operator' : 'Facebook Logistics Pro';
+          const mockProviderId = `${provider}-id-${Math.floor(100000 + Math.random() * 900000)}`;
+
+          const payload: any = {
+            email: mockEmail,
+            name: mockName,
+            provider,
+            providerId: mockProviderId
+          };
+
+          if (isRegisterMode) {
+            payload.warehouseOption = warehouseOption;
+            payload.warehouseName = warehouseName || `${mockName}'s Logistics Center`;
+            payload.warehouseAddress = warehouseAddress || 'Global Operations Hub';
+            payload.warehouseCode = warehouseCode.toUpperCase().trim();
+          }
+
+          const res = await fetch('/api/auth/oauth', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload)
+          });
+
+          const data = await res.json();
+          if (res.ok) {
+            localStorage.setItem('siwm_token', data.token);
+            localStorage.setItem('siwm_user', JSON.stringify(data.user));
+            localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
+            setToken(data.token);
+            setUser(data.user);
+            setWarehouse(data.warehouse);
+            setOauthDialog(prev => ({ ...prev, step: 'complete' }));
+            setTimeout(() => {
+              setOauthDialog({ isOpen: false, provider: '', step: 'connecting' });
+              showToast(`Identified via ${provider === 'google' ? 'Google' : 'Facebook'}. Access Granted.`, 'success');
+              confetti({ particleCount: 50, spread: 50 });
+            }, 800);
+          } else {
+            setOauthDialog({ isOpen: false, provider: '', step: 'connecting' });
+            setAuthError(data.error || 'Failed to authenticate via SSO provider.');
+          }
+        } catch (err) {
+          setOauthDialog({ isOpen: false, provider: '', step: 'connecting' });
+          setAuthError('Connection failed validating OAuth credentials.');
+        }
+      }, 1200);
+    }, 1200);
+  };
 
   // --- UI Navigation ---
   const [activeTab, setActiveTab] = useState<'dashboard' | 'inventory' | 'map' | 'history' | 'suppliers'>('dashboard');
@@ -160,7 +373,12 @@ export default function App() {
     if (window.confirm("Are you sure you want to reset all data back to the default warehouse dataset? This will clear and reseed the central Postgres database.")) {
       setLoading(true);
       try {
-        const res = await fetch('/api/reset', { method: 'POST' });
+        const res = await fetch('/api/reset', { 
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        });
         if (res.ok) {
           await fetchData();
           showToast("Warehouse database has been restored to factory defaults", "info");
@@ -254,7 +472,10 @@ export default function App() {
       try {
         const res = await fetch('/api/items', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
           body: JSON.stringify(newItem)
         });
         if (res.ok) {
@@ -294,7 +515,10 @@ export default function App() {
       try {
         const res = await fetch(`/api/items/${editingItem.id}`, {
           method: 'PUT',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`
+          },
           body: JSON.stringify(updatedItem)
         });
         if (res.ok) {
@@ -317,7 +541,12 @@ export default function App() {
     if (window.confirm(`Are you sure you want to decommission "${name}"? This deletes it from active stock tracking.`)) {
       setLoading(true);
       try {
-        const res = await fetch(`/api/items/${id}`, { method: 'DELETE' });
+        const res = await fetch(`/api/items/${id}`, { 
+          method: 'DELETE',
+          headers: {
+            'Authorization': `Bearer ${token}`
+          }
+        });
         if (res.ok) {
           await fetchData();
           showToast(`Product "${name}" has been decommissioned.`, "info");
@@ -363,7 +592,10 @@ export default function App() {
     try {
       const res = await fetch('/api/adjust', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({
           itemId: adjustingItem.id,
           type: adjustForm.type,
@@ -402,7 +634,10 @@ export default function App() {
     try {
       const res = await fetch('/api/restock', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: { 
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
         body: JSON.stringify({ supplierId, itemsToRestock })
       });
       if (res.ok) {
@@ -573,6 +808,333 @@ export default function App() {
     );
   };
 
+  if (loading) {
+    return (
+      <div className="min-h-screen flex flex-col items-center justify-center bg-slate-950 text-slate-100 font-sans" id="siwm_loading_screen">
+        <div className="flex flex-col items-center gap-4">
+          <div className="h-10 w-10 border-4 border-indigo-500 border-t-transparent rounded-full animate-spin"></div>
+          <div className="text-center">
+            <h2 className="text-sm font-bold tracking-wider text-slate-400 uppercase">Synchronizing Network</h2>
+            <p className="text-[10px] text-slate-600 font-mono mt-1">Establishing Secure Pipeline to PostgreSQL...</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  if (!token) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-slate-950 text-slate-200 font-sans p-4 relative overflow-hidden" id="siwm_auth_panel">
+        
+        {/* Subtle background glow blobs */}
+        <div className="absolute top-1/4 left-1/4 -translate-x-1/2 -translate-y-1/2 w-[500px] h-[500px] bg-indigo-500/10 rounded-full blur-[120px] pointer-events-none" id="bg_glow_1" />
+        <div className="absolute bottom-1/4 right-1/4 translate-x-1/2 translate-y-1/2 w-[500px] h-[500px] bg-blue-500/10 rounded-full blur-[120px] pointer-events-none" id="bg_glow_2" />
+
+        <div className="max-w-5xl w-full bg-slate-900 border border-slate-800/80 rounded-3xl overflow-hidden shadow-2xl flex flex-col md:flex-row relative z-10" id="auth_container">
+          
+          {/* Left Column - Tech graphic panel */}
+          <div className="w-full md:w-[42%] bg-gradient-to-b from-indigo-950/60 to-slate-950 p-8 flex flex-col justify-between border-b md:border-b-0 md:border-r border-slate-800/80" id="auth_left_col">
+            <div>
+              <div className="flex items-center gap-3 mb-8">
+                <div className="p-2.5 rounded-xl bg-indigo-600 text-white shadow-lg shadow-indigo-600/20">
+                  <Package className="h-6 w-6" />
+                </div>
+                <div>
+                  <h1 className="text-base font-bold text-white tracking-tight">SIWM Systems</h1>
+                  <p className="text-[10px] text-indigo-400 font-semibold tracking-wider uppercase">Smart Warehouse Suite</p>
+                </div>
+              </div>
+
+              <div className="space-y-6">
+                <div>
+                  <h2 className="text-lg font-bold text-white tracking-tight font-sans">Enterprise Multi-Tenancy</h2>
+                  <p className="text-xs text-slate-400 mt-1.5 leading-relaxed font-sans">
+                    Access dedicated, isolated tenant database compartments secure with end-to-end industry standards. Ensure physical tracking precision.
+                  </p>
+                </div>
+
+                <div className="space-y-4 pt-2">
+                  <div className="flex items-start gap-3">
+                    <div className="p-1.5 rounded-lg bg-indigo-500/10 text-indigo-400 mt-0.5">
+                      <Check className="h-3.5 w-3.5" />
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-bold text-slate-200">Database Level Isolation</h4>
+                      <p className="text-[11px] text-slate-450 mt-0.5">All entities mapped strictly with relational warehouse IDs.</p>
+                    </div>
+                  </div>
+                  <div className="flex items-start gap-3">
+                    <div className="p-1.5 rounded-lg bg-indigo-500/10 text-indigo-400 mt-0.5">
+                      <Check className="h-3.5 w-3.5" />
+                    </div>
+                    <div>
+                      <h4 className="text-xs font-bold text-slate-200">Federated Identity Login</h4>
+                      <p className="text-[11px] text-slate-450 mt-0.5">Fully integrated authentication with standard single-sign-on.</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+
+            <div className="pt-8 border-t border-slate-800/60 flex items-center justify-between text-[10px] text-slate-500 font-mono">
+              <span>STATUS: ONLINE</span>
+              <span>VER 4.1.0</span>
+            </div>
+          </div>
+
+          {/* Right Column - Interaction Auth Form */}
+          <div className="w-full md:w-[58%] p-8 md:p-10 flex flex-col justify-center" id="auth_right_col">
+            <div className="mb-6">
+              <h2 className="text-xl font-bold text-white tracking-tight">
+                {isRegisterMode ? 'Establish Your Warehouse Tenant' : 'Operator Secure Access'}
+              </h2>
+              <p className="text-xs text-slate-400 mt-1">
+                {isRegisterMode 
+                  ? 'Sign up to create your isolated tenant warehouse space or join an active hub.' 
+                  : 'Enter your credentials to connect with your registered warehouse database.'}
+              </p>
+            </div>
+
+            {authError && (
+              <div className="mb-5 p-3.5 rounded-xl bg-rose-500/10 border border-rose-500/25 text-rose-300 text-xs flex items-center gap-3" id="auth_error_box">
+                <AlertTriangle className="h-5 w-5 text-rose-400 shrink-0" />
+                <span>{authError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleEmailAuth} className="space-y-4">
+              {isRegisterMode && (
+                <div>
+                  <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">Full Operator Name</label>
+                  <div className="relative">
+                    <Users className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
+                    <input 
+                      id="auth_input_name"
+                      type="text"
+                      required
+                      placeholder="e.g. Alexis Vance"
+                      value={authName}
+                      onChange={(e) => setAuthName(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-xl py-2.5 pl-10 pr-4 text-xs text-slate-200 focus:ring-1 focus:ring-indigo-500 outline-none transition"
+                    />
+                  </div>
+                </div>
+              )}
+
+              <div>
+                <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">Operator Email</label>
+                <div className="relative">
+                  <Mail className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
+                  <input 
+                    id="auth_input_email"
+                    type="email"
+                    required
+                    placeholder="email@example.com"
+                    value={authEmail}
+                    onChange={(e) => setAuthEmail(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl py-2.5 pl-10 pr-4 text-xs text-slate-200 focus:ring-1 focus:ring-indigo-500 outline-none transition"
+                  />
+                </div>
+              </div>
+
+              <div>
+                <label className="text-[11px] font-bold text-slate-400 uppercase tracking-wider block mb-1.5">Security Password</label>
+                <div className="relative">
+                  <Lock className="absolute left-3.5 top-1/2 -translate-y-1/2 h-4 w-4 text-slate-500" />
+                  <input 
+                    id="auth_input_password"
+                    type="password"
+                    required
+                    placeholder="••••••••••••"
+                    value={authPassword}
+                    onChange={(e) => setAuthPassword(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-xl py-2.5 pl-10 pr-4 text-xs text-slate-200 focus:ring-1 focus:ring-indigo-500 outline-none transition"
+                  />
+                </div>
+              </div>
+
+              {/* Tenant Configuration Settings (Registration Only) */}
+              {isRegisterMode && (
+                <div className="p-4 bg-slate-950/60 border border-slate-800/80 rounded-xl space-y-4 mt-2" id="tenant_config_box">
+                  <div>
+                    <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-wider block mb-2">Workspace Tenancy Option</span>
+                    <div className="grid grid-cols-2 gap-2">
+                      <button
+                        id="btn_select_create_wh"
+                        type="button"
+                        onClick={() => setWarehouseOption('create')}
+                        className={`py-2 px-3 rounded-lg font-bold text-[11px] border transition flex items-center justify-center gap-2 ${
+                          warehouseOption === 'create'
+                            ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
+                            : 'bg-slate-900 text-slate-500 border-slate-800 hover:text-slate-300'
+                        }`}
+                      >
+                        <Building2 className="h-3.5 w-3.5" />
+                        Create Workspace
+                      </button>
+                      <button
+                        id="btn_select_join_wh"
+                        type="button"
+                        onClick={() => setWarehouseOption('join')}
+                        className={`py-2 px-3 rounded-lg font-bold text-[11px] border transition flex items-center justify-center gap-2 ${
+                          warehouseOption === 'join'
+                            ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
+                            : 'bg-slate-900 text-slate-500 border-slate-800 hover:text-slate-300'
+                        }`}
+                      >
+                        <KeyRound className="h-3.5 w-3.5" />
+                        Join Workspace
+                      </button>
+                    </div>
+                  </div>
+
+                  {warehouseOption === 'create' ? (
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3" id="create_wh_fields">
+                      <div>
+                        <label className="text-[9px] font-bold text-slate-500 uppercase tracking-wider block mb-1">Warehouse Designation *</label>
+                        <input 
+                          id="wh_input_name"
+                          type="text"
+                          required={warehouseOption === 'create'}
+                          placeholder="e.g. Chicago Central Hub"
+                          value={warehouseName}
+                          onChange={(e) => setWarehouseName(e.target.value)}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-[11px] text-slate-200 outline-none focus:border-indigo-500"
+                        />
+                      </div>
+                      <div>
+                        <label className="text-[9px] font-bold text-slate-500 uppercase tracking-wider block mb-1">Physical Address</label>
+                        <input 
+                          id="wh_input_address"
+                          type="text"
+                          placeholder="e.g. 4820 Loomis Blvd, IL"
+                          value={warehouseAddress}
+                          onChange={(e) => setWarehouseAddress(e.target.value)}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-[11px] text-slate-200 outline-none focus:border-indigo-500"
+                        />
+                      </div>
+                    </div>
+                  ) : (
+                    <div id="join_wh_fields">
+                      <label className="text-[9px] font-bold text-slate-500 uppercase tracking-wider block mb-1">Clearance Access Code (6 Digits) *</label>
+                      <input 
+                        id="wh_input_code"
+                        type="text"
+                        required={warehouseOption === 'join'}
+                        placeholder="e.g. WH-104928"
+                        maxLength={9}
+                        value={warehouseCode}
+                        onChange={(e) => setWarehouseCode(e.target.value)}
+                        className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-[11px] text-slate-250 outline-none focus:border-indigo-500 font-mono text-center tracking-wider"
+                      />
+                    </div>
+                  )}
+                </div>
+              )}
+
+              <button
+                id="btn_submit_auth"
+                type="submit"
+                disabled={authSubmitting}
+                className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-800 text-white font-bold text-xs rounded-xl shadow-lg transition flex items-center justify-center gap-2 mt-4"
+              >
+                {authSubmitting ? (
+                  <span className="h-4 w-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                ) : (
+                  <>
+                    <span>{isRegisterMode ? 'Verify & Launch Space' : 'Establish Operational Access'}</span>
+                    <ArrowRight className="h-4 w-4" />
+                  </>
+                )}
+              </button>
+            </form>
+
+            {/* Social SSO Authentication divider */}
+            <div className="relative my-6">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-slate-800"></div>
+              </div>
+              <div className="relative flex justify-center text-xs">
+                <span className="bg-slate-900 px-3 text-slate-500 font-medium uppercase tracking-wider">Or Access Securely Via SSO</span>
+              </div>
+            </div>
+
+            {/* SSO buttons */}
+            <div className="grid grid-cols-2 gap-3">
+              <button
+                id="btn_sso_google"
+                type="button"
+                onClick={() => handleOAuthSimulate('google')}
+                className="py-2.5 px-4 bg-slate-950 hover:bg-slate-950/85 border border-slate-800 rounded-xl text-slate-300 font-semibold text-xs flex items-center justify-center gap-2.5 transition"
+              >
+                <svg className="h-4 w-4" viewBox="0 0 24 24">
+                  <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                  <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                  <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l3.66-2.85z" />
+                  <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.85c.87-2.6 3.3-4.53 6.16-4.53z" />
+                </svg>
+                Google Portal
+              </button>
+              <button
+                id="btn_sso_facebook"
+                type="button"
+                onClick={() => handleOAuthSimulate('facebook')}
+                className="py-2.5 px-4 bg-slate-950 hover:bg-slate-950/85 border border-slate-800 rounded-xl text-slate-300 font-semibold text-xs flex items-center justify-center gap-2.5 transition"
+              >
+                <svg className="h-4 w-4 text-[#1877F2]" fill="currentColor" viewBox="0 0 24 24">
+                  <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z" />
+                </svg>
+                Meta Identity
+              </button>
+            </div>
+
+            {/* Toggle Mode */}
+            <div className="mt-8 text-center text-xs">
+              <button
+                id="btn_toggle_auth_mode"
+                type="button"
+                onClick={() => {
+                  setIsRegisterMode(!isRegisterMode);
+                  setAuthError('');
+                }}
+                className="text-indigo-400 hover:text-indigo-300 font-semibold transition"
+              >
+                {isRegisterMode 
+                  ? 'Already have an active operator slot? Log In' 
+                  : 'New operator team? Establish Warehouse Tenant'}
+              </button>
+            </div>
+
+          </div>
+        </div>
+
+        {/* OAuth Loading Popup Modal */}
+        {oauthDialog.isOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/90 backdrop-blur-md p-4 animate-fade-in" id="oauth_loading_modal">
+            <div className="bg-slate-900 border border-slate-800/80 rounded-2xl max-w-sm w-full p-6 text-center shadow-2xl relative">
+              <div className="mx-auto h-12 w-12 rounded-full bg-indigo-500/10 flex items-center justify-center text-indigo-400 mb-4">
+                {oauthDialog.step === 'complete' ? (
+                  <Check className="h-6 w-6 text-emerald-400 animate-bounce" />
+                ) : (
+                  <div className="h-5 w-5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
+                )}
+              </div>
+              <h3 className="text-sm font-bold text-white mb-2 uppercase tracking-wide">
+                {oauthDialog.step === 'connecting' ? 'Contacting Provider' : oauthDialog.step === 'verifying' ? 'Verifying Credentials' : 'Access Approved'}
+              </h3>
+              <p className="text-xs text-slate-400 leading-relaxed">
+                {oauthDialog.step === 'connecting' && `Connecting secure link to ${oauthDialog.provider}...`}
+                {oauthDialog.step === 'verifying' && `Validating secure session with ${oauthDialog.provider}...`}
+                {oauthDialog.step === 'complete' && 'Establishing secure connection tunnel.'}
+              </p>
+            </div>
+          </div>
+        )}
+
+      </div>
+    );
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-slate-900 text-slate-100 font-sans antialiased" id="siwm_root_app">
       
@@ -606,14 +1168,38 @@ export default function App() {
             </div>
 
             {/* Operator/Environment Quick Stats */}
-            <div className="p-4 mx-4 my-3 rounded-xl bg-slate-900/60 border border-slate-800/80" id="siwm_operator_badge">
-              <div className="flex items-center gap-2 text-xs text-slate-400">
-                <Clock className="h-3.5 w-3.5 text-indigo-400 shrink-0" />
-                <span className="truncate font-mono">2026-07-09 14:58:30 UTC</span>
+            <div className="p-4 mx-4 my-3 rounded-xl bg-slate-900/60 border border-slate-800/80 space-y-2.5" id="siwm_operator_badge">
+              <div className="border-b border-slate-800/60 pb-2">
+                <span className="text-[9px] font-bold text-indigo-400 tracking-wider uppercase block mb-1">Active Operator</span>
+                <span className="text-xs font-bold text-slate-200 block truncate">{user?.name || 'Alexis Vance'}</span>
+                <span className="text-[10px] text-slate-500 block truncate font-mono">{user?.email || 'email@example.com'}</span>
               </div>
-              <div className="mt-1.5 flex items-center gap-2 text-xs text-slate-400">
-                <Users className="h-3.5 w-3.5 text-indigo-400 shrink-0" />
-                <span className="truncate font-medium">{`Vision79SLU@gmail.com`}</span>
+              <div>
+                <span className="text-[9px] font-bold text-indigo-400 tracking-wider uppercase block mb-1">Secure Tenancy Space</span>
+                <span className="text-xs font-bold text-slate-200 block truncate">{warehouse?.name || 'Operations Hub'}</span>
+                {warehouse?.address && (
+                  <span className="text-[10px] text-slate-500 block truncate mt-0.5">{warehouse.address}</span>
+                )}
+              </div>
+              <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-850 flex items-center justify-between gap-1">
+                <div>
+                  <span className="text-[8px] font-bold text-slate-500 uppercase block">Share Code</span>
+                  <span className="text-xs font-bold text-emerald-400 font-mono tracking-wider">{warehouse?.code || 'WH-XXXXXX'}</span>
+                </div>
+                <button
+                  id="btn_copy_wh_code"
+                  type="button"
+                  onClick={() => {
+                    if (warehouse?.code) {
+                      navigator.clipboard.writeText(warehouse.code);
+                      showToast(`Clearance Code ${warehouse.code} copied! Share with team members to join.`, 'success');
+                    }
+                  }}
+                  className="p-1.5 rounded bg-slate-900 hover:bg-slate-850 border border-slate-800 hover:text-white transition text-slate-400 animate-scale-up"
+                  title="Copy Clearance Access Code"
+                >
+                  <Copy className="h-3.5 w-3.5" />
+                </button>
               </div>
             </div>
 
@@ -706,14 +1292,15 @@ export default function App() {
           </div>
 
           {/* Sidebar Footer System Status */}
-          <div className="p-4 border-t border-slate-800" id="siwm_sidebar_footer">
-            <div className="flex items-center justify-between text-xs text-slate-500 mb-3">
-              <span>Database Instance: {loading ? 'SYNCING...' : 'POSTGRESQL'}</span>
+          <div className="p-4 border-t border-slate-800 space-y-2" id="siwm_sidebar_footer">
+            <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1">
+              <span>Tenant Isolation:</span>
               <span className="flex items-center gap-1">
-                <span className={`h-1.5 w-1.5 rounded-full ${loading ? 'bg-amber-500' : 'bg-emerald-500'} animate-ping`}></span>
-                <span className={`${loading ? 'text-amber-400' : 'text-emerald-400'} font-semibold uppercase`}>{loading ? 'SYNCING' : 'ONLINE'}</span>
+                <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-ping"></span>
+                <span className="text-emerald-400 font-bold uppercase tracking-wider text-[10px]">SECURE</span>
               </span>
             </div>
+            
             <button 
               id="btn_restore_data"
               onClick={handleResetData}
@@ -721,6 +1308,16 @@ export default function App() {
             >
               <RotateCcw className="h-3 w-3" />
               Reset Warehouse Data
+            </button>
+
+            <button 
+              id="btn_signout_operator"
+              type="button"
+              onClick={handleLogout}
+              className="w-full flex items-center justify-center gap-2 py-2 px-3 text-xs bg-indigo-950/40 hover:bg-indigo-900/30 border border-indigo-900/30 rounded-lg hover:text-indigo-200 transition text-slate-400 font-semibold"
+            >
+              <Lock className="h-3 w-3" />
+              Sign Out Operator
             </button>
           </div>
         </aside>

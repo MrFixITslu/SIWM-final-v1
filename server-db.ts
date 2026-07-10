@@ -9,8 +9,6 @@ import {
 
 const { Pool } = pg;
 
-// Connection options
-// Default host is set to "postgres" as the database container is on the "proxy_network" docker network.
 const connectionString = process.env.DATABASE_URL;
 const dbConfig = {
   host: process.env.PGHOST || process.env.DB_HOST || 'postgres',
@@ -23,12 +21,61 @@ const dbConfig = {
 let pool: any = null;
 let usePostgres = false;
 
-// In-Memory Backups (Fallback for sandbox environment)
-let memItems = [...INITIAL_ITEMS];
-let memTransactions = [...INITIAL_TRANSACTIONS];
-let memSuppliers = [...INITIAL_SUPPLIERS];
-let memCategories = [...INITIAL_CATEGORIES];
-let memZones = [...INITIAL_ZONES];
+// --- Multi-Tenant In-Memory Storage Fallbacks ---
+let memWarehouses: any[] = [
+  { 
+    id: 'wh-demo', 
+    name: 'Demo Central Warehouse', 
+    code: 'DEMO123', 
+    address: '123 Logistics Way, Chicago, IL', 
+    createdAt: new Date().toISOString() 
+  }
+];
+
+let memUsers: any[] = [
+  { 
+    id: 'usr-demo', 
+    email: 'demo@siwm.org', 
+    passwordHash: '$2a$10$W2G6k18vI.hQO639C0YxXuzX3Uj3m7T0O7jV38kXyV1YxW3G03vIq', // bcrypt hash for 'demo123'
+    name: 'Demo Operator', 
+    warehouseId: 'wh-demo', 
+    provider: 'email', 
+    createdAt: new Date().toISOString() 
+  }
+];
+
+// Initialize in-memory arrays with 'wh-demo' mappings for initial seed data
+let memCategories: any[] = INITIAL_CATEGORIES.map(cat => ({
+  ...cat,
+  id: `${cat.id}-wh-demo`,
+  warehouse_id: 'wh-demo'
+}));
+
+let memSuppliers: any[] = INITIAL_SUPPLIERS.map(sup => ({
+  ...sup,
+  id: `${sup.id}-wh-demo`,
+  warehouse_id: 'wh-demo'
+}));
+
+let memZones: any[] = INITIAL_ZONES.map(z => ({
+  ...z,
+  id: `${z.id}-wh-demo`,
+  warehouse_id: 'wh-demo'
+}));
+
+let memItems: any[] = INITIAL_ITEMS.map(item => ({
+  ...item,
+  id: `${item.id}-wh-demo`,
+  warehouse_id: 'wh-demo',
+  supplierId: item.supplierId ? `${item.supplierId}-wh-demo` : undefined
+}));
+
+let memTransactions: any[] = INITIAL_TRANSACTIONS.map(tx => ({
+  ...tx,
+  id: `${tx.id}-wh-demo`,
+  warehouse_id: 'wh-demo',
+  itemId: `${tx.itemId}-wh-demo`
+}));
 
 export async function initDb() {
   console.log('Initializing database connectivity...');
@@ -50,55 +97,86 @@ export async function initDb() {
     await runMigrations();
   } catch (err: any) {
     console.warn('\n⚠️ WARNING: PostgreSQL connection failed or timed out:', err.message);
-    console.warn('Falling back to memory-backed cache storage for sandboxed AI Studio preview.');
-    console.warn('When deployed in docker network "proxy_network", it will connect to Postgres automatically.\n');
+    console.warn('Falling back to memory-backed multi-tenant storage for sandbox AI Studio preview.\n');
     usePostgres = false;
   }
 }
 
 async function runMigrations() {
-  console.log('Verifying PostgreSQL schema tables...');
+  console.log('Verifying PostgreSQL schema tables for multi-tenancy...');
   
-  // 1. Categories
+  // 1. Warehouses Table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS warehouses (
+      id VARCHAR(50) PRIMARY KEY,
+      name VARCHAR(100) NOT NULL,
+      code VARCHAR(50) NOT NULL UNIQUE,
+      address TEXT,
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // 2. Users Table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS users (
+      id VARCHAR(50) PRIMARY KEY,
+      email VARCHAR(150) NOT NULL UNIQUE,
+      password_hash TEXT,
+      name VARCHAR(100),
+      warehouse_id VARCHAR(50) REFERENCES warehouses(id) ON DELETE SET NULL,
+      provider VARCHAR(20) NOT NULL DEFAULT 'email',
+      provider_id VARCHAR(100),
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // 3. Categories Table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS categories (
       id VARCHAR(50) PRIMARY KEY,
-      name VARCHAR(100) NOT NULL UNIQUE,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      name VARCHAR(100) NOT NULL,
       description TEXT,
-      color VARCHAR(50)
+      color VARCHAR(50),
+      UNIQUE(warehouse_id, name)
     )
   `);
 
-  // 2. Suppliers
+  // 4. Suppliers Table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS suppliers (
       id VARCHAR(50) PRIMARY KEY,
-      name VARCHAR(100) NOT NULL UNIQUE,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      name VARCHAR(100) NOT NULL,
       contact_name VARCHAR(100),
       email VARCHAR(150),
       phone VARCHAR(50),
-      address TEXT
+      address TEXT,
+      UNIQUE(warehouse_id, name)
     )
   `);
 
-  // 3. Zones
+  // 5. Zones Table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS zones (
       id VARCHAR(50) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
       name VARCHAR(100) NOT NULL,
       description TEXT,
       max_capacity INT,
-      color VARCHAR(50)
+      color VARCHAR(50),
+      UNIQUE(warehouse_id, name)
     )
   `);
 
-  // 4. Items
+  // 6. Items Table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS items (
       id VARCHAR(50) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
       name VARCHAR(255) NOT NULL,
-      sku VARCHAR(100) NOT NULL UNIQUE,
-      category VARCHAR(100) REFERENCES categories(name) ON UPDATE CASCADE,
+      sku VARCHAR(100) NOT NULL,
+      category VARCHAR(100) NOT NULL,
       quantity INT NOT NULL DEFAULT 0,
       unit VARCHAR(50) NOT NULL DEFAULT 'pcs',
       price DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
@@ -109,14 +187,16 @@ async function runMigrations() {
       supplier_id VARCHAR(50) REFERENCES suppliers(id) ON DELETE SET NULL,
       min_threshold INT NOT NULL DEFAULT 10,
       last_updated TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-      notes TEXT
+      notes TEXT,
+      UNIQUE(warehouse_id, sku)
     )
   `);
 
-  // 5. Transactions
+  // 7. Transactions Table
   await pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
       id VARCHAR(50) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
       item_id VARCHAR(50),
       item_name VARCHAR(255) NOT NULL,
       sku VARCHAR(100) NOT NULL,
@@ -128,105 +208,295 @@ async function runMigrations() {
     )
   `);
 
-  // Seed data if empty
-  const catCheck = await pool.query('SELECT COUNT(*) FROM categories');
-  if (parseInt(catCheck.rows[0].count, 10) === 0) {
-    console.log('Seeding initial categories...');
-    for (const cat of INITIAL_CATEGORIES) {
-      await pool.query(
-        'INSERT INTO categories (id, name, description, color) VALUES ($1, $2, $3, $4)',
-        [cat.id, cat.name, cat.description, cat.color]
-      );
-    }
+  // Ensure default demo warehouse exists
+  const whCheck = await pool.query("SELECT COUNT(*) FROM warehouses WHERE id = 'wh-demo'");
+  if (parseInt(whCheck.rows[0].count, 10) === 0) {
+    console.log('Seeding default central warehouse (wh-demo)...');
+    await pool.query(
+      "INSERT INTO warehouses (id, name, code, address) VALUES ($1, $2, $3, $4)",
+      ['wh-demo', 'Demo Central Warehouse', 'DEMO123', '123 Logistics Way, Chicago, IL']
+    );
   }
 
-  const supCheck = await pool.query('SELECT COUNT(*) FROM suppliers');
-  if (parseInt(supCheck.rows[0].count, 10) === 0) {
-    console.log('Seeding initial suppliers...');
-    for (const s of INITIAL_SUPPLIERS) {
-      await pool.query(
-        'INSERT INTO suppliers (id, name, contact_name, email, phone, address) VALUES ($1, $2, $3, $4, $5, $6)',
-        [s.id, s.name, s.contactName, s.email, s.phone, s.address]
-      );
-    }
+  // Ensure default demo user exists
+  const userCheck = await pool.query("SELECT COUNT(*) FROM users WHERE email = 'demo@siwm.org'");
+  if (parseInt(userCheck.rows[0].count, 10) === 0) {
+    console.log('Seeding default demo user (demo@siwm.org)...');
+    await pool.query(
+      "INSERT INTO users (id, email, password_hash, name, warehouse_id, provider) VALUES ($1, $2, $3, $4, $5, $6)",
+      ['usr-demo', 'demo@siwm.org', '$2a$10$W2G6k18vI.hQO639C0YxXuzX3Uj3m7T0O7jV38kXyV1YxW3G03vIq', 'Demo Operator', 'wh-demo', 'email']
+    );
   }
 
-  const zoneCheck = await pool.query('SELECT COUNT(*) FROM zones');
-  if (parseInt(zoneCheck.rows[0].count, 10) === 0) {
-    console.log('Seeding initial zones...');
-    for (const z of INITIAL_ZONES) {
-      await pool.query(
-        'INSERT INTO zones (id, name, description, max_capacity, color) VALUES ($1, $2, $3, $4, $5)',
-        [z.id, z.name, z.description, z.maxCapacity, z.color]
-      );
-    }
-  }
-
-  const itemCheck = await pool.query('SELECT COUNT(*) FROM items');
-  if (parseInt(itemCheck.rows[0].count, 10) === 0) {
-    console.log('Seeding initial inventory items...');
-    for (const item of INITIAL_ITEMS) {
-      await pool.query(
-        `INSERT INTO items (id, name, sku, category, quantity, unit, price, zone, aisle, shelf, bin, supplier_id, min_threshold, last_updated, notes) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
-        [
-          item.id,
-          item.name,
-          item.sku,
-          item.category,
-          item.quantity,
-          item.unit,
-          item.price,
-          item.warehouseLocation.zone,
-          item.warehouseLocation.aisle,
-          item.warehouseLocation.shelf,
-          item.warehouseLocation.bin,
-          item.supplierId,
-          item.minThreshold,
-          item.lastUpdated,
-          item.notes || ''
-        ]
-      );
-    }
-  }
-
-  const txCheck = await pool.query('SELECT COUNT(*) FROM transactions');
-  if (parseInt(txCheck.rows[0].count, 10) === 0) {
-    console.log('Seeding initial stock transactions...');
-    for (const tx of INITIAL_TRANSACTIONS) {
-      await pool.query(
-        `INSERT INTO transactions (id, item_id, item_name, sku, type, quantity, reason, timestamp, operator) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-        [
-          tx.id,
-          tx.itemId,
-          tx.itemName,
-          tx.sku,
-          tx.type,
-          tx.quantity,
-          tx.reason,
-          tx.timestamp,
-          tx.operator
-        ]
-      );
-    }
-  }
-
+  // Seed default dataset for demo warehouse
+  await seedWarehouseData('wh-demo');
   console.log('PostgreSQL database migration and seed completed successfully.');
 }
 
-// DB Query Methods
-export async function getCategories() {
+// --- Dynamic Warehouse Seeding ---
+export async function seedWarehouseData(warehouseId: string) {
   if (usePostgres) {
-    const res = await pool.query('SELECT * FROM categories');
-    return res.rows;
+    // Categories
+    const catCheck = await pool.query('SELECT COUNT(*) FROM categories WHERE warehouse_id = $1', [warehouseId]);
+    if (parseInt(catCheck.rows[0].count, 10) === 0) {
+      console.log(`Seeding categories for warehouse ${warehouseId}...`);
+      for (const cat of INITIAL_CATEGORIES) {
+        await pool.query(
+          'INSERT INTO categories (id, warehouse_id, name, description, color) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING',
+          [`${cat.id}-${warehouseId}`, warehouseId, cat.name, cat.description, cat.color]
+        );
+      }
+    }
+
+    // Suppliers
+    const supCheck = await pool.query('SELECT COUNT(*) FROM suppliers WHERE warehouse_id = $1', [warehouseId]);
+    if (parseInt(supCheck.rows[0].count, 10) === 0) {
+      console.log(`Seeding suppliers for warehouse ${warehouseId}...`);
+      for (const s of INITIAL_SUPPLIERS) {
+        await pool.query(
+          'INSERT INTO suppliers (id, warehouse_id, name, contact_name, email, phone, address) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING',
+          [`${s.id}-${warehouseId}`, warehouseId, s.name, s.contactName, s.email, s.phone, s.address]
+        );
+      }
+    }
+
+    // Zones
+    const zoneCheck = await pool.query('SELECT COUNT(*) FROM zones WHERE warehouse_id = $1', [warehouseId]);
+    if (parseInt(zoneCheck.rows[0].count, 10) === 0) {
+      console.log(`Seeding zones for warehouse ${warehouseId}...`);
+      for (const z of INITIAL_ZONES) {
+        await pool.query(
+          'INSERT INTO zones (id, warehouse_id, name, description, max_capacity, color) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
+          [`${z.id}-${warehouseId}`, warehouseId, z.name, z.description, z.maxCapacity, z.color]
+        );
+      }
+    }
+
+    // Items
+    const itemCheck = await pool.query('SELECT COUNT(*) FROM items WHERE warehouse_id = $1', [warehouseId]);
+    if (parseInt(itemCheck.rows[0].count, 10) === 0) {
+      console.log(`Seeding items for warehouse ${warehouseId}...`);
+      for (const item of INITIAL_ITEMS) {
+        const itemSupId = item.supplierId ? `${item.supplierId}-${warehouseId}` : null;
+        await pool.query(
+          `INSERT INTO items (id, warehouse_id, name, sku, category, quantity, unit, price, zone, aisle, shelf, bin, supplier_id, min_threshold, last_updated, notes) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16) ON CONFLICT DO NOTHING`,
+          [
+            `${item.id}-${warehouseId}`,
+            warehouseId,
+            item.name,
+            item.sku,
+            item.category,
+            item.quantity,
+            item.unit,
+            item.price,
+            item.warehouseLocation.zone,
+            item.warehouseLocation.aisle,
+            item.warehouseLocation.shelf,
+            item.warehouseLocation.bin,
+            itemSupId,
+            item.minThreshold,
+            item.lastUpdated,
+            item.notes || ''
+          ]
+        );
+      }
+    }
+
+    // Transactions
+    const txCheck = await pool.query('SELECT COUNT(*) FROM transactions WHERE warehouse_id = $1', [warehouseId]);
+    if (parseInt(txCheck.rows[0].count, 10) === 0) {
+      console.log(`Seeding transactions for warehouse ${warehouseId}...`);
+      for (const tx of INITIAL_TRANSACTIONS) {
+        await pool.query(
+          `INSERT INTO transactions (id, warehouse_id, item_id, item_name, sku, type, quantity, reason, timestamp, operator) 
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10) ON CONFLICT DO NOTHING`,
+          [
+            `${tx.id}-${warehouseId}`,
+            warehouseId,
+            `${tx.itemId}-${warehouseId}`,
+            tx.itemName,
+            tx.sku,
+            tx.type,
+            tx.quantity,
+            tx.reason,
+            tx.timestamp,
+            tx.operator
+          ]
+        );
+      }
+    }
+  } else {
+    // In-Memory fallback seeding
+    // Categories
+    if (memCategories.filter(c => c.warehouse_id === warehouseId).length === 0) {
+      INITIAL_CATEGORIES.forEach(cat => {
+        memCategories.push({
+          ...cat,
+          id: `${cat.id}-${warehouseId}`,
+          warehouse_id: warehouseId
+        });
+      });
+    }
+
+    // Suppliers
+    if (memSuppliers.filter(s => s.warehouse_id === warehouseId).length === 0) {
+      INITIAL_SUPPLIERS.forEach(s => {
+        memSuppliers.push({
+          ...s,
+          id: `${s.id}-${warehouseId}`,
+          warehouse_id: warehouseId
+        });
+      });
+    }
+
+    // Zones
+    if (memZones.filter(z => z.warehouse_id === warehouseId).length === 0) {
+      INITIAL_ZONES.forEach(z => {
+        memZones.push({
+          ...z,
+          id: `${z.id}-${warehouseId}`,
+          warehouse_id: warehouseId
+        });
+      });
+    }
+
+    // Items
+    if (memItems.filter(i => i.warehouse_id === warehouseId).length === 0) {
+      INITIAL_ITEMS.forEach(item => {
+        memItems.push({
+          ...item,
+          id: `${item.id}-${warehouseId}`,
+          warehouse_id: warehouseId,
+          supplierId: item.supplierId ? `${item.supplierId}-${warehouseId}` : undefined
+        });
+      });
+    }
+
+    // Transactions
+    if (memTransactions.filter(t => t.warehouse_id === warehouseId).length === 0) {
+      INITIAL_TRANSACTIONS.forEach(tx => {
+        memTransactions.push({
+          ...tx,
+          id: `${tx.id}-${warehouseId}`,
+          warehouse_id: warehouseId,
+          itemId: `${tx.itemId}-${warehouseId}`
+        });
+      });
+    }
   }
-  return memCategories;
 }
 
-export async function getSuppliers() {
+// --- User Management ---
+export async function createUser(user: { id: string, email: string, passwordHash?: string, name: string, warehouseId: string, provider: string, providerId?: string }) {
   if (usePostgres) {
-    const res = await pool.query('SELECT * FROM suppliers');
+    await pool.query(
+      `INSERT INTO users (id, email, password_hash, name, warehouse_id, provider, provider_id) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+      [user.id, user.email, user.passwordHash || null, user.name, user.warehouseId, user.provider, user.providerId || null]
+    );
+  } else {
+    memUsers.push({
+      ...user,
+      createdAt: new Date().toISOString()
+    });
+  }
+  return user;
+}
+
+export async function findUserByEmail(email: string) {
+  const normEmail = email.toLowerCase().trim();
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [normEmail]);
+    if (res.rows.length === 0) return null;
+    const row = res.rows[0];
+    return {
+      id: row.id,
+      email: row.email,
+      passwordHash: row.password_hash,
+      name: row.name,
+      warehouseId: row.warehouse_id,
+      provider: row.provider,
+      providerId: row.provider_id
+    };
+  } else {
+    const matched = memUsers.find(u => u.email.toLowerCase().trim() === normEmail);
+    return matched ? { ...matched } : null;
+  }
+}
+
+export async function findUserByOAuth(provider: string, providerId: string) {
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM users WHERE provider = $1 AND provider_id = $2', [provider, providerId]);
+    if (res.rows.length === 0) return null;
+    const row = res.rows[0];
+    return {
+      id: row.id,
+      email: row.email,
+      passwordHash: row.password_hash,
+      name: row.name,
+      warehouseId: row.warehouse_id,
+      provider: row.provider,
+      providerId: row.provider_id
+    };
+  } else {
+    const matched = memUsers.find(u => u.provider === provider && u.providerId === providerId);
+    return matched ? { ...matched } : null;
+  }
+}
+
+// --- Warehouse Management ---
+export async function createWarehouse(warehouse: { id: string, name: string, code: string, address?: string }) {
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO warehouses (id, name, code, address) VALUES ($1, $2, $3, $4)`,
+      [warehouse.id, warehouse.name, warehouse.code, warehouse.address || null]
+    );
+  } else {
+    memWarehouses.push({
+      ...warehouse,
+      createdAt: new Date().toISOString()
+    });
+  }
+  return warehouse;
+}
+
+export async function findWarehouseByCode(code: string) {
+  const normCode = code.toUpperCase().trim();
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM warehouses WHERE UPPER(code) = $1', [normCode]);
+    if (res.rows.length === 0) return null;
+    return res.rows[0];
+  } else {
+    const matched = memWarehouses.find(w => w.code.toUpperCase().trim() === normCode);
+    return matched ? { ...matched } : null;
+  }
+}
+
+export async function findWarehouseById(id: string) {
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM warehouses WHERE id = $1', [id]);
+    if (res.rows.length === 0) return null;
+    return res.rows[0];
+  } else {
+    const matched = memWarehouses.find(w => w.id === id);
+    return matched ? { ...matched } : null;
+  }
+}
+
+// --- Tenant Scoped Data Queries ---
+
+export async function getCategories(warehouseId: string) {
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM categories WHERE warehouse_id = $1', [warehouseId]);
+    return res.rows;
+  }
+  return memCategories.filter(c => c.warehouse_id === warehouseId);
+}
+
+export async function getSuppliers(warehouseId: string) {
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM suppliers WHERE warehouse_id = $1', [warehouseId]);
     return res.rows.map((row: any) => ({
       id: row.id,
       name: row.name,
@@ -236,12 +506,12 @@ export async function getSuppliers() {
       address: row.address,
     }));
   }
-  return memSuppliers;
+  return memSuppliers.filter(s => s.warehouse_id === warehouseId);
 }
 
-export async function getZones() {
+export async function getZones(warehouseId: string) {
   if (usePostgres) {
-    const res = await pool.query('SELECT * FROM zones');
+    const res = await pool.query('SELECT * FROM zones WHERE warehouse_id = $1', [warehouseId]);
     return res.rows.map((row: any) => ({
       id: row.id,
       name: row.name,
@@ -250,12 +520,12 @@ export async function getZones() {
       color: row.color,
     }));
   }
-  return memZones;
+  return memZones.filter(z => z.warehouse_id === warehouseId);
 }
 
-export async function getItems() {
+export async function getItems(warehouseId: string) {
   if (usePostgres) {
-    const res = await pool.query('SELECT * FROM items ORDER BY last_updated DESC');
+    const res = await pool.query('SELECT * FROM items WHERE warehouse_id = $1 ORDER BY last_updated DESC', [warehouseId]);
     return res.rows.map((row: any) => ({
       id: row.id,
       name: row.name,
@@ -276,12 +546,12 @@ export async function getItems() {
       notes: row.notes,
     }));
   }
-  return memItems;
+  return memItems.filter(i => i.warehouse_id === warehouseId);
 }
 
-export async function getTransactions() {
+export async function getTransactions(warehouseId: string) {
   if (usePostgres) {
-    const res = await pool.query('SELECT * FROM transactions ORDER BY timestamp DESC');
+    const res = await pool.query('SELECT * FROM transactions WHERE warehouse_id = $1 ORDER BY timestamp DESC', [warehouseId]);
     return res.rows.map((row: any) => ({
       id: row.id,
       itemId: row.item_id,
@@ -294,16 +564,17 @@ export async function getTransactions() {
       operator: row.operator,
     }));
   }
-  return memTransactions;
+  return memTransactions.filter(t => t.warehouse_id === warehouseId);
 }
 
-export async function saveItem(item: any) {
+export async function saveItem(item: any, warehouseId: string) {
   if (usePostgres) {
     await pool.query(
-      `INSERT INTO items (id, name, sku, category, quantity, unit, price, zone, aisle, shelf, bin, supplier_id, min_threshold, last_updated, notes) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+      `INSERT INTO items (id, warehouse_id, name, sku, category, quantity, unit, price, zone, aisle, shelf, bin, supplier_id, min_threshold, last_updated, notes) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
       [
         item.id,
+        warehouseId,
         item.name,
         item.sku,
         item.category,
@@ -314,18 +585,21 @@ export async function saveItem(item: any) {
         item.warehouseLocation.aisle,
         item.warehouseLocation.shelf,
         item.warehouseLocation.bin,
-        item.supplierId,
+        item.supplierId || null,
         item.minThreshold,
         item.lastUpdated,
         item.notes || ''
       ]
     );
   } else {
-    memItems.unshift(item);
+    memItems.unshift({
+      ...item,
+      warehouse_id: warehouseId
+    });
   }
 }
 
-export async function updateItem(id: string, item: any) {
+export async function updateItem(id: string, item: any, warehouseId: string) {
   if (usePostgres) {
     await pool.query(
       `UPDATE items SET 
@@ -343,7 +617,7 @@ export async function updateItem(id: string, item: any) {
         min_threshold = $12, 
         last_updated = $13, 
         notes = $14 
-       WHERE id = $15`,
+       WHERE id = $15 AND warehouse_id = $16`,
       [
         item.name,
         item.sku,
@@ -355,33 +629,35 @@ export async function updateItem(id: string, item: any) {
         item.warehouseLocation.aisle,
         item.warehouseLocation.shelf,
         item.warehouseLocation.bin,
-        item.supplierId,
+        item.supplierId || null,
         item.minThreshold,
         item.lastUpdated,
         item.notes || '',
-        id
+        id,
+        warehouseId
       ]
     );
   } else {
-    memItems = memItems.map(i => i.id === id ? { ...i, ...item } : i);
+    memItems = memItems.map(i => (i.id === id && i.warehouse_id === warehouseId) ? { ...i, ...item } : i);
   }
 }
 
-export async function deleteItem(id: string) {
+export async function deleteItem(id: string, warehouseId: string) {
   if (usePostgres) {
-    await pool.query('DELETE FROM items WHERE id = $1', [id]);
+    await pool.query('DELETE FROM items WHERE id = $1 AND warehouse_id = $2', [id, warehouseId]);
   } else {
-    memItems = memItems.filter(i => i.id !== id);
+    memItems = memItems.filter(i => !(i.id === id && i.warehouse_id === warehouseId));
   }
 }
 
-export async function saveTransaction(tx: any) {
+export async function saveTransaction(tx: any, warehouseId: string) {
   if (usePostgres) {
     await pool.query(
-      `INSERT INTO transactions (id, item_id, item_name, sku, type, quantity, reason, timestamp, operator) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      `INSERT INTO transactions (id, warehouse_id, item_id, item_name, sku, type, quantity, reason, timestamp, operator) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
       [
         tx.id,
+        warehouseId,
         tx.itemId,
         tx.itemName,
         tx.sku,
@@ -393,21 +669,30 @@ export async function saveTransaction(tx: any) {
       ]
     );
   } else {
-    memTransactions.unshift(tx);
+    memTransactions.unshift({
+      ...tx,
+      warehouse_id: warehouseId
+    });
   }
 }
 
-export async function resetDb() {
+export async function resetDb(warehouseId: string) {
   if (usePostgres) {
-    console.log('Resetting and re-seeding database...');
-    await pool.query('TRUNCATE TABLE transactions, items CASCADE');
-    await pool.query('TRUNCATE TABLE categories, suppliers, zones CASCADE');
-    await runMigrations();
+    console.log(`Resetting database tables for warehouse ${warehouseId}...`);
+    // Delete only scoped data to preserve other warehouses!
+    await pool.query('DELETE FROM transactions WHERE warehouse_id = $1', [warehouseId]);
+    await pool.query('DELETE FROM items WHERE warehouse_id = $1', [warehouseId]);
+    await pool.query('DELETE FROM categories WHERE warehouse_id = $1', [warehouseId]);
+    await pool.query('DELETE FROM suppliers WHERE warehouse_id = $1', [warehouseId]);
+    await pool.query('DELETE FROM zones WHERE warehouse_id = $1', [warehouseId]);
+    await seedWarehouseData(warehouseId);
   } else {
-    memItems = [...INITIAL_ITEMS];
-    memTransactions = [...INITIAL_TRANSACTIONS];
-    memSuppliers = [...INITIAL_SUPPLIERS];
-    memCategories = [...INITIAL_CATEGORIES];
-    memZones = [...INITIAL_ZONES];
+    // Clear and re-seed scoped in-memory data
+    memItems = memItems.filter(i => i.warehouse_id !== warehouseId);
+    memTransactions = memTransactions.filter(t => t.warehouse_id !== warehouseId);
+    memSuppliers = memSuppliers.filter(s => s.warehouse_id !== warehouseId);
+    memCategories = memCategories.filter(c => c.warehouse_id !== warehouseId);
+    memZones = memZones.filter(z => z.warehouse_id !== warehouseId);
+    await seedWarehouseData(warehouseId);
   }
 }
