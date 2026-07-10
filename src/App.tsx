@@ -71,6 +71,25 @@ import {
   INITIAL_TRANSACTIONS 
 } from './mockData';
 
+const getZoneDisplayName = (zoneVal: string | null | undefined, zonesList?: any[]): string => {
+  if (!zoneVal) return '';
+  
+  let rawName = zoneVal;
+  if (zonesList && zonesList.length > 0) {
+    const foundZone = zonesList.find(z => z.id === zoneVal || z.name === zoneVal);
+    if (foundZone) {
+      rawName = foundZone.name;
+    }
+  }
+
+  // Strip trailing timestamp suffix like -1783720324158 and any preceding dashes
+  let clean = rawName.replace(/-\d{9,}$/, '').trim();
+  
+  // Clean common placeholder words
+  clean = clean.replace('Warehouse Zone', '').replace('Storage', '').trim();
+  return clean || zoneVal;
+};
+
 export default function App() {
   // --- Persistent State ---
   const [items, setItems] = useState<InventoryItem[]>([]);
@@ -1039,7 +1058,7 @@ export default function App() {
         if (res.ok) {
           await fetchData();
           setIsAddModalOpen(false);
-          showToast(`Product "${newItem.name}" added to location ${newItem.warehouseLocation.zone} successfully!`);
+          showToast(`Product "${newItem.name}" added to location ${getZoneDisplayName(newItem.warehouseLocation.zone, zones)} successfully!`);
           confetti({ particleCount: 50, spread: 60 });
         } else {
           showToast("Failed to save product to central database.", "error");
@@ -2199,7 +2218,7 @@ export default function App() {
                                 <h4 className="text-sm font-bold text-white truncate">{item.name}</h4>
                               </div>
                               <p className="text-xs text-slate-400 mt-1">
-                                Stock Balance: <span className="text-rose-400 font-extrabold">{item.quantity} {item.unit}</span> (Min Threshold: {item.minThreshold}) • Zone: {item.warehouseLocation.zone}
+                                Stock Balance: <span className="text-rose-400 font-extrabold">{item.quantity} {item.unit}</span> (Min Threshold: {item.minThreshold}) • Zone: {getZoneDisplayName(item.warehouseLocation.zone, zones)}
                               </p>
                             </div>
                             <button 
@@ -2226,7 +2245,7 @@ export default function App() {
                           <div className="flex items-center justify-between text-xs font-semibold mb-2">
                             <div className="flex items-center gap-2 text-slate-200">
                               <MapPin className="h-3.5 w-3.5 text-indigo-400" />
-                              <span>{zone.name}</span>
+                              <span>{getZoneDisplayName(zone.name, zones)}</span>
                             </div>
                             <span className="text-slate-400 font-mono">
                               {zone.allocated.toLocaleString()} / {zone.capacity.toLocaleString()} units ({zone.rate}%)
@@ -2301,7 +2320,7 @@ export default function App() {
                       className="bg-slate-950 border border-slate-800/80 rounded-xl px-3 py-2 text-xs font-semibold text-slate-300 focus:outline-none focus:ring-1 focus:ring-indigo-500"
                     >
                       <option value="All">All Warehouse Zones</option>
-                      {zones.map(z => <option key={z.id} value={z.name}>{z.name}</option>)}
+                      {zones.map(z => <option key={z.id} value={z.name}>{getZoneDisplayName(z.name, zones)}</option>)}
                     </select>
 
                     {/* Stock Alert Filter Status */}
@@ -2442,7 +2461,7 @@ export default function App() {
                                   <div className="flex items-center gap-1.5 text-xs text-slate-300 font-medium">
                                     <MapPin className="h-3.5 w-3.5 text-rose-500 shrink-0" />
                                     <span>
-                                      {item.warehouseLocation.zone.replace('Warehouse Zone', '').replace('Storage', '')} • {item.warehouseLocation.aisle} • {item.warehouseLocation.shelf}
+                                      {getZoneDisplayName(item.warehouseLocation.zone, zones)} • {item.warehouseLocation.aisle} • {item.warehouseLocation.shelf}
                                     </span>
                                   </div>
                                 </td>
@@ -2534,7 +2553,7 @@ export default function App() {
                       }}
                       className="bg-slate-950 border border-slate-800 rounded-xl px-4 py-2 text-xs font-bold text-slate-200 focus:outline-none focus:ring-2 focus:ring-indigo-500"
                     >
-                      {zones.map(z => <option key={z.id} value={z.id}>{z.name}</option>)}
+                      {zones.map(z => <option key={z.id} value={z.id}>{getZoneDisplayName(z.name, zones)}</option>)}
                     </select>
                   </div>
                 </div>
@@ -2545,7 +2564,7 @@ export default function App() {
                   <div className="lg:col-span-8 bg-slate-900/60 border border-slate-800/80 p-6 rounded-2xl flex flex-col" id="map_grid_board">
                     <div className="flex items-center justify-between mb-6">
                       <h4 className="text-sm font-bold text-slate-300">
-                        Bay Elevation Grid: <span className="text-white">{zones.find(z => z.id === mapSelectedZone)?.name}</span>
+                        Bay Elevation Grid: <span className="text-white">{getZoneDisplayName(zones.find(z => z.id === mapSelectedZone)?.name, zones)}</span>
                       </h4>
                       <div className="flex items-center gap-4 text-xs font-medium text-slate-400">
                         <span className="flex items-center gap-1.5">
@@ -2680,7 +2699,7 @@ export default function App() {
                                   </div>
                                   <div className="flex justify-between py-1.5 border-b border-slate-800/50">
                                     <span className="text-slate-400">Physical Zone</span>
-                                    <span className="text-white font-semibold">{zones.find(z => z.id === mapSelectedZone)?.name.split(' (')[0]}</span>
+                                    <span className="text-white font-semibold">{getZoneDisplayName(zones.find(z => z.id === mapSelectedZone)?.name, zones)}</span>
                                   </div>
                                   <div className="flex justify-between py-1.5 border-b border-slate-800/50">
                                     <span className="text-slate-400">Reorder Threshold</span>
@@ -3380,9 +3399,9 @@ export default function App() {
                                     ></span>
                                     <div>
                                       <div className="flex items-center gap-2">
-                                        <h5 className="text-xs font-bold text-white">{zone.name}</h5>
+                                        <h5 className="text-xs font-bold text-white">{getZoneDisplayName(zone.name, zones)}</h5>
                                         <span className="text-[9px] font-mono bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded uppercase">
-                                          {zone.id}
+                                          {getZoneDisplayName(zone.id, zones)}
                                         </span>
                                       </div>
                                       <p className="text-[11px] text-slate-400 mt-1">{zone.description || 'No description provided.'}</p>
@@ -3781,7 +3800,7 @@ export default function App() {
                       {zones.length === 0 ? (
                         <option value="Zone-A">Zone-A</option>
                       ) : (
-                        zones.map(z => <option key={z.id} value={z.id}>{z.name}</option>)
+                        zones.map(z => <option key={z.id} value={z.id}>{getZoneDisplayName(z.name, zones)}</option>)
                       )}
                     </select>
                   </div>
@@ -3965,7 +3984,7 @@ export default function App() {
                       {zones.length === 0 ? (
                         <option value="Zone-A">Zone-A</option>
                       ) : (
-                        zones.map(z => <option key={z.id} value={z.id}>{z.name}</option>)
+                        zones.map(z => <option key={z.id} value={z.id}>{getZoneDisplayName(z.name, zones)}</option>)
                       )}
                     </select>
                   </div>
