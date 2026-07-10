@@ -17,8 +17,8 @@ import {
 async function startServer() {
   const app = express();
   
-  // Configure the port: runs on PORT (3000) inside AI Studio, but defaults to 4000 in the user's container
-  const PORT = parseInt(process.env.PORT || '4000', 10);
+  // Configure the port: runs on PORT (3000) inside AI Studio, but defaults to 4001 in the user's container
+  const PORT = parseInt(process.env.PORT || '4001', 10);
 
   // Middleware for parsing JSON requests
   app.use(express.json());

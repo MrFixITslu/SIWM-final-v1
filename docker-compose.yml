@@ -9,7 +9,7 @@ services:
     restart: unless-stopped
     environment:
       - NODE_ENV=production
-      - PORT=4000
+      - PORT=4001
       # Connects to the existing PostgreSQL container on 'proxy_network'
       - DATABASE_URL=postgres://postgres:postgres@postgres:5432/postgres
       - PGHOST=postgres
@@ -27,7 +27,7 @@ services:
     container_name: siwm-frontend
     restart: unless-stopped
     ports:
-      - "4000:80"
+      - "4000:4000"
     depends_on:
       - siwm-backend
     networks:
