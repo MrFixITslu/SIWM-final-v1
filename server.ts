@@ -20,7 +20,11 @@ import {
   createWarehouse,
   findWarehouseByCode,
   findWarehouseById,
-  seedWarehouseData
+  seedWarehouseData,
+  associateUserWithWarehouse,
+  getUserWarehouses,
+  isUserInWarehouse,
+  updateUserActiveWarehouse
 } from './server-db.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'siwm-production-secure-key-2026';
@@ -133,6 +137,7 @@ async function startServer() {
       };
 
       await createUser(newUser);
+      await associateUserWithWarehouse(newUser.id, warehouseId);
 
       const token = jwt.sign(
         { id: newUser.id, email: newUser.email, name: newUser.name, warehouseId },
@@ -143,7 +148,8 @@ async function startServer() {
       res.status(201).json({
         token,
         user: { id: newUser.id, email: newUser.email, name: newUser.name },
-        warehouse: warehouseDetails
+        warehouse: warehouseDetails,
+        warehouses: [warehouseDetails]
       });
     } catch (err: any) {
       console.error('Registration error:', err);
@@ -174,6 +180,16 @@ async function startServer() {
       }
 
       const warehouse = await findWarehouseById(user.warehouseId || '');
+      const warehousesList = await getUserWarehouses(user.id);
+      
+      // Fallback association for seed / existing users
+      if (warehousesList.length === 0 && user.warehouseId) {
+        await associateUserWithWarehouse(user.id, user.warehouseId);
+        const mappedWh = await findWarehouseById(user.warehouseId);
+        if (mappedWh) {
+          warehousesList.push(mappedWh);
+        }
+      }
 
       const token = jwt.sign(
         { id: user.id, email: user.email, name: user.name, warehouseId: user.warehouseId },
@@ -184,7 +200,8 @@ async function startServer() {
       res.json({
         token,
         user: { id: user.id, email: user.email, name: user.name },
-        warehouse
+        warehouse,
+        warehouses: warehousesList
       });
     } catch (err: any) {
       console.error('Login error:', err);
@@ -252,8 +269,18 @@ async function startServer() {
         } as any;
 
         await createUser(user);
+        await associateUserWithWarehouse(user.id, warehouseId);
       } else {
         warehouseDetails = await findWarehouseById(user.warehouseId || '');
+      }
+
+      const warehousesList = await getUserWarehouses(user.id);
+      if (warehousesList.length === 0 && user.warehouseId) {
+        await associateUserWithWarehouse(user.id, user.warehouseId);
+        const mappedWh = await findWarehouseById(user.warehouseId);
+        if (mappedWh) {
+          warehousesList.push(mappedWh);
+        }
       }
 
       const token = jwt.sign(
@@ -265,7 +292,8 @@ async function startServer() {
       res.json({
         token,
         user: { id: user.id, email: user.email, name: user.name },
-        warehouse: warehouseDetails
+        warehouse: warehouseDetails,
+        warehouses: warehousesList
       });
     } catch (err: any) {
       console.error('OAuth processing error:', err);
@@ -274,6 +302,168 @@ async function startServer() {
   });
 
   // --- Secure Scoped Data API Endpoints ---
+
+  // Fetch all warehouses for the authenticated operator (max 2)
+  app.get('/api/auth/warehouses', authenticateToken, async (req: any, res) => {
+    try {
+      const warehousesList = await getUserWarehouses(req.user.id);
+      res.json({ warehouses: warehousesList });
+    } catch (err: any) {
+      console.error('Error fetching warehouses:', err);
+      res.status(500).json({ error: 'Failed to retrieve warehouses associated with your account.', details: err.message });
+    }
+  });
+
+  // Create an additional warehouse (max 2 warehouses per account)
+  app.post('/api/auth/warehouses/create', authenticateToken, async (req: any, res) => {
+    try {
+      const { name, address } = req.body;
+      if (!name) {
+        res.status(400).json({ error: 'Warehouse designation is required.' });
+        return;
+      }
+
+      // Check current count
+      const existing = await getUserWarehouses(req.user.id);
+      if (existing.length >= 2) {
+        res.status(400).json({ error: 'Maximum limit of 2 warehouses has been reached for this account.' });
+        return;
+      }
+
+      const warehouseId = `wh-${Date.now()}`;
+      const code = `WH-${Math.floor(100000 + Math.random() * 900000)}`;
+      const warehouseDetails = await createWarehouse({
+        id: warehouseId,
+        name,
+        code,
+        address: address || ''
+      });
+
+      // Seed default dataset
+      await seedWarehouseData(warehouseId);
+
+      // Associate
+      await associateUserWithWarehouse(req.user.id, warehouseId);
+
+      // Set active
+      await updateUserActiveWarehouse(req.user.id, warehouseId);
+
+      // Issue new token with updated active warehouseId
+      const token = jwt.sign(
+        { id: req.user.id, email: req.user.email, name: req.user.name, warehouseId },
+        JWT_SECRET,
+        { expiresIn: '24h' }
+      );
+
+      res.status(201).json({
+        status: 'success',
+        token,
+        warehouse: warehouseDetails,
+        warehouses: await getUserWarehouses(req.user.id)
+      });
+    } catch (err: any) {
+      console.error('Error creating additional warehouse:', err);
+      res.status(500).json({ error: 'Failed to create warehouse.', details: err.message });
+    }
+  });
+
+  // Join an existing warehouse via access clearance code (max 2 warehouses per account)
+  app.post('/api/auth/warehouses/join', authenticateToken, async (req: any, res) => {
+    try {
+      const { code } = req.body;
+      if (!code) {
+        res.status(400).json({ error: 'Warehouse clearance access code is required.' });
+        return;
+      }
+
+      // Check current count
+      const existing = await getUserWarehouses(req.user.id);
+      if (existing.length >= 2) {
+        res.status(400).json({ error: 'Maximum limit of 2 warehouses has been reached for this account.' });
+        return;
+      }
+
+      const matchedWh = await findWarehouseByCode(code);
+      if (!matchedWh) {
+        res.status(404).json({ error: 'Warehouse access code not found.' });
+        return;
+      }
+
+      // Check if already member
+      const isAlreadyMember = existing.some((w: any) => w.id === matchedWh.id);
+      if (isAlreadyMember) {
+        res.status(400).json({ error: 'You are already connected to this warehouse.' });
+        return;
+      }
+
+      // Associate
+      await associateUserWithWarehouse(req.user.id, matchedWh.id);
+
+      // Set active
+      await updateUserActiveWarehouse(req.user.id, matchedWh.id);
+
+      // Issue new token with updated active warehouseId
+      const token = jwt.sign(
+        { id: req.user.id, email: req.user.email, name: req.user.name, warehouseId: matchedWh.id },
+        JWT_SECRET,
+        { expiresIn: '24h' }
+      );
+
+      res.json({
+        status: 'success',
+        token,
+        warehouse: matchedWh,
+        warehouses: await getUserWarehouses(req.user.id)
+      });
+    } catch (err: any) {
+      console.error('Error joining warehouse:', err);
+      res.status(500).json({ error: 'Failed to join warehouse.', details: err.message });
+    }
+  });
+
+  // Switch active warehouse
+  app.post('/api/auth/warehouses/switch', authenticateToken, async (req: any, res) => {
+    try {
+      const { warehouseId } = req.body;
+      if (!warehouseId) {
+        res.status(400).json({ error: 'Target warehouse ID is required.' });
+        return;
+      }
+
+      // Verify the user is associated with this warehouse
+      const isMember = await isUserInWarehouse(req.user.id, warehouseId);
+      if (!isMember) {
+        res.status(403).json({ error: 'You do not have clearance to access this warehouse.' });
+        return;
+      }
+
+      const warehouseDetails = await findWarehouseById(warehouseId);
+      if (!warehouseDetails) {
+        res.status(404).json({ error: 'Warehouse not found.' });
+        return;
+      }
+
+      // Set active
+      await updateUserActiveWarehouse(req.user.id, warehouseId);
+
+      // Issue new token with updated active warehouseId
+      const token = jwt.sign(
+        { id: req.user.id, email: req.user.email, name: req.user.name, warehouseId },
+        JWT_SECRET,
+        { expiresIn: '24h' }
+      );
+
+      res.json({
+        status: 'success',
+        token,
+        warehouse: warehouseDetails,
+        warehouses: await getUserWarehouses(req.user.id)
+      });
+    } catch (err: any) {
+      console.error('Error switching active warehouse:', err);
+      res.status(500).json({ error: 'Failed to switch warehouse context.', details: err.message });
+    }
+  });
 
   // Retrieve the entire warehouse dataset (items, transactions, suppliers, categories, zones) scoped to user's warehouse
   app.get('/api/data', authenticateToken, async (req: any, res) => {
@@ -484,6 +674,31 @@ async function startServer() {
   // Reset database back to default dataset (clears items and transactions and seeds them)
   app.post('/api/reset', authenticateToken, async (req: any, res) => {
     try {
+      const { password } = req.body;
+      if (!password) {
+        res.status(400).json({ error: 'Password confirmation is required to reset the database.' });
+        return;
+      }
+
+      const user = await findUserByEmail(req.user.email);
+      if (!user) {
+        res.status(404).json({ error: 'User account not found.' });
+        return;
+      }
+
+      let isVerified = false;
+      if (user.passwordHash) {
+        isVerified = await bcrypt.compare(password, user.passwordHash);
+      } else {
+        const normPass = password.trim().toLowerCase();
+        isVerified = (normPass === 'oauth' || normPass === 'confirm' || normPass === 'reset' || normPass === user.email.toLowerCase());
+      }
+
+      if (!isVerified) {
+        res.status(401).json({ error: 'Incorrect verification password. Authorization denied.' });
+        return;
+      }
+
       const warehouseId = req.user.warehouseId;
       await resetDb(warehouseId);
       res.json({ status: 'success', message: 'Warehouse dataset reset completed successfully' });

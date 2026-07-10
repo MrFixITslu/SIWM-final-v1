@@ -85,6 +85,10 @@ export default function App() {
     const saved = localStorage.getItem('siwm_warehouse');
     return saved ? JSON.parse(saved) : null;
   });
+  const [warehouses, setWarehouses] = useState<any[]>(() => {
+    const saved = localStorage.getItem('siwm_warehouses');
+    return saved ? JSON.parse(saved) : [];
+  });
 
   // Auth form states
   const [isRegisterMode, setIsRegisterMode] = useState(false);
@@ -98,13 +102,30 @@ export default function App() {
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authError, setAuthError] = useState('');
 
+  // Secondary warehouse form states
+  const [isSecondWhModalOpen, setIsSecondWhModalOpen] = useState(false);
+  const [secondWhOption, setSecondWhOption] = useState<'create' | 'join'>('create');
+  const [secondWhName, setSecondWhName] = useState('');
+  const [secondWhAddress, setSecondWhAddress] = useState('');
+  const [secondWhCode, setSecondWhCode] = useState('');
+  const [secondWhSubmitting, setSecondWhSubmitting] = useState(false);
+  const [secondWhError, setSecondWhError] = useState('');
+
+  // Reset database modal states
+  const [isResetModalOpen, setIsResetModalOpen] = useState(false);
+  const [resetPassword, setResetPassword] = useState('');
+  const [resetSubmitting, setResetSubmitting] = useState(false);
+  const [resetError, setResetError] = useState('');
+
   const handleLogout = () => {
     localStorage.removeItem('siwm_token');
     localStorage.removeItem('siwm_user');
     localStorage.removeItem('siwm_warehouse');
+    localStorage.removeItem('siwm_warehouses');
     setToken(null);
     setUser(null);
     setWarehouse(null);
+    setWarehouses([]);
     setItems([]);
     setTransactions([]);
     setSuppliers([]);
@@ -131,6 +152,18 @@ export default function App() {
         setSuppliers(data.suppliers || []);
         setCategories(data.categories || []);
         setZones(data.zones || INITIAL_ZONES);
+
+        // Also refresh associated warehouses list dynamically
+        const whRes = await fetch('/api/auth/warehouses', {
+          headers: {
+            'Authorization': `Bearer ${tokenToUse}`
+          }
+        });
+        if (whRes.ok) {
+          const whData = await whRes.json();
+          setWarehouses(whData.warehouses || []);
+          localStorage.setItem('siwm_warehouses', JSON.stringify(whData.warehouses || []));
+        }
       } else if (res.status === 401 || res.status === 403) {
         handleLogout();
         showToast("Your session has expired. Please sign in again.", "error");
@@ -142,6 +175,89 @@ export default function App() {
       showToast("Central database connection error.", "error");
     } finally {
       setLoading(false);
+    }
+  };
+
+  const handleSwitchWarehouse = async (targetId: string) => {
+    try {
+      setLoading(true);
+      const res = await fetch('/api/auth/warehouses/switch', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ warehouseId: targetId })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        localStorage.setItem('siwm_token', data.token);
+        localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
+        if (data.warehouses) {
+          localStorage.setItem('siwm_warehouses', JSON.stringify(data.warehouses));
+          setWarehouses(data.warehouses);
+        }
+        setToken(data.token);
+        setWarehouse(data.warehouse);
+        showToast(`Workspace context switched to: ${data.warehouse.name}`, 'success');
+        fetchData(data.token);
+      } else {
+        showToast(data.error || "Failed to switch warehouse context.", "error");
+      }
+    } catch (err) {
+      showToast("Network error switching warehouse context.", "error");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleSecondWarehouseSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setSecondWhError('');
+    setSecondWhSubmitting(true);
+
+    try {
+      const endpoint = secondWhOption === 'create' 
+        ? '/api/auth/warehouses/create' 
+        : '/api/auth/warehouses/join';
+
+      const payload = secondWhOption === 'create'
+        ? { name: secondWhName, address: secondWhAddress }
+        : { code: secondWhCode.toUpperCase().trim() };
+
+      const res = await fetch(endpoint, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify(payload)
+      });
+
+      const data = await res.json();
+      if (res.ok) {
+        localStorage.setItem('siwm_token', data.token);
+        localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
+        localStorage.setItem('siwm_warehouses', JSON.stringify(data.warehouses));
+        setToken(data.token);
+        setWarehouse(data.warehouse);
+        setWarehouses(data.warehouses);
+        setIsSecondWhModalOpen(false);
+        setSecondWhName('');
+        setSecondWhAddress('');
+        setSecondWhCode('');
+        showToast(secondWhOption === 'create' 
+          ? `Workspace Established: Welcome to ${data.warehouse.name}`
+          : `Connected to Workspace: Welcome to ${data.warehouse.name}`, 'success');
+        confetti({ particleCount: 50, spread: 60 });
+        fetchData(data.token);
+      } else {
+        setSecondWhError(data.error || "Failed to add warehouse.");
+      }
+    } catch (err) {
+      setSecondWhError("Network error adding warehouse.");
+    } finally {
+      setSecondWhSubmitting(false);
     }
   };
 
@@ -369,28 +485,39 @@ export default function App() {
   };
 
   // --- Reset All Data Helper ---
-  const handleResetData = async () => {
-    if (window.confirm("Are you sure you want to reset all data back to the default warehouse dataset? This will clear and reseed the central Postgres database.")) {
-      setLoading(true);
-      try {
-        const res = await fetch('/api/reset', { 
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${token}`
-          }
-        });
-        if (res.ok) {
-          await fetchData();
-          showToast("Warehouse database has been restored to factory defaults", "info");
-          confetti({ particleCount: 30, spread: 40 });
-        } else {
-          showToast("Failed to reset central database.", "error");
-        }
-      } catch (err) {
-        showToast("Error resetting database.", "error");
-      } finally {
-        setLoading(false);
+  const handleResetData = () => {
+    setResetPassword('');
+    setResetError('');
+    setIsResetModalOpen(true);
+  };
+
+  const handleResetDataSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setResetError('');
+    setResetSubmitting(true);
+    try {
+      const res = await fetch('/api/reset', { 
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ password: resetPassword })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setIsResetModalOpen(false);
+        setResetPassword('');
+        await fetchData();
+        showToast("Warehouse database has been restored to factory defaults", "info");
+        confetti({ particleCount: 30, spread: 40 });
+      } else {
+        setResetError(data.error || "Failed to reset central database.");
       }
+    } catch (err) {
+      setResetError("Error resetting database. Check your connection.");
+    } finally {
+      setResetSubmitting(false);
     }
   };
 
@@ -1174,16 +1301,24 @@ export default function App() {
                 <span className="text-xs font-bold text-slate-200 block truncate">{user?.name || 'Alexis Vance'}</span>
                 <span className="text-[10px] text-slate-500 block truncate font-mono">{user?.email || 'email@example.com'}</span>
               </div>
+              
               <div>
-                <span className="text-[9px] font-bold text-indigo-400 tracking-wider uppercase block mb-1">Secure Tenancy Space</span>
-                <span className="text-xs font-bold text-slate-200 block truncate">{warehouse?.name || 'Operations Hub'}</span>
+                <span className="text-[9px] font-bold text-indigo-400 tracking-wider uppercase block mb-1">Active Space Context</span>
+                <div className="flex items-center justify-between">
+                  <span className="text-xs font-bold text-slate-200 block truncate">{warehouse?.name || 'Operations Hub'}</span>
+                  <span className="text-[9px] bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 px-1.5 py-0.5 rounded font-bold uppercase tracking-wider font-mono">
+                    Active
+                  </span>
+                </div>
                 {warehouse?.address && (
                   <span className="text-[10px] text-slate-500 block truncate mt-0.5">{warehouse.address}</span>
                 )}
               </div>
+
+              {/* Share Code */}
               <div className="bg-slate-950 p-2.5 rounded-lg border border-slate-850 flex items-center justify-between gap-1">
                 <div>
-                  <span className="text-[8px] font-bold text-slate-500 uppercase block">Share Code</span>
+                  <span className="text-[8px] font-bold text-slate-500 uppercase block">Clearance Code</span>
                   <span className="text-xs font-bold text-emerald-400 font-mono tracking-wider">{warehouse?.code || 'WH-XXXXXX'}</span>
                 </div>
                 <button
@@ -1200,6 +1335,49 @@ export default function App() {
                 >
                   <Copy className="h-3.5 w-3.5" />
                 </button>
+              </div>
+
+              {/* Associated Warehouses (Multi-Warehouse Selector / Switcher) */}
+              <div className="border-t border-slate-800/60 pt-2.5 space-y-2">
+                <span className="text-[9px] font-bold text-indigo-400 tracking-wider uppercase block">Your Registered Warehouses</span>
+                
+                {warehouses.length > 1 && (
+                  <div className="space-y-1.5">
+                    {warehouses.map((w) => (
+                      <button
+                        key={w.id}
+                        id={`btn_switch_wh_${w.id}`}
+                        type="button"
+                        disabled={w.id === warehouse?.id}
+                        onClick={() => handleSwitchWarehouse(w.id)}
+                        className={`w-full text-left p-2 rounded-lg text-xs flex items-center justify-between transition ${
+                          w.id === warehouse?.id
+                            ? 'bg-indigo-600/10 border border-indigo-500/30 text-indigo-200 font-bold'
+                            : 'bg-slate-950 border border-slate-850 text-slate-400 hover:text-slate-200 hover:border-slate-800'
+                        }`}
+                      >
+                        <span className="truncate">{w.name}</span>
+                        {w.id === warehouse?.id ? (
+                          <Check className="h-3.5 w-3.5 text-indigo-400 shrink-0" />
+                        ) : (
+                          <span className="text-[9px] text-slate-500 font-medium">Switch</span>
+                        )}
+                      </button>
+                    ))}
+                  </div>
+                )}
+
+                {warehouses.length <= 1 && (
+                  <button
+                    id="btn_add_second_wh"
+                    type="button"
+                    onClick={() => setIsSecondWhModalOpen(true)}
+                    className="w-full py-1.5 px-3 bg-slate-900 hover:bg-indigo-600/20 border border-slate-850 hover:border-indigo-500/30 rounded-lg text-[10px] font-bold text-indigo-400 hover:text-indigo-300 transition flex items-center justify-center gap-1.5"
+                  >
+                    <Plus className="h-3 w-3" />
+                    Connect 2nd Warehouse (Max 2)
+                  </button>
+                )}
               </div>
             </div>
 
@@ -2951,6 +3129,215 @@ export default function App() {
                   className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl transition"
                 >
                   Submit Balance Adjustment
+                </button>
+              </div>
+
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== FORM MODAL 4: CONNECT SECONDARY WAREHOUSE ==================== */}
+      {isSecondWhModalOpen && (
+        <div id="modal_add_second_warehouse" className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl relative animate-scale-up text-slate-200">
+            <h3 className="text-lg font-bold text-white border-b border-slate-800 pb-3 mb-4 flex items-center gap-2">
+              <Building2 className="h-5.5 w-5.5 text-indigo-400 animate-pulse" />
+              Connect Additional Warehouse
+            </h3>
+
+            {secondWhError && (
+              <div className="mb-4 p-3.5 bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs rounded-xl flex items-center gap-2.5">
+                <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />
+                <span>{secondWhError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleSecondWarehouseSubmit} className="space-y-4">
+              <div>
+                <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-wider block mb-2">Clearance Registration Option</span>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    id="btn_second_wh_create"
+                    type="button"
+                    onClick={() => setSecondWhOption('create')}
+                    className={`py-2 px-3 rounded-lg font-bold text-xs border transition flex items-center justify-center gap-2 ${
+                      secondWhOption === 'create'
+                        ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
+                        : 'bg-slate-950 text-slate-500 border-slate-850 hover:text-slate-300'
+                    }`}
+                  >
+                    <Plus className="h-3.5 w-3.5" />
+                    Establish New
+                  </button>
+                  <button
+                    id="btn_second_wh_join"
+                    type="button"
+                    onClick={() => setSecondWhOption('join')}
+                    className={`py-2 px-3 rounded-lg font-bold text-xs border transition flex items-center justify-center gap-2 ${
+                      secondWhOption === 'join'
+                        ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
+                        : 'bg-slate-950 text-slate-500 border-slate-850 hover:text-slate-300'
+                    }`}
+                  >
+                    <KeyRound className="h-3.5 w-3.5" />
+                    Join Existing
+                  </button>
+                </div>
+              </div>
+
+              {secondWhOption === 'create' ? (
+                <div className="space-y-3" id="second_wh_create_fields">
+                  <div>
+                    <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Warehouse Name Designation *</label>
+                    <input 
+                      id="second_wh_input_name"
+                      type="text"
+                      required={secondWhOption === 'create'}
+                      placeholder="e.g. Seattle East Hub"
+                      value={secondWhName}
+                      onChange={(e) => setSecondWhName(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-250 focus:ring-1 focus:ring-indigo-500 outline-none"
+                    />
+                  </div>
+                  <div>
+                    <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Physical Address / Location</label>
+                    <input 
+                      id="second_wh_input_address"
+                      type="text"
+                      placeholder="e.g. 102 Bellevue Way, WA"
+                      value={secondWhAddress}
+                      onChange={(e) => setSecondWhAddress(e.target.value)}
+                      className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-250 focus:ring-1 focus:ring-indigo-500 outline-none"
+                    />
+                  </div>
+                </div>
+              ) : (
+                <div id="second_wh_join_fields">
+                  <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Warehouse Access Clearance Code *</label>
+                  <input 
+                    id="second_wh_input_code"
+                    type="text"
+                    required={secondWhOption === 'join'}
+                    placeholder="e.g. WH-109384"
+                    maxLength={9}
+                    value={secondWhCode}
+                    onChange={(e) => setSecondWhCode(e.target.value)}
+                    className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-250 focus:ring-1 focus:ring-indigo-500 outline-none font-mono text-center tracking-widest uppercase"
+                  />
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-500 leading-relaxed italic">
+                Note: Standard accounts are bound by security clearance policies to a maximum limit of 2 warehouses per operator profile.
+              </p>
+
+              <div className="border-t border-slate-800/85 pt-4 mt-5 flex items-center justify-end gap-3">
+                <button 
+                  id="btn_cancel_second_wh"
+                  type="button" 
+                  onClick={() => {
+                    setIsSecondWhModalOpen(false);
+                    setSecondWhError('');
+                    setSecondWhName('');
+                    setSecondWhAddress('');
+                    setSecondWhCode('');
+                  }}
+                  className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-slate-200 transition"
+                >
+                  Cancel
+                </button>
+                <button 
+                  id="btn_submit_second_wh"
+                  type="submit" 
+                  disabled={secondWhSubmitting}
+                  className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-800 text-white font-bold text-xs rounded-xl transition flex items-center gap-1.5"
+                >
+                  {secondWhSubmitting ? (
+                    <span className="h-3 w-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                  ) : (
+                    <>
+                      <span>Establish Workspace Link</span>
+                      <ArrowRight className="h-3 w-3" />
+                    </>
+                  )}
+                </button>
+              </div>
+
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== FORM MODAL 5: PASSWORD-PROTECTED DATABASE RESET ==================== */}
+      {isResetModalOpen && (
+        <div id="modal_reset_database" className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-md w-full p-6 shadow-2xl relative animate-scale-up text-slate-200">
+            <h3 className="text-lg font-bold text-white border-b border-slate-800 pb-3 mb-4 flex items-center gap-2">
+              <AlertTriangle className="h-5.5 w-5.5 text-rose-500 animate-pulse" />
+              Authorize Database Reset
+            </h3>
+
+            {resetError && (
+              <div className="mb-4 p-3.5 bg-rose-500/15 border border-rose-500/30 text-rose-300 text-xs rounded-xl flex items-center gap-2.5">
+                <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />
+                <span>{resetError}</span>
+              </div>
+            )}
+
+            <p className="text-xs text-slate-400 leading-relaxed mb-4">
+              You are about to restore this warehouse's database back to factory defaults. This will permanently clear all items and transaction history scoped to <strong className="text-slate-200">"{warehouse?.name}"</strong> and reseed the default baseline dataset.
+            </p>
+
+            <form onSubmit={handleResetDataSubmit} className="space-y-4">
+              <div>
+                <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">
+                  Confirm Operator Password *
+                </label>
+                <input 
+                  id="reset_password_input"
+                  type="password"
+                  required
+                  placeholder="Enter your account password to authorize"
+                  value={resetPassword}
+                  onChange={(e) => setResetPassword(e.target.value)}
+                  className="w-full bg-slate-950 border border-slate-800 rounded-lg p-2.5 text-xs text-slate-250 focus:ring-1 focus:ring-indigo-500 outline-none"
+                />
+              </div>
+
+              {user?.provider !== 'email' && (
+                <p className="text-[10px] text-slate-500 leading-relaxed italic">
+                  Tip: For SSO simulated accounts (Google / Facebook), you can type "confirm", "reset", or your email to verify.
+                </p>
+              )}
+
+              <div className="border-t border-slate-800/85 pt-4 mt-5 flex items-center justify-end gap-3">
+                <button 
+                  id="btn_cancel_reset"
+                  type="button" 
+                  onClick={() => {
+                    setIsResetModalOpen(false);
+                    setResetError('');
+                    setResetPassword('');
+                  }}
+                  className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-slate-200 transition"
+                >
+                  Cancel
+                </button>
+                <button 
+                  id="btn_confirm_reset"
+                  type="submit" 
+                  disabled={resetSubmitting}
+                  className="px-5 py-2.5 bg-rose-600 hover:bg-rose-500 disabled:bg-rose-800 text-white font-bold text-xs rounded-xl transition flex items-center gap-1.5"
+                >
+                  {resetSubmitting ? (
+                    <span className="h-3 w-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                  ) : (
+                    <>
+                      <span>Wipe & Reset Database</span>
+                      <RotateCcw className="h-3 w-3" />
+                    </>
+                  )}
                 </button>
               </div>
 

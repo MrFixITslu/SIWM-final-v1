@@ -1,4 +1,5 @@
 import pg from 'pg';
+import crypto from 'crypto';
 import { 
   INITIAL_CATEGORIES, 
   INITIAL_SUPPLIERS, 
@@ -21,7 +22,49 @@ const dbConfig = {
 let pool: any = null;
 let usePostgres = false;
 
+// --- Multi-Tenant Symmetric Encryption Setup ---
+const JWT_SECRET = process.env.JWT_SECRET || 'siwm-production-secure-key-2026';
+
+function getWarehouseCryptoConfig(warehouseId: string) {
+  const key = crypto.createHash('sha256').update(warehouseId + JWT_SECRET).digest();
+  const iv = crypto.createHash('md5').update(warehouseId).digest();
+  return { key, iv };
+}
+
+export function encryptText(text: string | null | undefined, warehouseId: string): string {
+  if (!text) return '';
+  try {
+    const { key, iv } = getWarehouseCryptoConfig(warehouseId);
+    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+    let encrypted = cipher.update(text, 'utf8', 'hex');
+    encrypted += cipher.final('hex');
+    return 'enc_' + encrypted;
+  } catch (err) {
+    console.error('Encryption error:', err);
+    return text || '';
+  }
+}
+
+export function decryptText(encryptedText: string | null | undefined, warehouseId: string): string {
+  if (!encryptedText) return '';
+  if (!encryptedText.startsWith('enc_')) return encryptedText;
+  try {
+    const ciphertext = encryptedText.substring(4);
+    const { key, iv } = getWarehouseCryptoConfig(warehouseId);
+    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
+    let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
+    decrypted += decipher.final('utf8');
+    return decrypted;
+  } catch (err) {
+    return encryptedText;
+  }
+}
+
 // --- Multi-Tenant In-Memory Storage Fallbacks ---
+let memUserWarehouses: any[] = [
+  { user_id: 'usr-demo', warehouse_id: 'wh-demo' }
+];
+
 let memWarehouses: any[] = [
   { 
     id: 'wh-demo', 
@@ -208,6 +251,15 @@ async function runMigrations() {
     )
   `);
 
+  // 8. User Warehouses Mapping Table (Supporting up to 2 warehouses per user)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_warehouses (
+      user_id VARCHAR(50) NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      PRIMARY KEY (user_id, warehouse_id)
+    )
+  `);
+
   // Ensure default demo warehouse exists
   const whCheck = await pool.query("SELECT COUNT(*) FROM warehouses WHERE id = 'wh-demo'");
   if (parseInt(whCheck.rows[0].count, 10) === 0) {
@@ -228,6 +280,13 @@ async function runMigrations() {
     );
   }
 
+  // Ensure default demo mapping exists
+  await pool.query(`
+    INSERT INTO user_warehouses (user_id, warehouse_id)
+    VALUES ('usr-demo', 'wh-demo')
+    ON CONFLICT DO NOTHING
+  `);
+
   // Seed default dataset for demo warehouse
   await seedWarehouseData('wh-demo');
   console.log('PostgreSQL database migration and seed completed successfully.');
@@ -243,7 +302,7 @@ export async function seedWarehouseData(warehouseId: string) {
       for (const cat of INITIAL_CATEGORIES) {
         await pool.query(
           'INSERT INTO categories (id, warehouse_id, name, description, color) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING',
-          [`${cat.id}-${warehouseId}`, warehouseId, cat.name, cat.description, cat.color]
+          [`${cat.id}-${warehouseId}`, warehouseId, encryptText(cat.name, warehouseId), encryptText(cat.description, warehouseId), encryptText(cat.color, warehouseId)]
         );
       }
     }
@@ -255,7 +314,7 @@ export async function seedWarehouseData(warehouseId: string) {
       for (const s of INITIAL_SUPPLIERS) {
         await pool.query(
           'INSERT INTO suppliers (id, warehouse_id, name, contact_name, email, phone, address) VALUES ($1, $2, $3, $4, $5, $6, $7) ON CONFLICT DO NOTHING',
-          [`${s.id}-${warehouseId}`, warehouseId, s.name, s.contactName, s.email, s.phone, s.address]
+          [`${s.id}-${warehouseId}`, warehouseId, encryptText(s.name, warehouseId), encryptText(s.contactName, warehouseId), encryptText(s.email, warehouseId), encryptText(s.phone, warehouseId), encryptText(s.address, warehouseId)]
         );
       }
     }
@@ -267,7 +326,7 @@ export async function seedWarehouseData(warehouseId: string) {
       for (const z of INITIAL_ZONES) {
         await pool.query(
           'INSERT INTO zones (id, warehouse_id, name, description, max_capacity, color) VALUES ($1, $2, $3, $4, $5, $6) ON CONFLICT DO NOTHING',
-          [`${z.id}-${warehouseId}`, warehouseId, z.name, z.description, z.maxCapacity, z.color]
+          [`${z.id}-${warehouseId}`, warehouseId, encryptText(z.name, warehouseId), encryptText(z.description, warehouseId), z.maxCapacity, encryptText(z.color, warehouseId)]
         );
       }
     }
@@ -284,20 +343,20 @@ export async function seedWarehouseData(warehouseId: string) {
           [
             `${item.id}-${warehouseId}`,
             warehouseId,
-            item.name,
-            item.sku,
-            item.category,
+            encryptText(item.name, warehouseId),
+            encryptText(item.sku, warehouseId),
+            encryptText(item.category, warehouseId),
             item.quantity,
             item.unit,
             item.price,
-            item.warehouseLocation.zone,
-            item.warehouseLocation.aisle,
-            item.warehouseLocation.shelf,
-            item.warehouseLocation.bin,
+            encryptText(item.warehouseLocation.zone, warehouseId),
+            encryptText(item.warehouseLocation.aisle, warehouseId),
+            encryptText(item.warehouseLocation.shelf, warehouseId),
+            encryptText(item.warehouseLocation.bin, warehouseId),
             itemSupId,
             item.minThreshold,
             item.lastUpdated,
-            item.notes || ''
+            encryptText(item.notes || '', warehouseId)
           ]
         );
       }
@@ -315,13 +374,13 @@ export async function seedWarehouseData(warehouseId: string) {
             `${tx.id}-${warehouseId}`,
             warehouseId,
             `${tx.itemId}-${warehouseId}`,
-            tx.itemName,
-            tx.sku,
+            encryptText(tx.itemName, warehouseId),
+            encryptText(tx.sku, warehouseId),
             tx.type,
             tx.quantity,
-            tx.reason,
+            encryptText(tx.reason, warehouseId),
             tx.timestamp,
-            tx.operator
+            encryptText(tx.operator, warehouseId)
           ]
         );
       }
@@ -332,9 +391,11 @@ export async function seedWarehouseData(warehouseId: string) {
     if (memCategories.filter(c => c.warehouse_id === warehouseId).length === 0) {
       INITIAL_CATEGORIES.forEach(cat => {
         memCategories.push({
-          ...cat,
           id: `${cat.id}-${warehouseId}`,
-          warehouse_id: warehouseId
+          warehouse_id: warehouseId,
+          name: encryptText(cat.name, warehouseId),
+          description: encryptText(cat.description, warehouseId),
+          color: encryptText(cat.color, warehouseId)
         });
       });
     }
@@ -343,9 +404,13 @@ export async function seedWarehouseData(warehouseId: string) {
     if (memSuppliers.filter(s => s.warehouse_id === warehouseId).length === 0) {
       INITIAL_SUPPLIERS.forEach(s => {
         memSuppliers.push({
-          ...s,
           id: `${s.id}-${warehouseId}`,
-          warehouse_id: warehouseId
+          warehouse_id: warehouseId,
+          name: encryptText(s.name, warehouseId),
+          contactName: encryptText(s.contactName, warehouseId),
+          email: encryptText(s.email, warehouseId),
+          phone: encryptText(s.phone, warehouseId),
+          address: encryptText(s.address, warehouseId)
         });
       });
     }
@@ -354,9 +419,12 @@ export async function seedWarehouseData(warehouseId: string) {
     if (memZones.filter(z => z.warehouse_id === warehouseId).length === 0) {
       INITIAL_ZONES.forEach(z => {
         memZones.push({
-          ...z,
           id: `${z.id}-${warehouseId}`,
-          warehouse_id: warehouseId
+          warehouse_id: warehouseId,
+          name: encryptText(z.name, warehouseId),
+          description: encryptText(z.description, warehouseId),
+          maxCapacity: z.maxCapacity,
+          color: encryptText(z.color, warehouseId)
         });
       });
     }
@@ -365,10 +433,24 @@ export async function seedWarehouseData(warehouseId: string) {
     if (memItems.filter(i => i.warehouse_id === warehouseId).length === 0) {
       INITIAL_ITEMS.forEach(item => {
         memItems.push({
-          ...item,
           id: `${item.id}-${warehouseId}`,
           warehouse_id: warehouseId,
-          supplierId: item.supplierId ? `${item.supplierId}-${warehouseId}` : undefined
+          name: encryptText(item.name, warehouseId),
+          sku: encryptText(item.sku, warehouseId),
+          category: encryptText(item.category, warehouseId),
+          quantity: item.quantity,
+          unit: item.unit,
+          price: item.price,
+          warehouseLocation: {
+            zone: encryptText(item.warehouseLocation.zone, warehouseId),
+            aisle: encryptText(item.warehouseLocation.aisle, warehouseId),
+            shelf: encryptText(item.warehouseLocation.shelf, warehouseId),
+            bin: encryptText(item.warehouseLocation.bin, warehouseId)
+          },
+          supplierId: item.supplierId ? `${item.supplierId}-${warehouseId}` : undefined,
+          minThreshold: item.minThreshold,
+          lastUpdated: item.lastUpdated,
+          notes: encryptText(item.notes || '', warehouseId)
         });
       });
     }
@@ -377,10 +459,16 @@ export async function seedWarehouseData(warehouseId: string) {
     if (memTransactions.filter(t => t.warehouse_id === warehouseId).length === 0) {
       INITIAL_TRANSACTIONS.forEach(tx => {
         memTransactions.push({
-          ...tx,
           id: `${tx.id}-${warehouseId}`,
           warehouse_id: warehouseId,
-          itemId: `${tx.itemId}-${warehouseId}`
+          itemId: `${tx.itemId}-${warehouseId}`,
+          itemName: encryptText(tx.itemName, warehouseId),
+          sku: encryptText(tx.sku, warehouseId),
+          type: tx.type,
+          quantity: tx.quantity,
+          reason: encryptText(tx.reason, warehouseId),
+          timestamp: tx.timestamp,
+          operator: encryptText(tx.operator, warehouseId)
         });
       });
     }
@@ -487,87 +575,116 @@ export async function findWarehouseById(id: string) {
 // --- Tenant Scoped Data Queries ---
 
 export async function getCategories(warehouseId: string) {
+  let list = [];
   if (usePostgres) {
     const res = await pool.query('SELECT * FROM categories WHERE warehouse_id = $1', [warehouseId]);
-    return res.rows;
+    list = res.rows;
+  } else {
+    list = memCategories.filter(c => c.warehouse_id === warehouseId);
   }
-  return memCategories.filter(c => c.warehouse_id === warehouseId);
+  return list.map((row: any) => ({
+    id: row.id,
+    name: decryptText(row.name, warehouseId),
+    description: decryptText(row.description, warehouseId),
+    color: decryptText(row.color, warehouseId),
+  }));
 }
 
 export async function getSuppliers(warehouseId: string) {
+  let list = [];
   if (usePostgres) {
     const res = await pool.query('SELECT * FROM suppliers WHERE warehouse_id = $1', [warehouseId]);
-    return res.rows.map((row: any) => ({
-      id: row.id,
-      name: row.name,
-      contactName: row.contact_name,
-      email: row.email,
-      phone: row.phone,
-      address: row.address,
-    }));
+    list = res.rows;
+  } else {
+    list = memSuppliers.filter(s => s.warehouse_id === warehouseId);
   }
-  return memSuppliers.filter(s => s.warehouse_id === warehouseId);
+  return list.map((row: any) => ({
+    id: row.id,
+    name: decryptText(row.name, warehouseId),
+    contactName: decryptText(row.contact_name || row.contactName, warehouseId),
+    email: decryptText(row.email, warehouseId),
+    phone: decryptText(row.phone, warehouseId),
+    address: decryptText(row.address, warehouseId),
+  }));
 }
 
 export async function getZones(warehouseId: string) {
+  let list = [];
   if (usePostgres) {
     const res = await pool.query('SELECT * FROM zones WHERE warehouse_id = $1', [warehouseId]);
-    return res.rows.map((row: any) => ({
-      id: row.id,
-      name: row.name,
-      description: row.description,
-      maxCapacity: row.max_capacity,
-      color: row.color,
-    }));
+    list = res.rows;
+  } else {
+    list = memZones.filter(z => z.warehouse_id === warehouseId);
   }
-  return memZones.filter(z => z.warehouse_id === warehouseId);
+  return list.map((row: any) => ({
+    id: row.id,
+    name: decryptText(row.name, warehouseId),
+    description: decryptText(row.description, warehouseId),
+    maxCapacity: row.max_capacity || row.maxCapacity,
+    color: decryptText(row.color, warehouseId),
+  }));
 }
 
 export async function getItems(warehouseId: string) {
+  let list = [];
   if (usePostgres) {
     const res = await pool.query('SELECT * FROM items WHERE warehouse_id = $1 ORDER BY last_updated DESC', [warehouseId]);
-    return res.rows.map((row: any) => ({
-      id: row.id,
-      name: row.name,
-      sku: row.sku,
-      category: row.category,
-      quantity: row.quantity,
-      unit: row.unit,
-      price: parseFloat(row.price),
-      warehouseLocation: {
-        zone: row.zone,
-        aisle: row.aisle,
-        shelf: row.shelf,
-        bin: row.bin,
-      },
-      supplierId: row.supplier_id,
-      minThreshold: row.min_threshold,
-      lastUpdated: row.last_updated.toISOString(),
-      notes: row.notes,
-    }));
+    list = res.rows;
+  } else {
+    list = memItems.filter(i => i.warehouse_id === warehouseId);
   }
-  return memItems.filter(i => i.warehouse_id === warehouseId);
+  return list.map((row: any) => ({
+    id: row.id,
+    name: decryptText(row.name, warehouseId),
+    sku: decryptText(row.sku, warehouseId),
+    category: decryptText(row.category, warehouseId),
+    quantity: row.quantity,
+    unit: row.unit,
+    price: parseFloat(row.price),
+    warehouseLocation: {
+      zone: decryptText(row.zone || (row.warehouseLocation && row.warehouseLocation.zone), warehouseId),
+      aisle: decryptText(row.aisle || (row.warehouseLocation && row.warehouseLocation.aisle), warehouseId),
+      shelf: decryptText(row.shelf || (row.warehouseLocation && row.warehouseLocation.shelf), warehouseId),
+      bin: decryptText(row.bin || (row.warehouseLocation && row.warehouseLocation.bin), warehouseId),
+    },
+    supplierId: row.supplier_id || row.supplierId,
+    minThreshold: row.min_threshold || row.minThreshold,
+    lastUpdated: (row.last_updated ? (typeof row.last_updated === 'string' ? row.last_updated : row.last_updated.toISOString()) : (row.lastUpdated || new Date().toISOString())),
+    notes: decryptText(row.notes, warehouseId),
+  }));
 }
 
 export async function getTransactions(warehouseId: string) {
+  let list = [];
   if (usePostgres) {
     const res = await pool.query('SELECT * FROM transactions WHERE warehouse_id = $1 ORDER BY timestamp DESC', [warehouseId]);
-    return res.rows.map((row: any) => ({
-      id: row.id,
-      itemId: row.item_id,
-      itemName: row.item_name,
-      sku: row.sku,
-      type: row.type,
-      quantity: row.quantity,
-      reason: row.reason,
-      timestamp: row.timestamp.toISOString(),
-      operator: row.operator,
-    }));
+    list = res.rows;
+  } else {
+    list = memTransactions.filter(t => t.warehouse_id === warehouseId);
   }
-  return memTransactions.filter(t => t.warehouse_id === warehouseId);
+  return list.map((row: any) => ({
+    id: row.id,
+    itemId: row.item_id || row.itemId,
+    itemName: decryptText(row.item_name || row.itemName, warehouseId),
+    sku: decryptText(row.sku, warehouseId),
+    type: row.type,
+    quantity: row.quantity,
+    reason: decryptText(row.reason, warehouseId),
+    timestamp: (row.timestamp ? (typeof row.timestamp === 'string' ? row.timestamp : row.timestamp.toISOString()) : (row.timestamp || new Date().toISOString())),
+    operator: decryptText(row.operator, warehouseId),
+  }));
 }
 
 export async function saveItem(item: any, warehouseId: string) {
+  const encName = encryptText(item.name, warehouseId);
+  const encSku = encryptText(item.sku, warehouseId);
+  const encCategory = encryptText(item.category, warehouseId);
+  const encZone = encryptText(item.warehouseLocation.zone, warehouseId);
+  const encAisle = encryptText(item.warehouseLocation.aisle, warehouseId);
+  const encShelf = encryptText(item.warehouseLocation.shelf, warehouseId);
+  const encBin = encryptText(item.warehouseLocation.bin, warehouseId);
+  const encNotes = encryptText(item.notes || '', warehouseId);
+
   if (usePostgres) {
     await pool.query(
       `INSERT INTO items (id, warehouse_id, name, sku, category, quantity, unit, price, zone, aisle, shelf, bin, supplier_id, min_threshold, last_updated, notes) 
@@ -575,31 +692,50 @@ export async function saveItem(item: any, warehouseId: string) {
       [
         item.id,
         warehouseId,
-        item.name,
-        item.sku,
-        item.category,
+        encName,
+        encSku,
+        encCategory,
         item.quantity,
         item.unit,
         item.price,
-        item.warehouseLocation.zone,
-        item.warehouseLocation.aisle,
-        item.warehouseLocation.shelf,
-        item.warehouseLocation.bin,
+        encZone,
+        encAisle,
+        encShelf,
+        encBin,
         item.supplierId || null,
         item.minThreshold,
         item.lastUpdated,
-        item.notes || ''
+        encNotes
       ]
     );
   } else {
     memItems.unshift({
       ...item,
-      warehouse_id: warehouseId
+      warehouse_id: warehouseId,
+      name: encName,
+      sku: encSku,
+      category: encCategory,
+      warehouseLocation: {
+        zone: encZone,
+        aisle: encAisle,
+        shelf: encShelf,
+        bin: encBin
+      },
+      notes: encNotes
     });
   }
 }
 
 export async function updateItem(id: string, item: any, warehouseId: string) {
+  const encName = encryptText(item.name, warehouseId);
+  const encSku = encryptText(item.sku, warehouseId);
+  const encCategory = encryptText(item.category, warehouseId);
+  const encZone = encryptText(item.warehouseLocation.zone, warehouseId);
+  const encAisle = encryptText(item.warehouseLocation.aisle, warehouseId);
+  const encShelf = encryptText(item.warehouseLocation.shelf, warehouseId);
+  const encBin = encryptText(item.warehouseLocation.bin, warehouseId);
+  const encNotes = encryptText(item.notes || '', warehouseId);
+
   if (usePostgres) {
     await pool.query(
       `UPDATE items SET 
@@ -619,26 +755,39 @@ export async function updateItem(id: string, item: any, warehouseId: string) {
         notes = $14 
        WHERE id = $15 AND warehouse_id = $16`,
       [
-        item.name,
-        item.sku,
-        item.category,
+        encName,
+        encSku,
+        encCategory,
         item.quantity,
         item.unit,
         item.price,
-        item.warehouseLocation.zone,
-        item.warehouseLocation.aisle,
-        item.warehouseLocation.shelf,
-        item.warehouseLocation.bin,
+        encZone,
+        encAisle,
+        encShelf,
+        encBin,
         item.supplierId || null,
         item.minThreshold,
         item.lastUpdated,
-        item.notes || '',
+        encNotes,
         id,
         warehouseId
       ]
     );
   } else {
-    memItems = memItems.map(i => (i.id === id && i.warehouse_id === warehouseId) ? { ...i, ...item } : i);
+    memItems = memItems.map(i => (i.id === id && i.warehouse_id === warehouseId) ? { 
+      ...i, 
+      ...item,
+      name: encName,
+      sku: encSku,
+      category: encCategory,
+      warehouseLocation: {
+        zone: encZone,
+        aisle: encAisle,
+        shelf: encShelf,
+        bin: encBin
+      },
+      notes: encNotes
+    } : i);
   }
 }
 
@@ -651,6 +800,11 @@ export async function deleteItem(id: string, warehouseId: string) {
 }
 
 export async function saveTransaction(tx: any, warehouseId: string) {
+  const encItemName = encryptText(tx.itemName, warehouseId);
+  const encSku = encryptText(tx.sku, warehouseId);
+  const encReason = encryptText(tx.reason, warehouseId);
+  const encOperator = encryptText(tx.operator, warehouseId);
+
   if (usePostgres) {
     await pool.query(
       `INSERT INTO transactions (id, warehouse_id, item_id, item_name, sku, type, quantity, reason, timestamp, operator) 
@@ -659,19 +813,23 @@ export async function saveTransaction(tx: any, warehouseId: string) {
         tx.id,
         warehouseId,
         tx.itemId,
-        tx.itemName,
-        tx.sku,
+        encItemName,
+        encSku,
         tx.type,
         tx.quantity,
-        tx.reason,
+        encReason,
         tx.timestamp,
-        tx.operator
+        encOperator
       ]
     );
   } else {
     memTransactions.unshift({
       ...tx,
-      warehouse_id: warehouseId
+      warehouse_id: warehouseId,
+      itemName: encItemName,
+      sku: encSku,
+      reason: encReason,
+      operator: encOperator
     });
   }
 }
@@ -694,5 +852,59 @@ export async function resetDb(warehouseId: string) {
     memCategories = memCategories.filter(c => c.warehouse_id !== warehouseId);
     memZones = memZones.filter(z => z.warehouse_id !== warehouseId);
     await seedWarehouseData(warehouseId);
+  }
+}
+
+// --- User Warehouses Mapping Helpers ---
+
+export async function associateUserWithWarehouse(userId: string, warehouseId: string) {
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO user_warehouses (user_id, warehouse_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
+      [userId, warehouseId]
+    );
+  } else {
+    const exists = memUserWarehouses.some(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
+    if (!exists) {
+      memUserWarehouses.push({ user_id: userId, warehouse_id: warehouseId });
+    }
+  }
+}
+
+export async function getUserWarehouses(userId: string) {
+  if (usePostgres) {
+    const res = await pool.query(
+      `SELECT w.* FROM warehouses w
+       JOIN user_warehouses uw ON w.id = uw.warehouse_id
+       WHERE uw.user_id = $1`,
+      [userId]
+    );
+    return res.rows;
+  } else {
+    const matches = memUserWarehouses.filter(uw => uw.user_id === userId);
+    return matches.map(uw => memWarehouses.find(w => w.id === uw.warehouse_id)).filter(Boolean);
+  }
+}
+
+export async function isUserInWarehouse(userId: string, warehouseId: string) {
+  if (usePostgres) {
+    const res = await pool.query(
+      `SELECT 1 FROM user_warehouses WHERE user_id = $1 AND warehouse_id = $2`,
+      [userId, warehouseId]
+    );
+    return res.rows.length > 0;
+  } else {
+    return memUserWarehouses.some(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
+  }
+}
+
+export async function updateUserActiveWarehouse(userId: string, warehouseId: string) {
+  if (usePostgres) {
+    await pool.query(
+      `UPDATE users SET warehouse_id = $1 WHERE id = $2`,
+      [warehouseId, userId]
+    );
+  } else {
+    memUsers = memUsers.map(u => u.id === userId ? { ...u, warehouseId } : u);
   }
 }
