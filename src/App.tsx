@@ -1118,8 +1118,11 @@ export default function App() {
   };
 
   // --- Interactive Shelf Cell Layout ---
-  const mapAisles = ['Aisle 01', 'Aisle 02', 'Aisle 03', 'Aisle 04'];
-  const mapShelves = ['Level 3', 'Level 2', 'Level 1']; // Top down representation
+  const rowsCount = warehouse?.layout_rows || 5;
+  const colsCount = warehouse?.layout_cols || 5;
+
+  const mapAisles = Array.from({ length: rowsCount }, (_, i) => `Aisle ${String(i + 1).padStart(2, '0')}`);
+  const mapShelves = Array.from({ length: colsCount }, (_, i) => `Level ${colsCount - i}`); // Top down representation
 
   // Find item stored at map cell coordinates
   const getItemAtLocation = (zone: string, aisle: string, shelf: string) => {
@@ -1613,7 +1616,7 @@ export default function App() {
               >
                 <div className="flex items-center gap-3">
                   <Settings className={`h-4.5 w-4.5 ${activeTab === 'settings' ? 'text-white' : 'text-slate-400 group-hover:text-indigo-400'}`} />
-                  <span>Setup & Permissions</span>
+                  <span>Setup</span>
                 </div>
                 <div className="flex items-center gap-1.5">
                   <span className="text-[9px] bg-slate-800 group-hover:bg-indigo-500/25 text-slate-300 group-hover:text-indigo-300 font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wide border border-slate-700 group-hover:border-indigo-500/30 transition duration-150">
@@ -2295,7 +2298,11 @@ export default function App() {
                     </div>
 
                     {/* PHYSICAL GRID */}
-                    <div className="grid grid-cols-4 gap-4 flex-1" id="grid_bays">
+                    <div 
+                      className="grid gap-4 flex-1" 
+                      id="grid_bays"
+                      style={{ gridTemplateColumns: `repeat(${mapAisles.length}, minmax(0, 1fr))` }}
+                    >
                       {mapAisles.map(aisle => (
                         <div key={aisle} className="space-y-4" id={`aisle_column_${aisle.replace(' ', '')}`}>
                           <div className="text-center py-1.5 bg-slate-950 border border-slate-850 rounded-lg text-xs font-bold text-indigo-400">
