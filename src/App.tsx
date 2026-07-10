@@ -122,9 +122,11 @@ export default function App() {
   const [resetSubmitting, setResetSubmitting] = useState(false);
   const [resetError, setResetError] = useState('');
 
-  // System-wide administrative wipe states
+  // Wipe-my-account-and-warehouse states (admin-only, requires an authenticated,
+  // existing account - this can never run for a logged-out visitor)
   const [isSystemWipeModalOpen, setIsSystemWipeModalOpen] = useState(false);
   const [systemWipeConfirmWord, setSystemWipeConfirmWord] = useState('');
+  const [systemWipePassword, setSystemWipePassword] = useState('');
   const [systemWipeSubmitting, setSystemWipeSubmitting] = useState(false);
   const [systemWipeError, setSystemWipeError] = useState('');
 
@@ -293,12 +295,6 @@ export default function App() {
   }, [token]);
 
   // --- Auth Handlers ---
-  const [oauthDialog, setOauthDialog] = useState<{ isOpen: boolean; provider: string; step: 'connecting' | 'verifying' | 'complete' }>({
-    isOpen: false,
-    provider: '',
-    step: 'connecting'
-  });
-
   const handleEmailAuth = async (e: React.FormEvent) => {
     e.preventDefault();
     setAuthError('');
@@ -383,68 +379,6 @@ export default function App() {
     } finally {
       setAuthSubmitting(false);
     }
-  };
-
-  const handleOAuthSimulate = (provider: 'google' | 'facebook') => {
-    setOauthDialog({
-      isOpen: true,
-      provider: provider === 'google' ? 'Google Workspace ID' : 'Facebook Secure Access',
-      step: 'connecting'
-    });
-
-    setTimeout(() => {
-      setOauthDialog(prev => ({ ...prev, step: 'verifying' }));
-
-      setTimeout(async () => {
-        try {
-          const mockEmail = provider === 'google' ? 'Vision79SLU@gmail.com' : 'vision.fb.operator@meta-tenant.org';
-          const mockName = provider === 'google' ? 'Vision79 Operator' : 'Facebook Logistics Pro';
-          const mockProviderId = `${provider}-id-${Math.floor(100000 + Math.random() * 900000)}`;
-
-          const payload: any = {
-            email: mockEmail,
-            name: mockName,
-            provider,
-            providerId: mockProviderId
-          };
-
-          if (isRegisterMode) {
-            payload.warehouseOption = warehouseOption;
-            payload.warehouseName = warehouseName || `${mockName}'s Logistics Center`;
-            payload.warehouseAddress = warehouseAddress || 'Global Operations Hub';
-            payload.warehouseCode = warehouseCode.toUpperCase().trim();
-          }
-
-          const res = await fetch('/api/auth/oauth', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          });
-
-          const data = await res.json();
-          if (res.ok) {
-            localStorage.setItem('siwm_token', data.token);
-            localStorage.setItem('siwm_user', JSON.stringify(data.user));
-            localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
-            setToken(data.token);
-            setUser(data.user);
-            setWarehouse(data.warehouse);
-            setOauthDialog(prev => ({ ...prev, step: 'complete' }));
-            setTimeout(() => {
-              setOauthDialog({ isOpen: false, provider: '', step: 'connecting' });
-              showToast(`Identified via ${provider === 'google' ? 'Google' : 'Facebook'}. Access Granted.`, 'success');
-              confetti({ particleCount: 50, spread: 50 });
-            }, 800);
-          } else {
-            setOauthDialog({ isOpen: false, provider: '', step: 'connecting' });
-            setAuthError(data.error || 'Failed to authenticate via SSO provider.');
-          }
-        } catch (err) {
-          setOauthDialog({ isOpen: false, provider: '', step: 'connecting' });
-          setAuthError('Connection failed validating OAuth credentials.');
-        }
-      }, 1200);
-    }, 1200);
   };
 
   // --- UI Navigation ---
@@ -716,9 +650,14 @@ export default function App() {
     }
   };
 
-  // --- Administrative System-Wide Wipe Handlers ---
+  // --- Delete My Warehouse & Account Handlers (admin-only, own tenant only) ---
   const handleSystemWipe = () => {
+    if (userRole !== 'admin') {
+      showToast('Only Administrators can delete a warehouse and its data.', 'error');
+      return;
+    }
     setSystemWipeConfirmWord('');
+    setSystemWipePassword('');
     setSystemWipeError('');
     setIsSystemWipeModalOpen(true);
   };
@@ -729,18 +668,28 @@ export default function App() {
       setSystemWipeError('Please type "WIPE" in all uppercase letters to authorize.');
       return;
     }
+    if (!systemWipePassword) {
+      setSystemWipeError('Please enter your password to confirm this irreversible action.');
+      return;
+    }
 
     setSystemWipeError('');
     setSystemWipeSubmitting(true);
     try {
-      const res = await fetch('/api/system/wipe-all', {
-        method: 'POST'
+      const res = await fetch('/api/account/wipe-my-data', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`
+        },
+        body: JSON.stringify({ password: systemWipePassword, confirm: 'WIPE' })
       });
       const data = await res.json();
       if (res.ok) {
         setIsSystemWipeModalOpen(false);
         setSystemWipeConfirmWord('');
-        
+        setSystemWipePassword('');
+
         // Log out immediately & clean state completely
         localStorage.removeItem('siwm_token');
         localStorage.removeItem('siwm_user');
@@ -754,14 +703,14 @@ export default function App() {
         setTransactions([]);
         setSuppliers([]);
         setCategories([]);
-        
-        showToast("System reset completed. All accounts and stored/simulated data have been purged.", "info");
+
+        showToast("Your warehouse and account have been permanently deleted.", "info");
         confetti({ particleCount: 50, spread: 80 });
       } else {
-        setSystemWipeError(data.error || "Failed to perform administrative wipe.");
+        setSystemWipeError(data.error || "Failed to delete account and warehouse data.");
       }
     } catch (err) {
-      setSystemWipeError("Network error occurred during administrative system-wide wipe.");
+      setSystemWipeError("Network error occurred while deleting your account and warehouse data.");
     } finally {
       setSystemWipeSubmitting(false);
     }
@@ -1241,8 +1190,8 @@ export default function App() {
                       <Check className="h-3.5 w-3.5" />
                     </div>
                     <div>
-                      <h4 className="text-xs font-bold text-slate-200">Federated Identity Login</h4>
-                      <p className="text-[11px] text-slate-450 mt-0.5">Fully integrated authentication with standard single-sign-on.</p>
+                      <h4 className="text-xs font-bold text-slate-200">Encrypted Tenant Data</h4>
+                      <p className="text-[11px] text-slate-450 mt-0.5">Per-warehouse fields are encrypted at rest with AES-256-GCM.</p>
                     </div>
                   </div>
                 </div>
@@ -1254,14 +1203,6 @@ export default function App() {
                 <span>STATUS: ONLINE</span>
                 <span>VER 4.1.0</span>
               </div>
-              <button
-                id="btn_system_wipe"
-                type="button"
-                onClick={handleSystemWipe}
-                className="w-full text-center py-2 px-3 border border-dashed border-rose-500/20 hover:border-rose-500/60 bg-rose-500/5 hover:bg-rose-500/10 rounded-xl text-rose-400 hover:text-rose-300 transition duration-200 font-bold tracking-wide uppercase cursor-pointer"
-              >
-                ⚠️ WIPE SYSTEM & RESET ACCOUNTS
-              </button>
             </div>
           </div>
 
@@ -1432,45 +1373,6 @@ export default function App() {
               </button>
             </form>
 
-            {/* Social SSO Authentication divider */}
-            <div className="relative my-6">
-              <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-slate-800"></div>
-              </div>
-              <div className="relative flex justify-center text-xs">
-                <span className="bg-slate-900 px-3 text-slate-500 font-medium uppercase tracking-wider">Or Access Securely Via SSO</span>
-              </div>
-            </div>
-
-            {/* SSO buttons */}
-            <div className="grid grid-cols-2 gap-3">
-              <button
-                id="btn_sso_google"
-                type="button"
-                onClick={() => handleOAuthSimulate('google')}
-                className="py-2.5 px-4 bg-slate-950 hover:bg-slate-950/85 border border-slate-800 rounded-xl text-slate-300 font-semibold text-xs flex items-center justify-center gap-2.5 transition"
-              >
-                <svg className="h-4 w-4" viewBox="0 0 24 24">
-                  <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
-                  <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-                  <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.06H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.94l3.66-2.85z" />
-                  <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.06l3.66 2.85c.87-2.6 3.3-4.53 6.16-4.53z" />
-                </svg>
-                Google Portal
-              </button>
-              <button
-                id="btn_sso_facebook"
-                type="button"
-                onClick={() => handleOAuthSimulate('facebook')}
-                className="py-2.5 px-4 bg-slate-950 hover:bg-slate-950/85 border border-slate-800 rounded-xl text-slate-300 font-semibold text-xs flex items-center justify-center gap-2.5 transition"
-              >
-                <svg className="h-4 w-4 text-[#1877F2]" fill="currentColor" viewBox="0 0 24 24">
-                  <path d="M24 12.073c0-6.627-5.373-12-12-12s-12 5.373-12 12c0 5.99 4.388 10.954 10.125 11.854v-8.385H7.078v-3.47h3.047V9.43c0-3.007 1.792-4.669 4.533-4.669 1.312 0 2.686.235 2.686.235v2.953H15.83c-1.491 0-1.956.925-1.956 1.874v2.25h3.328l-.532 3.47h-2.796v8.385C19.612 23.027 24 18.062 24 12.073z" />
-                </svg>
-                Meta Identity
-              </button>
-            </div>
-
             {/* Toggle Mode */}
             <div className="mt-8 text-center text-xs">
               <button
@@ -1490,29 +1392,6 @@ export default function App() {
 
           </div>
         </div>
-
-        {/* OAuth Loading Popup Modal */}
-        {oauthDialog.isOpen && (
-          <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/90 backdrop-blur-md p-4 animate-fade-in" id="oauth_loading_modal">
-            <div className="bg-slate-900 border border-slate-800/80 rounded-2xl max-w-sm w-full p-6 text-center shadow-2xl relative">
-              <div className="mx-auto h-12 w-12 rounded-full bg-indigo-500/10 flex items-center justify-center text-indigo-400 mb-4">
-                {oauthDialog.step === 'complete' ? (
-                  <Check className="h-6 w-6 text-emerald-400 animate-bounce" />
-                ) : (
-                  <div className="h-5 w-5 border-2 border-indigo-400 border-t-transparent rounded-full animate-spin"></div>
-                )}
-              </div>
-              <h3 className="text-sm font-bold text-white mb-2 uppercase tracking-wide">
-                {oauthDialog.step === 'connecting' ? 'Contacting Provider' : oauthDialog.step === 'verifying' ? 'Verifying Credentials' : 'Access Approved'}
-              </h3>
-              <p className="text-xs text-slate-400 leading-relaxed">
-                {oauthDialog.step === 'connecting' && `Connecting secure link to ${oauthDialog.provider}...`}
-                {oauthDialog.step === 'verifying' && `Validating secure session with ${oauthDialog.provider}...`}
-                {oauthDialog.step === 'complete' && 'Establishing secure connection tunnel.'}
-              </p>
-            </div>
-          </div>
-        )}
 
       </div>
     );
@@ -1775,15 +1654,17 @@ export default function App() {
               Sign Out Operator
             </button>
 
-            <button 
-              id="btn_sidebar_system_wipe"
-              type="button"
-              onClick={handleSystemWipe}
-              className="w-full flex items-center justify-center gap-2 py-2 px-3 text-xs bg-rose-950/20 hover:bg-rose-900/30 border border-rose-900/30 hover:border-rose-500/50 rounded-lg text-rose-400 hover:text-rose-300 transition font-semibold"
-            >
-              <Trash2 className="h-3 w-3" />
-              Wipe System Accounts
-            </button>
+            {userRole === 'admin' && (
+              <button
+                id="btn_sidebar_system_wipe"
+                type="button"
+                onClick={handleSystemWipe}
+                className="w-full flex items-center justify-center gap-2 py-2 px-3 text-xs bg-rose-950/20 hover:bg-rose-900/30 border border-rose-900/30 hover:border-rose-500/50 rounded-lg text-rose-400 hover:text-rose-300 transition font-semibold"
+              >
+                <Trash2 className="h-3 w-3" />
+                Delete Warehouse & Account
+              </button>
+            )}
           </div>
         </aside>
 
@@ -3149,7 +3030,7 @@ export default function App() {
                             </button>
                           </div>
                           <p className="text-[10px] text-slate-500">
-                            Inviting a new email automatically generates a login credential with default password <span className="font-mono text-slate-400">welcome123</span>.
+                            Inviting a new email automatically generates a unique temporary password, shown once after the invite is sent.
                           </p>
                         </form>
                       </div>
@@ -3919,13 +3800,13 @@ export default function App() {
         </div>
       )}
 
-      {/* ==================== FORM MODAL 6: SYSTEM-WIDE DESTRUCTIVE WIPE ==================== */}
+      {/* ==================== FORM MODAL 6: DELETE WAREHOUSE & ACCOUNT ==================== */}
       {isSystemWipeModalOpen && (
         <div id="modal_system_wipe_destructive" className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/90 backdrop-blur-md p-4 animate-fade-in">
           <div className="bg-slate-900 border-2 border-rose-500/30 rounded-2xl max-w-md w-full p-6 shadow-2xl relative animate-scale-up text-slate-200">
             <h3 className="text-lg font-bold text-rose-400 border-b border-slate-800 pb-3 mb-4 flex items-center gap-2">
               <AlertTriangle className="h-6 w-6 text-rose-500 animate-bounce" />
-              CRITICAL: Administrative System Wipe
+              Delete Warehouse &amp; Account
             </h3>
 
             {systemWipeError && (
@@ -3937,16 +3818,15 @@ export default function App() {
 
             <div className="space-y-3 text-xs text-slate-400 leading-relaxed mb-5">
               <p>
-                This action is extremely destructive and irreversible. You are about to:
+                This action only affects your own warehouse and account - other tenants are never touched. You are about to:
               </p>
               <ul className="list-disc pl-5 space-y-1 text-rose-300 font-medium">
-                <li>Permanently delete ALL operator and tenant user accounts.</li>
-                <li>Destroy all created warehouse databases &amp; clearance codes.</li>
-                <li>Wipe all stored inventory items, transactions, suppliers, and historical audit sheets.</li>
-                <li>Reset the multi-tenant PostgreSQL tables and memory arrays to a pristine blank slate.</li>
+                <li>Permanently delete this warehouse's items, transactions, categories, suppliers, and zones.</li>
+                <li>Remove this warehouse's clearance code, so no one can join it anymore.</li>
+                <li>Delete your own account, if you have no other warehouse associated with it.</li>
               </ul>
               <p className="font-semibold text-slate-300">
-                Type the verification word <span className="text-white bg-slate-950 px-1.5 py-0.5 rounded font-mono font-bold">WIPE</span> below to confirm your authority.
+                Type the verification word <span className="text-white bg-slate-950 px-1.5 py-0.5 rounded font-mono font-bold">WIPE</span> and enter your password to confirm.
               </p>
             </div>
 
@@ -3966,6 +3846,21 @@ export default function App() {
                 />
               </div>
 
+              <div>
+                <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">
+                  Your password *
+                </label>
+                <input
+                  id="system_wipe_password_input"
+                  type="password"
+                  required
+                  placeholder="Confirm your account password"
+                  value={systemWipePassword}
+                  onChange={(e) => setSystemWipePassword(e.target.value)}
+                  className="w-full bg-slate-950 border border-rose-500/30 rounded-lg p-2.5 text-xs text-slate-250 focus:ring-1 focus:ring-rose-500 outline-none"
+                />
+              </div>
+
               <div className="border-t border-slate-800/85 pt-4 mt-5 flex items-center justify-end gap-3">
                 <button 
                   id="btn_cancel_system_wipe"
@@ -3974,6 +3869,7 @@ export default function App() {
                     setIsSystemWipeModalOpen(false);
                     setSystemWipeError('');
                     setSystemWipeConfirmWord('');
+                    setSystemWipePassword('');
                   }}
                   className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-slate-200 transition"
                 >
@@ -3989,7 +3885,7 @@ export default function App() {
                     <span className="h-3 w-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
                   ) : (
                     <>
-                      <span>Wipe Database &amp; Accounts</span>
+                      <span>Delete Warehouse &amp; Account</span>
                       <Trash2 className="h-3 w-3" />
                     </>
                   )}

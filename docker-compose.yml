@@ -1,37 +1,23 @@
-version: '3.8'
-
 services:
-  siwm-backend:
+  siwm:
     build:
       context: .
-      dockerfile: Dockerfile.backend
-    container_name: siwm-backend
+      dockerfile: Dockerfile
+    container_name: siwm
     restart: unless-stopped
+    env_file:
+      - .env
     environment:
       - NODE_ENV=production
-      - PORT=4001
-      # Connects to the existing PostgreSQL container on 'proxy_network'
-      - DATABASE_URL=postgres://postgres:postgres@postgres:5432/postgres
-      - PGHOST=postgres
-      - PGPORT=5432
-      - PGUSER=postgres
-      - PGPASSWORD=postgres
-      - PGDATABASE=postgres
+      # If your Nginx Proxy Manager host for siwm.v79sl.duckdns.org already
+      # targets a specific port (e.g. 3060 from an earlier deployment), set
+      # PORT to that same value in .env so you don't have to touch NPM.
+      - PORT=${PORT:-4001}
     networks:
       - proxy_network
-
-  siwm-frontend:
-    build:
-      context: .
-      dockerfile: Dockerfile.frontend
-    container_name: siwm-frontend
-    restart: unless-stopped
-    ports:
-      - "4000:4000"
-    depends_on:
-      - siwm-backend
-    networks:
-      - proxy_network
+    # No ports: published to the host on purpose - Nginx Proxy Manager reaches
+    # this container over proxy_network by container name + PORT, the same
+    # pattern used by this operator's other apps (FFPRO, GIBD, Tiquet).
 
 networks:
   proxy_network:

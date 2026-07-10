@@ -24,22 +24,35 @@ let pool: any = null;
 let usePostgres = false;
 
 // --- Multi-Tenant Symmetric Encryption Setup ---
-const JWT_SECRET = process.env.JWT_SECRET || 'siwm-production-secure-key-2026';
+// Kept as its own secret, separate from JWT_SECRET, so rotating login sessions
+// never silently breaks decryption of already-stored data. The historical
+// default is preserved here (rather than failing fast like JWT_SECRET) so any
+// data already encrypted with it keeps decrypting after this upgrade. Set
+// DATA_ENCRYPTION_SECRET explicitly for new deployments; rotating it on an
+// existing deployment requires re-encrypting stored data first.
+const DATA_ENCRYPTION_SECRET = process.env.DATA_ENCRYPTION_SECRET || 'siwm-production-secure-key-2026';
+if (!process.env.DATA_ENCRYPTION_SECRET && process.env.NODE_ENV === 'production') {
+  console.warn('⚠️  DATA_ENCRYPTION_SECRET not set - falling back to the default key baked into this repo. Set DATA_ENCRYPTION_SECRET in your .env for a real deployment.');
+}
 
-function getWarehouseCryptoConfig(warehouseId: string) {
-  const key = crypto.createHash('sha256').update(warehouseId + JWT_SECRET).digest();
-  const iv = crypto.createHash('md5').update(warehouseId).digest();
-  return { key, iv };
+// Whether to auto-create the built-in demo account/warehouse on every boot.
+// Defaults OFF so a fresh/wiped database actually stays fresh across restarts.
+const SEED_DEMO_DATA = (process.env.SEED_DEMO_DATA || 'false').toLowerCase() === 'true';
+
+function getWarehouseKey(warehouseId: string): Buffer {
+  return crypto.createHash('sha256').update(warehouseId + DATA_ENCRYPTION_SECRET).digest();
 }
 
 export function encryptText(text: string | null | undefined, warehouseId: string): string {
   if (!text) return '';
   try {
-    const { key, iv } = getWarehouseCryptoConfig(warehouseId);
-    const cipher = crypto.createCipheriv('aes-256-cbc', key, iv);
+    const key = getWarehouseKey(warehouseId);
+    const iv = crypto.randomBytes(12);
+    const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
     let encrypted = cipher.update(text, 'utf8', 'hex');
     encrypted += cipher.final('hex');
-    return 'enc_' + encrypted;
+    const authTag = cipher.getAuthTag().toString('hex');
+    return `encv2_${iv.toString('hex')}:${authTag}:${encrypted}`;
   } catch (err) {
     console.error('Encryption error:', err);
     return text || '';
@@ -48,17 +61,41 @@ export function encryptText(text: string | null | undefined, warehouseId: string
 
 export function decryptText(encryptedText: string | null | undefined, warehouseId: string): string {
   if (!encryptedText) return '';
-  if (!encryptedText.startsWith('enc_')) return encryptedText;
-  try {
-    const ciphertext = encryptedText.substring(4);
-    const { key, iv } = getWarehouseCryptoConfig(warehouseId);
-    const decipher = crypto.createDecipheriv('aes-256-cbc', key, iv);
-    let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
-    decrypted += decipher.final('utf8');
-    return decrypted;
-  } catch (err) {
-    return encryptedText;
+  const key = getWarehouseKey(warehouseId);
+
+  if (encryptedText.startsWith('encv2_')) {
+    try {
+      const [ivHex, authTagHex, cipherHex] = encryptedText.substring(6).split(':');
+      const iv = Buffer.from(ivHex, 'hex');
+      const authTag = Buffer.from(authTagHex, 'hex');
+      const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+      decipher.setAuthTag(authTag);
+      let decrypted = decipher.update(cipherHex, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      return decrypted;
+    } catch (err) {
+      console.error('Decryption error:', err);
+      return encryptedText;
+    }
   }
+
+  // Legacy format from before the AES-256-GCM upgrade: AES-256-CBC with a
+  // static per-warehouse IV. Kept only so previously-stored data (encrypted
+  // before this fix shipped) keeps decrypting correctly.
+  if (encryptedText.startsWith('enc_')) {
+    try {
+      const ciphertext = encryptedText.substring(4);
+      const legacyIv = crypto.createHash('md5').update(warehouseId).digest();
+      const decipher = crypto.createDecipheriv('aes-256-cbc', key, legacyIv);
+      let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      return decrypted;
+    } catch (err) {
+      return encryptedText;
+    }
+  }
+
+  return encryptedText;
 }
 
 // --- Multi-Tenant In-Memory Storage Fallbacks ---
@@ -270,36 +307,41 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_zones TEXT DEFAULT '[]'`);
   await pool.query(`ALTER TABLE user_warehouses ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'admin'`);
 
-  // Ensure default demo warehouse exists
-  const whCheck = await pool.query("SELECT COUNT(*) FROM warehouses WHERE id = 'wh-demo'");
-  if (parseInt(whCheck.rows[0].count, 10) === 0) {
-    console.log('Seeding default central warehouse (wh-demo)...');
-    await pool.query(
-      "INSERT INTO warehouses (id, name, code, address, email, phone, contact_name, layout_rows, layout_cols, layout_zones) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
-      ['wh-demo', 'Demo Central Warehouse', 'DEMO123', '123 Logistics Way, Chicago, IL', 'demo-warehouse@siwm.org', '555-0199', 'Demo Administrator', 6, 8, '[]']
-    );
+  // Demo account/warehouse seeding is opt-in only (SEED_DEMO_DATA=true). It used
+  // to run unconditionally on every boot, which meant a well-known credential
+  // (demo@siwm.org) was always publicly guessable and re-appeared even after an
+  // operator wiped the database to "start fresh". Enable it only for local/demo
+  // environments, never in production.
+  if (SEED_DEMO_DATA) {
+    const whCheck = await pool.query("SELECT COUNT(*) FROM warehouses WHERE id = 'wh-demo'");
+    if (parseInt(whCheck.rows[0].count, 10) === 0) {
+      console.log('Seeding default central warehouse (wh-demo)...');
+      await pool.query(
+        "INSERT INTO warehouses (id, name, code, address, email, phone, contact_name, layout_rows, layout_cols, layout_zones) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+        ['wh-demo', 'Demo Central Warehouse', 'DEMO123', '123 Logistics Way, Chicago, IL', 'demo-warehouse@siwm.org', '555-0199', 'Demo Administrator', 6, 8, '[]']
+      );
+    }
+
+    const userCheck = await pool.query("SELECT COUNT(*) FROM users WHERE email = 'demo@siwm.org'");
+    if (parseInt(userCheck.rows[0].count, 10) === 0) {
+      console.log('Seeding default demo user (demo@siwm.org)...');
+      await pool.query(
+        "INSERT INTO users (id, email, password_hash, name, warehouse_id, provider) VALUES ($1, $2, $3, $4, $5, $6)",
+        ['usr-demo', 'demo@siwm.org', '$2a$10$W2G6k18vI.hQO639C0YxXuzX3Uj3m7T0O7jV38kXyV1YxW3G03vIq', 'Demo Operator', 'wh-demo', 'email']
+      );
+    }
+
+    await pool.query(`
+      INSERT INTO user_warehouses (user_id, warehouse_id, role)
+      VALUES ('usr-demo', 'wh-demo', 'admin')
+      ON CONFLICT (user_id, warehouse_id) DO NOTHING
+    `);
+
+    await seedWarehouseData('wh-demo');
+    console.log('Demo data seeded (SEED_DEMO_DATA=true).');
   }
 
-  // Ensure default demo user exists
-  const userCheck = await pool.query("SELECT COUNT(*) FROM users WHERE email = 'demo@siwm.org'");
-  if (parseInt(userCheck.rows[0].count, 10) === 0) {
-    console.log('Seeding default demo user (demo@siwm.org)...');
-    await pool.query(
-      "INSERT INTO users (id, email, password_hash, name, warehouse_id, provider) VALUES ($1, $2, $3, $4, $5, $6)",
-      ['usr-demo', 'demo@siwm.org', '$2a$10$W2G6k18vI.hQO639C0YxXuzX3Uj3m7T0O7jV38kXyV1YxW3G03vIq', 'Demo Operator', 'wh-demo', 'email']
-    );
-  }
-
-  // Ensure default demo mapping exists
-  await pool.query(`
-    INSERT INTO user_warehouses (user_id, warehouse_id, role)
-    VALUES ('usr-demo', 'wh-demo', 'admin')
-    ON CONFLICT (user_id, warehouse_id) DO NOTHING
-  `);
-
-  // Seed default dataset for demo warehouse
-  await seedWarehouseData('wh-demo');
-  console.log('PostgreSQL database migration and seed completed successfully.');
+  console.log('PostgreSQL database migration completed successfully.');
 }
 
 // --- Dynamic Warehouse Seeding ---
@@ -869,28 +911,37 @@ export async function saveTransaction(tx: any, warehouseId: string) {
   }
 }
 
-export async function wipeAllSystemData() {
+// Deletes only the calling admin's own warehouse (and all its data) and their
+// own account. Deliberately scoped to one tenant - a wipe reachable by any
+// single logged-in admin must never be able to destroy other tenants' data.
+export async function wipeWarehouseAndAccount(userId: string, warehouseId: string) {
   if (usePostgres) {
-    console.log('Performing full administrative system wipe across all multi-tenant spaces...');
-    await pool.query('DELETE FROM transactions');
-    await pool.query('DELETE FROM items');
-    await pool.query('DELETE FROM categories');
-    await pool.query('DELETE FROM suppliers');
-    await pool.query('DELETE FROM zones');
-    await pool.query('DELETE FROM user_warehouses');
-    await pool.query('DELETE FROM users');
-    await pool.query('DELETE FROM warehouses');
+    console.log(`Wiping warehouse ${warehouseId} and account ${userId} at their request...`);
+    await pool.query('DELETE FROM transactions WHERE warehouse_id = $1', [warehouseId]);
+    await pool.query('DELETE FROM items WHERE warehouse_id = $1', [warehouseId]);
+    await pool.query('DELETE FROM categories WHERE warehouse_id = $1', [warehouseId]);
+    await pool.query('DELETE FROM suppliers WHERE warehouse_id = $1', [warehouseId]);
+    await pool.query('DELETE FROM zones WHERE warehouse_id = $1', [warehouseId]);
+    // Removing the warehouse cascades to its user_warehouses mappings.
+    await pool.query('DELETE FROM warehouses WHERE id = $1', [warehouseId]);
+    // Only remove the account itself if it has no other warehouses left.
+    const remaining = await pool.query('SELECT 1 FROM user_warehouses WHERE user_id = $1 LIMIT 1', [userId]);
+    if (remaining.rows.length === 0) {
+      await pool.query('DELETE FROM users WHERE id = $1', [userId]);
+    }
+  } else {
+    memItems = memItems.filter(i => i.warehouse_id !== warehouseId);
+    memTransactions = memTransactions.filter(t => t.warehouse_id !== warehouseId);
+    memCategories = memCategories.filter(c => c.warehouse_id !== warehouseId);
+    memSuppliers = memSuppliers.filter(s => s.warehouse_id !== warehouseId);
+    memZones = memZones.filter(z => z.warehouse_id !== warehouseId);
+    memWarehouses = memWarehouses.filter(w => w.id !== warehouseId);
+    memUserWarehouses = memUserWarehouses.filter(uw => uw.warehouse_id !== warehouseId);
+    const stillHasWarehouse = memUserWarehouses.some(uw => uw.user_id === userId);
+    if (!stillHasWarehouse) {
+      memUsers = memUsers.filter(u => u.id !== userId);
+    }
   }
-
-  // Clear all multi-tenant in-memory storage fallbacks
-  memUserWarehouses = [];
-  memWarehouses = [];
-  memUsers = [];
-  memCategories = [];
-  memSuppliers = [];
-  memZones = [];
-  memItems = [];
-  memTransactions = [];
 }
 
 export async function resetDb(warehouseId: string) {
@@ -1089,12 +1140,15 @@ export async function inviteUserToWarehouse(warehouseId: string, email: string, 
   const normEmail = email.toLowerCase().trim();
   let user = await findUserByEmail(normEmail);
   let isNewUser = false;
-  
+  let tempPassword: string | undefined;
+
   if (!user) {
     isNewUser = true;
     const userId = `usr-${Date.now()}`;
-    // Default welcome password
-    const passwordHash = await bcrypt.hash('welcome123', 10);
+    // Each invited account gets its own random temporary password rather than
+    // a single fixed password shared by every new operator account system-wide.
+    tempPassword = crypto.randomBytes(9).toString('base64url');
+    const passwordHash = await bcrypt.hash(tempPassword, 10);
     user = {
       id: userId,
       email: normEmail,
@@ -1105,7 +1159,7 @@ export async function inviteUserToWarehouse(warehouseId: string, email: string, 
     };
     await createUser(user);
   }
-  
+
   await associateUserWithWarehouse(user.id, warehouseId, role);
-  return { user, isNewUser };
+  return { user, isNewUser, tempPassword };
 }

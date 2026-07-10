@@ -16,7 +16,6 @@ import {
   resetDb,
   createUser,
   findUserByEmail,
-  findUserByOAuth,
   createWarehouse,
   findWarehouseByCode,
   findWarehouseById,
@@ -25,7 +24,7 @@ import {
   getUserWarehouses,
   isUserInWarehouse,
   updateUserActiveWarehouse,
-  wipeAllSystemData,
+  wipeWarehouseAndAccount,
   getUserRoleInWarehouse,
   updateWarehouse,
   getWarehouseUsers,
@@ -34,7 +33,19 @@ import {
   inviteUserToWarehouse
 } from './server-db.js';
 
-const JWT_SECRET = process.env.JWT_SECRET || 'siwm-production-secure-key-2026';
+function resolveJwtSecret(): string {
+  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'FATAL: JWT_SECRET environment variable is required in production. ' +
+      'Refusing to start with a hardcoded/default secret. Set JWT_SECRET in your .env file.'
+    );
+  }
+  console.warn('⚠️  JWT_SECRET not set - using an insecure development-only default. Never deploy this way.');
+  return 'dev-only-insecure-secret-do-not-use-in-production';
+}
+
+const JWT_SECRET = resolveJwtSecret();
 
 // Middleware to authenticate JWT access tokens
 function authenticateToken(req: any, res: any, next: any) {
@@ -216,96 +227,22 @@ async function startServer() {
     }
   });
 
-  // Handle Google & Facebook OAuth Login / Registration
+  // Google & Facebook OAuth Login / Registration - DISABLED.
+  //
+  // The previous implementation trusted a client-supplied email/provider/providerId
+  // with no server-side verification against Google or Facebook. That meant anyone
+  // could POST an existing user's email with a made-up providerId and be logged in
+  // as that user, no password required - a full account-takeover bug. The frontend
+  // never implemented real SSO either; it simulated a fixed demo login.
+  //
+  // Real SSO requires verifying a genuine Google ID token (e.g. via
+  // google-auth-library's OAuth2Client.verifyIdToken) or a genuine Facebook access
+  // token (via the Graph API /debug_token endpoint) server-side, using OAuth
+  // client credentials you register with each provider for this exact domain.
+  // Wire that up here once you have those credentials - do not re-enable this
+  // endpoint without real token verification.
   app.post('/api/auth/oauth', async (req, res) => {
-    try {
-      const { email, name, provider, providerId, warehouseOption, warehouseName, warehouseAddress, warehouseCode } = req.body;
-      
-      if (!email || !provider || !providerId) {
-        res.status(400).json({ error: 'Missing OAuth identity parameters.' });
-        return;
-      }
-
-      const normEmail = email.toLowerCase().trim();
-
-      // 1. Try to find user by provider and providerId
-      let user = await findUserByOAuth(provider, providerId);
-
-      // 2. If not found by OAuth, try by email
-      if (!user) {
-        const emailUser = await findUserByEmail(normEmail);
-        if (emailUser) {
-          user = emailUser;
-        }
-      }
-
-      let warehouseDetails: any = null;
-
-      // 3. Register user if they do not exist
-      if (!user) {
-        let warehouseId = '';
-        
-        if (warehouseOption === 'join' && warehouseCode) {
-          const matchedWh = await findWarehouseByCode(warehouseCode);
-          if (!matchedWh) {
-            res.status(404).json({ error: 'Warehouse access code not found.' });
-            return;
-          }
-          warehouseId = matchedWh.id;
-          warehouseDetails = matchedWh;
-        } else {
-          // Create a new custom warehouse for the OAuth user
-          warehouseId = `wh-${Date.now()}`;
-          const code = `WH-${Math.floor(100000 + Math.random() * 900000)}`;
-          warehouseDetails = await createWarehouse({
-            id: warehouseId,
-            name: warehouseName || `${name}'s Operations Hub`,
-            code,
-            address: warehouseAddress || ''
-          });
-          await seedWarehouseData(warehouseId);
-        }
-
-        user = {
-          id: `usr-${Date.now()}`,
-          email: normEmail,
-          name: name || 'OAuth User',
-          warehouseId,
-          provider,
-          providerId
-        } as any;
-
-        await createUser(user);
-        await associateUserWithWarehouse(user.id, warehouseId);
-      } else {
-        warehouseDetails = await findWarehouseById(user.warehouseId || '');
-      }
-
-      const warehousesList = await getUserWarehouses(user.id);
-      if (warehousesList.length === 0 && user.warehouseId) {
-        await associateUserWithWarehouse(user.id, user.warehouseId);
-        const mappedWh = await findWarehouseById(user.warehouseId);
-        if (mappedWh) {
-          warehousesList.push(mappedWh);
-        }
-      }
-
-      const token = jwt.sign(
-        { id: user.id, email: user.email, name: user.name, warehouseId: user.warehouseId },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-      );
-
-      res.json({
-        token,
-        user: { id: user.id, email: user.email, name: user.name },
-        warehouse: warehouseDetails,
-        warehouses: warehousesList
-      });
-    } catch (err: any) {
-      console.error('OAuth processing error:', err);
-      res.status(500).json({ error: 'Failed to complete OAuth process.', details: err.message });
-    }
+    res.status(501).json({ error: 'Social sign-in is not yet available. Please use email and password.' });
   });
 
   // --- Secure Scoped Data API Endpoints ---
@@ -775,14 +712,15 @@ async function startServer() {
         return;
       }
 
-      const { user, isNewUser } = await inviteUserToWarehouse(warehouseId, email, name, targetRole || 'operator');
+      const { user, isNewUser, tempPassword } = await inviteUserToWarehouse(warehouseId, email, name, targetRole || 'operator');
       const updatedUsersList = await getWarehouseUsers(warehouseId);
 
       res.status(201).json({
         status: 'success',
-        message: isNewUser 
-          ? `Account auto-created for new operator ${email} with default password 'welcome123'.`
+        message: isNewUser
+          ? `Account created for new operator ${email}. Temporary password: ${tempPassword} (share this securely - it won't be shown again).`
           : `Existing account for ${email} has been associated with your warehouse.`,
+        tempPassword: isNewUser ? tempPassword : undefined,
         users: updatedUsersList
       });
     } catch (err: any) {
@@ -893,14 +831,56 @@ async function startServer() {
     }
   });
 
-  // Wipe all system data (public/admin developer endpoint to delete all accounts and start fresh)
-  app.post('/api/system/wipe-all', async (req, res) => {
+  // Permanently delete the caller's own account and their warehouse data.
+  // SECURITY: This must stay authenticated + admin-scoped + tenant-scoped.
+  // It intentionally does NOT touch other tenants' data - a login-gated button
+  // that could wipe every customer's warehouse would defeat multi-tenancy
+  // entirely. A true whole-system wipe is a DB-operator action (see
+  // scripts/reset-production-data.sql), not something reachable over HTTP.
+  app.post('/api/account/wipe-my-data', authenticateToken, async (req: any, res) => {
     try {
-      await wipeAllSystemData();
-      res.json({ status: 'success', message: 'All user accounts, warehouse mappings, and simulated dataset files have been permanently cleared.' });
+      const { password, confirm } = req.body;
+      if (confirm !== 'WIPE') {
+        res.status(400).json({ error: 'You must type WIPE to confirm this irreversible action.' });
+        return;
+      }
+
+      const warehouseId = req.user.warehouseId;
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin') {
+        res.status(403).json({ error: 'Access denied: Only Administrators can delete a warehouse and its data.' });
+        return;
+      }
+
+      const user = await findUserByEmail(req.user.email);
+      if (!user) {
+        res.status(404).json({ error: 'User account not found.' });
+        return;
+      }
+
+      // Re-verify identity before a destructive action, same as the scoped reset flow.
+      let isVerified = false;
+      if (user.passwordHash) {
+        if (!password) {
+          res.status(400).json({ error: 'Password confirmation is required.' });
+          return;
+        }
+        isVerified = await bcrypt.compare(password, user.passwordHash);
+      } else {
+        const normPass = (password || '').trim().toLowerCase();
+        isVerified = (normPass === 'confirm' || normPass === 'reset' || normPass === user.email.toLowerCase());
+      }
+
+      if (!isVerified) {
+        res.status(401).json({ error: 'Incorrect verification password. Authorization denied.' });
+        return;
+      }
+
+      await wipeWarehouseAndAccount(req.user.id, warehouseId);
+      res.json({ status: 'success', message: 'Your warehouse data and account have been permanently deleted.' });
     } catch (err: any) {
-      console.error('Error performing administrative system-wide wipe:', err);
-      res.status(500).json({ error: 'Failed to wipe system data.', details: err.message });
+      console.error('Error wiping account/warehouse data:', err);
+      res.status(500).json({ error: 'Failed to delete account and warehouse data.', details: err.message });
     }
   });
 
