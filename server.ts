@@ -24,7 +24,14 @@ import {
   associateUserWithWarehouse,
   getUserWarehouses,
   isUserInWarehouse,
-  updateUserActiveWarehouse
+  updateUserActiveWarehouse,
+  wipeAllSystemData,
+  getUserRoleInWarehouse,
+  updateWarehouse,
+  getWarehouseUsers,
+  updateWarehouseUserRole,
+  removeUserFromWarehouse,
+  inviteUserToWarehouse
 } from './server-db.js';
 
 const JWT_SECRET = process.env.JWT_SECRET || 'siwm-production-secure-key-2026';
@@ -465,18 +472,21 @@ async function startServer() {
     }
   });
 
-  // Retrieve the entire warehouse dataset (items, transactions, suppliers, categories, zones) scoped to user's warehouse
+  // Retrieve the entire warehouse dataset (items, transactions, suppliers, categories, zones, warehouse settings, user roles) scoped to user's warehouse
   app.get('/api/data', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
-      const [items, transactions, suppliers, categories, zones] = await Promise.all([
+      const [items, transactions, suppliers, categories, zones, warehouse, userRole, warehouseUsers] = await Promise.all([
         getItems(warehouseId),
         getTransactions(warehouseId),
         getSuppliers(warehouseId),
         getCategories(warehouseId),
-        getZones(warehouseId)
+        getZones(warehouseId),
+        findWarehouseById(warehouseId),
+        getUserRoleInWarehouse(req.user.id, warehouseId),
+        getWarehouseUsers(warehouseId)
       ]);
-      res.json({ items, transactions, suppliers, categories, zones });
+      res.json({ items, transactions, suppliers, categories, zones, warehouse, userRole, warehouseUsers });
     } catch (err: any) {
       console.error('Error fetching data:', err);
       res.status(500).json({ error: 'Failed to fetch warehouse dataset', details: err.message });
@@ -487,6 +497,14 @@ async function startServer() {
   app.post('/api/items', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
+      
+      // Permission check: admin/manager only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can add new catalog items.' });
+        return;
+      }
+
       const item = req.body;
       if (!item.id || !item.name || !item.sku) {
         res.status(400).json({ error: 'Missing required item properties' });
@@ -522,6 +540,14 @@ async function startServer() {
   app.put('/api/items/:id', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
+
+      // Permission check: admin/manager only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can update catalog items.' });
+        return;
+      }
+
       const { id } = req.params;
       const item = req.body;
       if (!item.name || !item.sku) {
@@ -541,6 +567,14 @@ async function startServer() {
   app.delete('/api/items/:id', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
+
+      // Permission check: admin/manager only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can delete catalog items.' });
+        return;
+      }
+
       const { id } = req.params;
       await deleteItem(id, warehouseId);
       res.json({ status: 'success', message: `Item ${id} deleted` });
@@ -554,6 +588,14 @@ async function startServer() {
   app.post('/api/adjust', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
+
+      // Permission check: viewers are read-only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role === 'viewer') {
+        res.status(403).json({ error: 'Access denied: Viewers are not permitted to log inventory adjustments.' });
+        return;
+      }
+
       const { itemId, type, quantity, reason, operator } = req.body;
       if (!itemId || !type || !quantity) {
         res.status(400).json({ error: 'Missing adjustment parameters' });
@@ -613,6 +655,14 @@ async function startServer() {
   app.post('/api/restock', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
+
+      // Permission check: viewers are read-only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role === 'viewer') {
+        res.status(403).json({ error: 'Access denied: Viewers are not permitted to log procurement restocks.' });
+        return;
+      }
+
       const { supplierId, itemsToRestock } = req.body;
       if (!supplierId || !itemsToRestock || !Array.isArray(itemsToRestock)) {
         res.status(400).json({ error: 'Missing purchase order fields' });
@@ -671,6 +721,141 @@ async function startServer() {
     }
   });
 
+  // --- Warehouse Details & Layout Setup Endpoint ---
+  app.put('/api/warehouse', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+
+      // Permission check: admin only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin') {
+        res.status(403).json({ error: 'Access denied: Only Administrators can edit warehouse setup and details.' });
+        return;
+      }
+
+      const { name, address, email, phone, contact_name, layout_rows, layout_cols, layout_zones } = req.body;
+      if (!name) {
+        res.status(400).json({ error: 'Warehouse name is required.' });
+        return;
+      }
+
+      const updated = await updateWarehouse(warehouseId, {
+        name,
+        address,
+        email,
+        phone,
+        contact_name,
+        layout_rows: Number(layout_rows ?? 5),
+        layout_cols: Number(layout_cols ?? 5),
+        layout_zones: typeof layout_zones === 'string' ? layout_zones : JSON.stringify(layout_zones || [])
+      });
+
+      res.json({ status: 'success', message: 'Warehouse configuration updated successfully.', warehouse: updated });
+    } catch (err: any) {
+      console.error('Error updating warehouse:', err);
+      res.status(500).json({ error: 'Failed to update warehouse settings.', details: err.message });
+    }
+  });
+
+  // --- Invite/Add User to Warehouse Endpoint ---
+  app.post('/api/warehouse/users', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+
+      // Permission check: admin only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin') {
+        res.status(403).json({ error: 'Access denied: Only Administrators can manage warehouse operator accounts.' });
+        return;
+      }
+
+      const { email, name, role: targetRole } = req.body;
+      if (!email) {
+        res.status(400).json({ error: 'Operator email is required.' });
+        return;
+      }
+
+      const { user, isNewUser } = await inviteUserToWarehouse(warehouseId, email, name, targetRole || 'operator');
+      const updatedUsersList = await getWarehouseUsers(warehouseId);
+
+      res.status(201).json({
+        status: 'success',
+        message: isNewUser 
+          ? `Account auto-created for new operator ${email} with default password 'welcome123'.`
+          : `Existing account for ${email} has been associated with your warehouse.`,
+        users: updatedUsersList
+      });
+    } catch (err: any) {
+      console.error('Error adding user:', err);
+      res.status(500).json({ error: 'Failed to add operator account to warehouse.', details: err.message });
+    }
+  });
+
+  // --- Edit Member User Role Endpoint ---
+  app.put('/api/warehouse/users/:userId', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const { userId } = req.params;
+      const { role: targetRole } = req.body;
+
+      // Permission check: admin only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin') {
+        res.status(403).json({ error: 'Access denied: Only Administrators can edit operator roles.' });
+        return;
+      }
+
+      if (userId === req.user.id) {
+        res.status(400).json({ error: 'You cannot change your own Administrator permissions.' });
+        return;
+      }
+
+      await updateWarehouseUserRole(warehouseId, userId, targetRole || 'operator');
+      const updatedUsersList = await getWarehouseUsers(warehouseId);
+
+      res.json({
+        status: 'success',
+        message: 'Operator permissions updated successfully.',
+        users: updatedUsersList
+      });
+    } catch (err: any) {
+      console.error('Error updating user role:', err);
+      res.status(500).json({ error: 'Failed to update operator role.', details: err.message });
+    }
+  });
+
+  // --- Remove Member User Endpoint ---
+  app.delete('/api/warehouse/users/:userId', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const { userId } = req.params;
+
+      // Permission check: admin only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin') {
+        res.status(403).json({ error: 'Access denied: Only Administrators can remove operators.' });
+        return;
+      }
+
+      if (userId === req.user.id) {
+        res.status(400).json({ error: 'You cannot remove yourself from your active warehouse.' });
+        return;
+      }
+
+      await removeUserFromWarehouse(warehouseId, userId);
+      const updatedUsersList = await getWarehouseUsers(warehouseId);
+
+      res.json({
+        status: 'success',
+        message: 'Operator has been removed from this warehouse space.',
+        users: updatedUsersList
+      });
+    } catch (err: any) {
+      console.error('Error removing user:', err);
+      res.status(500).json({ error: 'Failed to remove operator account from warehouse.', details: err.message });
+    }
+  });
+
   // Reset database back to default dataset (clears items and transactions and seeds them)
   app.post('/api/reset', authenticateToken, async (req: any, res) => {
     try {
@@ -705,6 +890,17 @@ async function startServer() {
     } catch (err: any) {
       console.error('Error resetting database:', err);
       res.status(500).json({ error: 'Failed to reset database', details: err.message });
+    }
+  });
+
+  // Wipe all system data (public/admin developer endpoint to delete all accounts and start fresh)
+  app.post('/api/system/wipe-all', async (req, res) => {
+    try {
+      await wipeAllSystemData();
+      res.json({ status: 'success', message: 'All user accounts, warehouse mappings, and simulated dataset files have been permanently cleared.' });
+    } catch (err: any) {
+      console.error('Error performing administrative system-wide wipe:', err);
+      res.status(500).json({ error: 'Failed to wipe system data.', details: err.message });
     }
   });
 

@@ -1,5 +1,6 @@
 import pg from 'pg';
 import crypto from 'crypto';
+import bcrypt from 'bcryptjs';
 import { 
   INITIAL_CATEGORIES, 
   INITIAL_SUPPLIERS, 
@@ -260,13 +261,22 @@ async function runMigrations() {
     )
   `);
 
+  // 9. Database Migrations (Safely adding layout, contact details, and role columns)
+  await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS email VARCHAR(150)`);
+  await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS phone VARCHAR(50)`);
+  await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS contact_name VARCHAR(100)`);
+  await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_rows INT DEFAULT 5`);
+  await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_cols INT DEFAULT 5`);
+  await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_zones TEXT DEFAULT '[]'`);
+  await pool.query(`ALTER TABLE user_warehouses ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'admin'`);
+
   // Ensure default demo warehouse exists
   const whCheck = await pool.query("SELECT COUNT(*) FROM warehouses WHERE id = 'wh-demo'");
   if (parseInt(whCheck.rows[0].count, 10) === 0) {
     console.log('Seeding default central warehouse (wh-demo)...');
     await pool.query(
-      "INSERT INTO warehouses (id, name, code, address) VALUES ($1, $2, $3, $4)",
-      ['wh-demo', 'Demo Central Warehouse', 'DEMO123', '123 Logistics Way, Chicago, IL']
+      "INSERT INTO warehouses (id, name, code, address, email, phone, contact_name, layout_rows, layout_cols, layout_zones) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)",
+      ['wh-demo', 'Demo Central Warehouse', 'DEMO123', '123 Logistics Way, Chicago, IL', 'demo-warehouse@siwm.org', '555-0199', 'Demo Administrator', 6, 8, '[]']
     );
   }
 
@@ -282,9 +292,9 @@ async function runMigrations() {
 
   // Ensure default demo mapping exists
   await pool.query(`
-    INSERT INTO user_warehouses (user_id, warehouse_id)
-    VALUES ('usr-demo', 'wh-demo')
-    ON CONFLICT DO NOTHING
+    INSERT INTO user_warehouses (user_id, warehouse_id, role)
+    VALUES ('usr-demo', 'wh-demo', 'admin')
+    ON CONFLICT (user_id, warehouse_id) DO NOTHING
   `);
 
   // Seed default dataset for demo warehouse
@@ -534,15 +544,40 @@ export async function findUserByOAuth(provider: string, providerId: string) {
 }
 
 // --- Warehouse Management ---
-export async function createWarehouse(warehouse: { id: string, name: string, code: string, address?: string }) {
+export async function createWarehouse(warehouse: { 
+  id: string, 
+  name: string, 
+  code: string, 
+  address?: string,
+  email?: string,
+  phone?: string,
+  contact_name?: string,
+  layout_rows?: number,
+  layout_cols?: number,
+  layout_zones?: string
+}) {
   if (usePostgres) {
     await pool.query(
-      `INSERT INTO warehouses (id, name, code, address) VALUES ($1, $2, $3, $4)`,
-      [warehouse.id, warehouse.name, warehouse.code, warehouse.address || null]
+      `INSERT INTO warehouses (id, name, code, address, email, phone, contact_name, layout_rows, layout_cols, layout_zones) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      [
+        warehouse.id, 
+        warehouse.name, 
+        warehouse.code, 
+        warehouse.address || null,
+        warehouse.email || null,
+        warehouse.phone || null,
+        warehouse.contact_name || null,
+        warehouse.layout_rows ?? 5,
+        warehouse.layout_cols ?? 5,
+        warehouse.layout_zones || '[]'
+      ]
     );
   } else {
     memWarehouses.push({
       ...warehouse,
+      layout_rows: warehouse.layout_rows ?? 5,
+      layout_cols: warehouse.layout_cols ?? 5,
+      layout_zones: warehouse.layout_zones || '[]',
       createdAt: new Date().toISOString()
     });
   }
@@ -834,6 +869,30 @@ export async function saveTransaction(tx: any, warehouseId: string) {
   }
 }
 
+export async function wipeAllSystemData() {
+  if (usePostgres) {
+    console.log('Performing full administrative system wipe across all multi-tenant spaces...');
+    await pool.query('DELETE FROM transactions');
+    await pool.query('DELETE FROM items');
+    await pool.query('DELETE FROM categories');
+    await pool.query('DELETE FROM suppliers');
+    await pool.query('DELETE FROM zones');
+    await pool.query('DELETE FROM user_warehouses');
+    await pool.query('DELETE FROM users');
+    await pool.query('DELETE FROM warehouses');
+  }
+
+  // Clear all multi-tenant in-memory storage fallbacks
+  memUserWarehouses = [];
+  memWarehouses = [];
+  memUsers = [];
+  memCategories = [];
+  memSuppliers = [];
+  memZones = [];
+  memItems = [];
+  memTransactions = [];
+}
+
 export async function resetDb(warehouseId: string) {
   if (usePostgres) {
     console.log(`Resetting database tables for warehouse ${warehouseId}...`);
@@ -857,16 +916,20 @@ export async function resetDb(warehouseId: string) {
 
 // --- User Warehouses Mapping Helpers ---
 
-export async function associateUserWithWarehouse(userId: string, warehouseId: string) {
+export async function associateUserWithWarehouse(userId: string, warehouseId: string, role: string = 'admin') {
   if (usePostgres) {
     await pool.query(
-      `INSERT INTO user_warehouses (user_id, warehouse_id) VALUES ($1, $2) ON CONFLICT DO NOTHING`,
-      [userId, warehouseId]
+      `INSERT INTO user_warehouses (user_id, warehouse_id, role) 
+       VALUES ($1, $2, $3) 
+       ON CONFLICT (user_id, warehouse_id) DO UPDATE SET role = EXCLUDED.role`,
+      [userId, warehouseId, role]
     );
   } else {
-    const exists = memUserWarehouses.some(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
-    if (!exists) {
-      memUserWarehouses.push({ user_id: userId, warehouse_id: warehouseId });
+    const existingIndex = memUserWarehouses.findIndex(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
+    if (existingIndex !== -1) {
+      memUserWarehouses[existingIndex].role = role;
+    } else {
+      memUserWarehouses.push({ user_id: userId, warehouse_id: warehouseId, role });
     }
   }
 }
@@ -874,7 +937,7 @@ export async function associateUserWithWarehouse(userId: string, warehouseId: st
 export async function getUserWarehouses(userId: string) {
   if (usePostgres) {
     const res = await pool.query(
-      `SELECT w.* FROM warehouses w
+      `SELECT w.*, uw.role FROM warehouses w
        JOIN user_warehouses uw ON w.id = uw.warehouse_id
        WHERE uw.user_id = $1`,
       [userId]
@@ -882,7 +945,10 @@ export async function getUserWarehouses(userId: string) {
     return res.rows;
   } else {
     const matches = memUserWarehouses.filter(uw => uw.user_id === userId);
-    return matches.map(uw => memWarehouses.find(w => w.id === uw.warehouse_id)).filter(Boolean);
+    return matches.map(uw => {
+      const w = memWarehouses.find(wh => wh.id === uw.warehouse_id);
+      return w ? { ...w, role: uw.role || 'admin' } : null;
+    }).filter(Boolean);
   }
 }
 
@@ -907,4 +973,139 @@ export async function updateUserActiveWarehouse(userId: string, warehouseId: str
   } else {
     memUsers = memUsers.map(u => u.id === userId ? { ...u, warehouseId } : u);
   }
+}
+
+export async function getUserRoleInWarehouse(userId: string, warehouseId: string): Promise<string> {
+  if (usePostgres) {
+    const res = await pool.query('SELECT role FROM user_warehouses WHERE user_id = $1 AND warehouse_id = $2', [userId, warehouseId]);
+    return res.rows[0]?.role || 'operator';
+  } else {
+    const found = memUserWarehouses.find(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
+    return found?.role || 'operator';
+  }
+}
+
+export async function updateWarehouse(id: string, updates: { 
+  name: string, 
+  address?: string, 
+  email?: string, 
+  phone?: string, 
+  contact_name?: string, 
+  layout_rows?: number, 
+  layout_cols?: number,
+  layout_zones?: string
+}) {
+  if (usePostgres) {
+    await pool.query(
+      `UPDATE warehouses 
+       SET name = $1, address = $2, email = $3, phone = $4, contact_name = $5, 
+           layout_rows = $6, layout_cols = $7, layout_zones = $8 
+       WHERE id = $9`,
+      [
+        updates.name, 
+        updates.address || null, 
+        updates.email || null, 
+        updates.phone || null, 
+        updates.contact_name || null, 
+        updates.layout_rows ?? 5, 
+        updates.layout_cols ?? 5, 
+        updates.layout_zones || '[]',
+        id
+      ]
+    );
+  } else {
+    memWarehouses = memWarehouses.map(w => {
+      if (w.id === id) {
+        return {
+          ...w,
+          ...updates
+        };
+      }
+      return w;
+    });
+  }
+  return { id, ...updates };
+}
+
+export async function getWarehouseUsers(warehouseId: string) {
+  if (usePostgres) {
+    const res = await pool.query(
+      `SELECT u.id, u.email, u.name, uw.role 
+       FROM users u 
+       JOIN user_warehouses uw ON u.id = uw.user_id 
+       WHERE uw.warehouse_id = $1`,
+      [warehouseId]
+    );
+    return res.rows;
+  } else {
+    const mappings = memUserWarehouses.filter(uw => uw.warehouse_id === warehouseId);
+    return mappings.map(uw => {
+      const u = memUsers.find(user => user.id === uw.user_id);
+      return u ? { id: u.id, email: u.email, name: u.name, role: uw.role || 'admin' } : null;
+    }).filter(Boolean);
+  }
+}
+
+export async function updateWarehouseUserRole(warehouseId: string, userId: string, role: string) {
+  if (usePostgres) {
+    await pool.query(
+      `UPDATE user_warehouses SET role = $1 WHERE warehouse_id = $2 AND user_id = $3`,
+      [role, warehouseId, userId]
+    );
+  } else {
+    memUserWarehouses = memUserWarehouses.map(uw => {
+      if (uw.warehouse_id === warehouseId && uw.user_id === userId) {
+        return { ...uw, role };
+      }
+      return uw;
+    });
+  }
+}
+
+export async function removeUserFromWarehouse(warehouseId: string, userId: string) {
+  if (usePostgres) {
+    await pool.query(
+      `DELETE FROM user_warehouses WHERE warehouse_id = $1 AND user_id = $2`,
+      [warehouseId, userId]
+    );
+    // If the active warehouse_id of the user was this warehouse, update it to another or null
+    const checkActive = await pool.query(`SELECT warehouse_id FROM users WHERE id = $1`, [userId]);
+    if (checkActive.rows[0]?.warehouse_id === warehouseId) {
+      const remaining = await pool.query(`SELECT warehouse_id FROM user_warehouses WHERE user_id = $1 LIMIT 1`, [userId]);
+      const nextWhId = remaining.rows[0]?.warehouse_id || null;
+      await pool.query(`UPDATE users SET warehouse_id = $1 WHERE id = $2`, [nextWhId, userId]);
+    }
+  } else {
+    memUserWarehouses = memUserWarehouses.filter(uw => !(uw.warehouse_id === warehouseId && uw.user_id === userId));
+    const userIndex = memUsers.findIndex(u => u.id === userId);
+    if (userIndex !== -1 && memUsers[userIndex].warehouseId === warehouseId) {
+      const remaining = memUserWarehouses.find(uw => uw.user_id === userId);
+      memUsers[userIndex].warehouseId = remaining ? remaining.warehouse_id : null;
+    }
+  }
+}
+
+export async function inviteUserToWarehouse(warehouseId: string, email: string, name: string, role: string) {
+  const normEmail = email.toLowerCase().trim();
+  let user = await findUserByEmail(normEmail);
+  let isNewUser = false;
+  
+  if (!user) {
+    isNewUser = true;
+    const userId = `usr-${Date.now()}`;
+    // Default welcome password
+    const passwordHash = await bcrypt.hash('welcome123', 10);
+    user = {
+      id: userId,
+      email: normEmail,
+      passwordHash,
+      name: name || email.split('@')[0],
+      warehouseId,
+      provider: 'email'
+    };
+    await createUser(user);
+  }
+  
+  await associateUserWithWarehouse(user.id, warehouseId, role);
+  return { user, isNewUser };
 }

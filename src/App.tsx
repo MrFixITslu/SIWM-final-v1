@@ -30,7 +30,10 @@ import {
   Building2,
   KeyRound,
   Copy,
-  ArrowRight
+  ArrowRight,
+  Settings,
+  ShieldCheck,
+  UserPlus
 } from 'lucide-react';
 import { 
   PieChart, 
@@ -89,6 +92,8 @@ export default function App() {
     const saved = localStorage.getItem('siwm_warehouses');
     return saved ? JSON.parse(saved) : [];
   });
+  const [userRole, setUserRole] = useState<'admin' | 'manager' | 'operator' | 'viewer'>('viewer');
+  const [warehouseUsers, setWarehouseUsers] = useState<any[]>([]);
 
   // Auth form states
   const [isRegisterMode, setIsRegisterMode] = useState(false);
@@ -116,6 +121,12 @@ export default function App() {
   const [resetPassword, setResetPassword] = useState('');
   const [resetSubmitting, setResetSubmitting] = useState(false);
   const [resetError, setResetError] = useState('');
+
+  // System-wide administrative wipe states
+  const [isSystemWipeModalOpen, setIsSystemWipeModalOpen] = useState(false);
+  const [systemWipeConfirmWord, setSystemWipeConfirmWord] = useState('');
+  const [systemWipeSubmitting, setSystemWipeSubmitting] = useState(false);
+  const [systemWipeError, setSystemWipeError] = useState('');
 
   const handleLogout = () => {
     localStorage.removeItem('siwm_token');
@@ -152,6 +163,18 @@ export default function App() {
         setSuppliers(data.suppliers || []);
         setCategories(data.categories || []);
         setZones(data.zones || INITIAL_ZONES);
+        
+        // Save user role, member operator list and warehouse details
+        if (data.userRole) {
+          setUserRole(data.userRole);
+        }
+        if (data.warehouseUsers) {
+          setWarehouseUsers(data.warehouseUsers);
+        }
+        if (data.warehouse) {
+          setWarehouse(data.warehouse);
+          localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
+        }
 
         // Also refresh associated warehouses list dynamically
         const whRes = await fetch('/api/auth/warehouses', {
@@ -425,7 +448,7 @@ export default function App() {
   };
 
   // --- UI Navigation ---
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'inventory' | 'map' | 'history' | 'suppliers'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'inventory' | 'map' | 'history' | 'suppliers' | 'settings'>('dashboard');
 
   // --- Search & Filter States ---
   const [searchTerm, setSearchTerm] = useState('');
@@ -474,6 +497,46 @@ export default function App() {
   // --- Procurement Planner state ---
   const [procurementSuppliers, setProcurementSuppliers] = useState<Record<string, boolean>>({});
 
+  // --- Warehouse Configuration & Permissions States ---
+  const [whForm, setWhForm] = useState({
+    name: '',
+    address: '',
+    email: '',
+    phone: '',
+    contactName: '',
+    layoutRows: 5,
+    layoutCols: 5,
+    layoutZones: [] as string[]
+  });
+  const [inviteForm, setInviteForm] = useState({
+    email: '',
+    name: '',
+    role: 'operator' as 'admin' | 'manager' | 'operator' | 'viewer'
+  });
+  const [whSaving, setWhSaving] = useState(false);
+  const [inviteSubmitting, setInviteSubmitting] = useState(false);
+
+  useEffect(() => {
+    if (warehouse) {
+      let zonesParsed = [] as string[];
+      try {
+        zonesParsed = warehouse.layout_zones ? (typeof warehouse.layout_zones === 'string' ? JSON.parse(warehouse.layout_zones) : warehouse.layout_zones) : [];
+      } catch (err) {
+        zonesParsed = [];
+      }
+      setWhForm({
+        name: warehouse.name || '',
+        address: warehouse.address || '',
+        email: warehouse.email || '',
+        phone: warehouse.phone || '',
+        contactName: warehouse.contact_name || '',
+        layoutRows: warehouse.layout_rows || 5,
+        layoutCols: warehouse.layout_cols || 5,
+        layoutZones: zonesParsed
+      });
+    }
+  }, [warehouse]);
+
   // --- Help Toast/Banner ---
   const [toastMessage, setToastMessage] = useState<{ text: string; type: 'success' | 'error' | 'info' } | null>(null);
 
@@ -482,6 +545,138 @@ export default function App() {
     setTimeout(() => {
       setToastMessage(null);
     }, 4000);
+  };
+
+  // --- Warehouse Configuration & Permissions Handlers ---
+  const handleSaveWarehouseSettings = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (userRole !== 'admin') {
+      showToast("Access Denied: Only Administrators can edit warehouse setup.", "error");
+      return;
+    }
+    setWhSaving(true);
+    try {
+      const res = await fetch('/api/warehouse', {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          name: whForm.name,
+          address: whForm.address,
+          email: whForm.email,
+          phone: whForm.phone,
+          contact_name: whForm.contactName,
+          layout_rows: whForm.layoutRows,
+          layout_cols: whForm.layoutCols,
+          layout_zones: whForm.layoutZones
+        })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast("Warehouse configuration updated successfully.", "success");
+        await fetchData();
+      } else {
+        showToast(data.error || "Failed to update warehouse settings.", "error");
+      }
+    } catch (err) {
+      showToast("Connection failed saving settings.", "error");
+    } finally {
+      setWhSaving(false);
+    }
+  };
+
+  const handleInviteUser = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (userRole !== 'admin') {
+      showToast("Access Denied: Only Administrators can manage operators.", "error");
+      return;
+    }
+    if (!inviteForm.email.trim()) {
+      showToast("Please enter an email address.", "error");
+      return;
+    }
+    setInviteSubmitting(true);
+    try {
+      const res = await fetch('/api/warehouse/users', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          email: inviteForm.email,
+          name: inviteForm.name,
+          role: inviteForm.role
+        })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast(data.message || "Operator authorized successfully.", "success");
+        setInviteForm({ email: '', name: '', role: 'operator' });
+        await fetchData();
+      } else {
+        showToast(data.error || "Failed to add operator.", "error");
+      }
+    } catch (err) {
+      showToast("Connection failed inviting operator.", "error");
+    } finally {
+      setInviteSubmitting(false);
+    }
+  };
+
+  const handleUpdateUserRole = async (userId: string, targetRole: string) => {
+    if (userRole !== 'admin') {
+      showToast("Access Denied: Only Administrators can edit operator roles.", "error");
+      return;
+    }
+    try {
+      const res = await fetch(`/api/warehouse/users/${userId}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({ role: targetRole })
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast("Operator permissions updated successfully.", "success");
+        await fetchData();
+      } else {
+        showToast(data.error || "Failed to update operator role.", "error");
+      }
+    } catch (err) {
+      showToast("Connection failed updating permissions.", "error");
+    }
+  };
+
+  const handleRemoveUser = async (userId: string) => {
+    if (userRole !== 'admin') {
+      showToast("Access Denied: Only Administrators can remove operators.", "error");
+      return;
+    }
+    if (!window.confirm("Are you sure you want to revoke warehouse access for this operator?")) {
+      return;
+    }
+    try {
+      const res = await fetch(`/api/warehouse/users/${userId}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast("Operator access revoked successfully.", "success");
+        await fetchData();
+      } else {
+        showToast(data.error || "Failed to remove operator.", "error");
+      }
+    } catch (err) {
+      showToast("Connection failed removing operator.", "error");
+    }
   };
 
   // --- Reset All Data Helper ---
@@ -518,6 +713,57 @@ export default function App() {
       setResetError("Error resetting database. Check your connection.");
     } finally {
       setResetSubmitting(false);
+    }
+  };
+
+  // --- Administrative System-Wide Wipe Handlers ---
+  const handleSystemWipe = () => {
+    setSystemWipeConfirmWord('');
+    setSystemWipeError('');
+    setIsSystemWipeModalOpen(true);
+  };
+
+  const handleSystemWipeSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (systemWipeConfirmWord.toUpperCase().trim() !== 'WIPE') {
+      setSystemWipeError('Please type "WIPE" in all uppercase letters to authorize.');
+      return;
+    }
+
+    setSystemWipeError('');
+    setSystemWipeSubmitting(true);
+    try {
+      const res = await fetch('/api/system/wipe-all', {
+        method: 'POST'
+      });
+      const data = await res.json();
+      if (res.ok) {
+        setIsSystemWipeModalOpen(false);
+        setSystemWipeConfirmWord('');
+        
+        // Log out immediately & clean state completely
+        localStorage.removeItem('siwm_token');
+        localStorage.removeItem('siwm_user');
+        localStorage.removeItem('siwm_warehouse');
+        localStorage.removeItem('siwm_warehouses');
+        setToken(null);
+        setUser(null);
+        setWarehouse(null);
+        setWarehouses([]);
+        setItems([]);
+        setTransactions([]);
+        setSuppliers([]);
+        setCategories([]);
+        
+        showToast("System reset completed. All accounts and stored/simulated data have been purged.", "info");
+        confetti({ particleCount: 50, spread: 80 });
+      } else {
+        setSystemWipeError(data.error || "Failed to perform administrative wipe.");
+      }
+    } catch (err) {
+      setSystemWipeError("Network error occurred during administrative system-wide wipe.");
+    } finally {
+      setSystemWipeSubmitting(false);
     }
   };
 
@@ -1003,9 +1249,19 @@ export default function App() {
               </div>
             </div>
 
-            <div className="pt-8 border-t border-slate-800/60 flex items-center justify-between text-[10px] text-slate-500 font-mono">
-              <span>STATUS: ONLINE</span>
-              <span>VER 4.1.0</span>
+            <div className="pt-8 border-t border-slate-800/60 flex flex-col gap-3.5 text-[10px] text-slate-500 font-mono">
+              <div className="flex items-center justify-between">
+                <span>STATUS: ONLINE</span>
+                <span>VER 4.1.0</span>
+              </div>
+              <button
+                id="btn_system_wipe"
+                type="button"
+                onClick={handleSystemWipe}
+                className="w-full text-center py-2 px-3 border border-dashed border-rose-500/20 hover:border-rose-500/60 bg-rose-500/5 hover:bg-rose-500/10 rounded-xl text-rose-400 hover:text-rose-300 transition duration-200 font-bold tracking-wide uppercase cursor-pointer"
+              >
+                ⚠️ WIPE SYSTEM & RESET ACCOUNTS
+              </button>
             </div>
           </div>
 
@@ -1466,6 +1722,27 @@ export default function App() {
                 </div>
                 <ChevronRight className="h-4 w-4 opacity-40 group-hover:opacity-100 transition-opacity" />
               </button>
+
+              <button 
+                id="btn_nav_settings"
+                onClick={() => setActiveTab('settings')}
+                className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-semibold transition-all duration-200 group ${
+                  activeTab === 'settings' 
+                    ? 'bg-indigo-600 text-white shadow-lg shadow-indigo-600/10' 
+                    : 'text-slate-400 hover:bg-slate-900 hover:text-slate-100'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <Settings className={`h-4.5 w-4.5 ${activeTab === 'settings' ? 'text-white' : 'text-slate-400 group-hover:text-indigo-400'}`} />
+                  <span>Setup & Permissions</span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[9px] bg-slate-800 group-hover:bg-indigo-500/25 text-slate-300 group-hover:text-indigo-300 font-extrabold px-2 py-0.5 rounded-full uppercase tracking-wide border border-slate-700 group-hover:border-indigo-500/30 transition duration-150">
+                    {userRole}
+                  </span>
+                  <ChevronRight className="h-4 w-4 opacity-40 group-hover:opacity-100 transition-opacity" />
+                </div>
+              </button>
             </nav>
           </div>
 
@@ -1497,6 +1774,16 @@ export default function App() {
               <Lock className="h-3 w-3" />
               Sign Out Operator
             </button>
+
+            <button 
+              id="btn_sidebar_system_wipe"
+              type="button"
+              onClick={handleSystemWipe}
+              className="w-full flex items-center justify-center gap-2 py-2 px-3 text-xs bg-rose-950/20 hover:bg-rose-900/30 border border-rose-900/30 hover:border-rose-500/50 rounded-lg text-rose-400 hover:text-rose-300 transition font-semibold"
+            >
+              <Trash2 className="h-3 w-3" />
+              Wipe System Accounts
+            </button>
           </div>
         </aside>
 
@@ -1512,6 +1799,7 @@ export default function App() {
                 {activeTab === 'map' && '🗺️ Location mapping & Bay Allocation'}
                 {activeTab === 'history' && '🔄 Stock Adjustment Audit Logs'}
                 {activeTab === 'suppliers' && '🤝 Suppliers Contact Book & Reorder Planner'}
+                {activeTab === 'settings' && '⚙️ Space Configuration & Operator Permissions'}
               </h2>
               <p className="text-sm text-slate-400 mt-1">
                 {activeTab === 'dashboard' && 'Real-time telemetry, stock valuations, low stock alerts, and zone utilization ratios.'}
@@ -1519,6 +1807,7 @@ export default function App() {
                 {activeTab === 'map' && 'Interactive rack layout of specific aisles, shelves and bin allocations. Occupancy heatmap.'}
                 {activeTab === 'history' && 'Comprehensive historical audit logs of item receipts, shipments, safety dispenses, and disposals.'}
                 {activeTab === 'suppliers' && 'Group low stock elements by suppliers and automatically transmit mock purchase order requests.'}
+                {activeTab === 'settings' && 'Manage physical layout dimensions, contact details, and invite/authorize operator access levels.'}
               </p>
             </div>
 
@@ -2592,6 +2881,290 @@ export default function App() {
               </div>
             )}
 
+            {activeTab === 'settings' && (
+              <div className="space-y-8 animate-fade-in" id="panel_settings">
+                
+                {/* ADMINISTRATIVE PERMISSIONS BANNER */}
+                <div className={`p-4.5 rounded-2xl border flex items-start gap-4 ${
+                  userRole === 'admin' 
+                    ? 'bg-indigo-950/20 border-indigo-800/40 text-indigo-300' 
+                    : 'bg-amber-950/25 border-amber-900/40 text-amber-300'
+                }`}>
+                  <ShieldCheck className="h-5.5 w-5.5 shrink-0 mt-0.5 text-indigo-400" />
+                  <div className="space-y-1">
+                    <h4 className="font-bold text-sm text-white">
+                      Logged in with {userRole === 'admin' ? 'Administrator' : userRole === 'manager' ? 'Inventory Manager' : userRole === 'operator' ? 'Field Operator' : 'Read-Only Viewer'} Status
+                    </h4>
+                    <p className="text-xs text-slate-300">
+                      {userRole === 'admin' 
+                        ? 'You have complete authorization to modify physical layout grids, contact channels, and invite/revoke operator permissions.' 
+                        : 'Your current access level is read-only for physical layout settings and operator memberships. Contact your warehouse Administrator to request role elevations.'}
+                    </p>
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                  
+                  {/* Left Column: Warehouse Setup & Layout */}
+                  <div className="bg-slate-900/60 border border-slate-800/80 p-6 rounded-2xl space-y-6" id="settings_warehouse_setup">
+                    <div className="border-b border-slate-800 pb-4">
+                      <h3 className="text-lg font-bold text-white">Warehouse Profile & Layout Configuration</h3>
+                      <p className="text-xs text-slate-400 mt-1">Specify layout dimensions and physical contact coordinates for this active space.</p>
+                    </div>
+
+                    <form onSubmit={handleSaveWarehouseSettings} className="space-y-5">
+                      <div className="space-y-4">
+                        <div>
+                          <label className="block text-xs font-bold text-slate-400 uppercase tracking-wide mb-1.5">Warehouse Name</label>
+                          <input 
+                            type="text" 
+                            disabled={userRole !== 'admin'}
+                            value={whForm.name}
+                            onChange={e => setWhForm(prev => ({ ...prev, name: e.target.value }))}
+                            className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-xl px-4 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none transition disabled:opacity-50"
+                            placeholder="e.g. Seattle Distribution Center Hub"
+                            required
+                          />
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-bold text-slate-400 uppercase tracking-wide mb-1.5">Physical Address</label>
+                          <input 
+                            type="text" 
+                            disabled={userRole !== 'admin'}
+                            value={whForm.address}
+                            onChange={e => setWhForm(prev => ({ ...prev, address: e.target.value }))}
+                            className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-xl px-4 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none transition disabled:opacity-50"
+                            placeholder="e.g. 101 Elliot Ave W, Seattle, WA 98119"
+                          />
+                        </div>
+
+                        <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                          <div>
+                            <label className="block text-xs font-bold text-slate-400 uppercase tracking-wide mb-1.5">Contact Email</label>
+                            <input 
+                              type="email" 
+                              disabled={userRole !== 'admin'}
+                              value={whForm.email}
+                              onChange={e => setWhForm(prev => ({ ...prev, email: e.target.value }))}
+                              className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-xl px-4 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none transition disabled:opacity-50"
+                              placeholder="e.g. ops@seattlehub.com"
+                            />
+                          </div>
+                          <div>
+                            <label className="block text-xs font-bold text-slate-400 uppercase tracking-wide mb-1.5">Contact Phone</label>
+                            <input 
+                              type="text" 
+                              disabled={userRole !== 'admin'}
+                              value={whForm.phone}
+                              onChange={e => setWhForm(prev => ({ ...prev, phone: e.target.value }))}
+                              className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-xl px-4 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none transition disabled:opacity-50"
+                              placeholder="e.g. +1 (206) 555-0199"
+                            />
+                          </div>
+                        </div>
+
+                        <div>
+                          <label className="block text-xs font-bold text-slate-400 uppercase tracking-wide mb-1.5">Warehouse Manager Name</label>
+                          <input 
+                            type="text" 
+                            disabled={userRole !== 'admin'}
+                            value={whForm.contactName}
+                            onChange={e => setWhForm(prev => ({ ...prev, contactName: e.target.value }))}
+                            className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-xl px-4 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none transition disabled:opacity-50"
+                            placeholder="e.g. Sarah Jenkins"
+                          />
+                        </div>
+
+                        <div className="border-t border-slate-800/80 pt-4 mt-2">
+                          <h4 className="text-xs font-extrabold text-indigo-400 uppercase tracking-wider mb-3">Grid Coordinates Layout</h4>
+                          <div className="grid grid-cols-2 gap-4">
+                            <div>
+                              <label className="block text-xs text-slate-400 mb-1.5">Aisles (Grid Rows)</label>
+                              <input 
+                                type="number" 
+                                min="2"
+                                max="20"
+                                disabled={userRole !== 'admin'}
+                                value={whForm.layoutRows}
+                                onChange={e => setWhForm(prev => ({ ...prev, layoutRows: parseInt(e.target.value) || 5 }))}
+                                className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-xl px-4 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none transition disabled:opacity-50 font-mono"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-xs text-slate-400 mb-1.5">Shelves/Levels (Grid Columns)</label>
+                              <input 
+                                type="number" 
+                                min="2"
+                                max="20"
+                                disabled={userRole !== 'admin'}
+                                value={whForm.layoutCols}
+                                onChange={e => setWhForm(prev => ({ ...prev, layoutCols: parseInt(e.target.value) || 5 }))}
+                                className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-xl px-4 py-2.5 text-sm text-slate-100 placeholder-slate-600 focus:outline-none transition disabled:opacity-50 font-mono"
+                              />
+                            </div>
+                          </div>
+                          <p className="text-[11px] text-slate-500 mt-2">
+                            Aisles and Shelves specify the visual matrix rows/columns shown in the Interactive Bay Layout mapping tab.
+                          </p>
+                        </div>
+                      </div>
+
+                      {userRole === 'admin' && (
+                        <button 
+                          type="submit" 
+                          disabled={whSaving}
+                          className="w-full flex items-center justify-center gap-2 px-5 py-3 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-700 text-white font-bold rounded-xl text-sm transition shadow-lg shadow-indigo-600/20 mt-4"
+                        >
+                          {whSaving ? 'Saving Profiles...' : 'Save Configuration & Update Grid'}
+                        </button>
+                      )}
+                    </form>
+                  </div>
+
+                  {/* Right Column: User Management & Operator Memberships */}
+                  <div className="bg-slate-900/60 border border-slate-800/80 p-6 rounded-2xl space-y-6" id="settings_user_management">
+                    <div className="border-b border-slate-800 pb-4">
+                      <h3 className="text-lg font-bold text-white">Authorized Operators & Team Permissions</h3>
+                      <p className="text-xs text-slate-400 mt-1">Audit, register and grant role permissions for warehouse operations.</p>
+                    </div>
+
+                    {/* Authorized Users List */}
+                    <div className="space-y-4">
+                      <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Active Authorized Team ({warehouseUsers.length})</h4>
+                      
+                      <div className="space-y-3.5 max-h-[280px] overflow-y-auto pr-1 text-slate-200">
+                        {warehouseUsers.map((member) => {
+                          const isSelf = member.id === user?.id;
+                          return (
+                            <div 
+                              key={member.id} 
+                              className="bg-slate-950/60 border border-slate-800/60 p-3.5 rounded-xl flex items-center justify-between"
+                            >
+                              <div className="min-w-0 flex-1 pr-3 text-left">
+                                <div className="flex items-center gap-2">
+                                  <span className="text-sm font-bold text-white truncate">{member.name || 'Anonymous Operator'}</span>
+                                  {isSelf && (
+                                    <span className="text-[10px] bg-indigo-950/50 text-indigo-400 border border-indigo-500/20 font-bold px-1.5 py-0.2 rounded-md uppercase">
+                                      You
+                                    </span>
+                                  )}
+                                </div>
+                                <span className="text-xs text-slate-400 truncate block mt-0.5 font-mono">{member.email}</span>
+                              </div>
+
+                              <div className="flex items-center gap-2 shrink-0">
+                                {userRole === 'admin' && !isSelf ? (
+                                  <select 
+                                    value={member.role}
+                                    onChange={(e) => handleUpdateUserRole(member.id, e.target.value)}
+                                    className="bg-slate-900 border border-slate-800 rounded-lg px-2 py-1 text-xs text-slate-200 focus:outline-none focus:border-indigo-500"
+                                  >
+                                    <option value="admin">Administrator</option>
+                                    <option value="manager">Manager</option>
+                                    <option value="operator">Operator</option>
+                                    <option value="viewer">Viewer</option>
+                                  </select>
+                                ) : (
+                                  <span className={`text-[10px] font-extrabold px-2 py-0.5 rounded-md uppercase border ${
+                                    member.role === 'admin' 
+                                      ? 'bg-rose-500/10 text-rose-400 border-rose-500/20' 
+                                      : member.role === 'manager' 
+                                      ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20' 
+                                      : member.role === 'operator' 
+                                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
+                                      : 'bg-slate-500/10 text-slate-400 border-slate-500/20'
+                                  }`}>
+                                    {member.role}
+                                  </span>
+                                )}
+
+                                {userRole === 'admin' && !isSelf && (
+                                  <button 
+                                    type="button"
+                                    onClick={() => handleRemoveUser(member.id)}
+                                    className="p-1 text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 rounded transition"
+                                    title="Revoke operator access"
+                                  >
+                                    <Trash2 className="h-4 w-4" />
+                                  </button>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
+
+                    {/* Invite/Add User Section */}
+                    {userRole === 'admin' ? (
+                      <div className="border-t border-slate-800/80 pt-5 space-y-4">
+                        <div className="flex items-center gap-2">
+                          <UserPlus className="h-4.5 w-4.5 text-indigo-400" />
+                          <h4 className="text-xs font-bold text-white uppercase tracking-wider">Register & Authorize New Team Member</h4>
+                        </div>
+
+                        <form onSubmit={handleInviteUser} className="space-y-3">
+                          <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                            <div>
+                              <input 
+                                type="text" 
+                                placeholder="Full name (e.g. James R)"
+                                value={inviteForm.name}
+                                onChange={e => setInviteForm(prev => ({ ...prev, name: e.target.value }))}
+                                className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-600 focus:outline-none"
+                              />
+                            </div>
+                            <div>
+                              <input 
+                                type="email" 
+                                placeholder="Email address"
+                                value={inviteForm.email}
+                                onChange={e => setInviteForm(prev => ({ ...prev, email: e.target.value }))}
+                                className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-600 focus:outline-none"
+                                required
+                              />
+                            </div>
+                          </div>
+
+                          <div className="flex gap-3">
+                            <div className="flex-1">
+                              <select 
+                                value={inviteForm.role}
+                                onChange={e => setInviteForm(prev => ({ ...prev, role: e.target.value as any }))}
+                                className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none"
+                              >
+                                <option value="admin">Administrator (Full control)</option>
+                                <option value="manager">Manager (Manage inventory catalog)</option>
+                                <option value="operator">Operator (Standard logs & shipments)</option>
+                                <option value="viewer">Viewer (Read-only access)</option>
+                              </select>
+                            </div>
+                            <button 
+                              type="submit"
+                              disabled={inviteSubmitting}
+                              className="px-4 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-700 text-white text-xs font-bold rounded-lg transition shrink-0"
+                            >
+                              {inviteSubmitting ? 'Authorizing...' : 'Invite Operator'}
+                            </button>
+                          </div>
+                          <p className="text-[10px] text-slate-500">
+                            Inviting a new email automatically generates a login credential with default password <span className="font-mono text-slate-400">welcome123</span>.
+                          </p>
+                        </form>
+                      </div>
+                    ) : (
+                      <div className="p-4 bg-slate-950/40 border border-slate-800/80 rounded-xl text-center text-xs text-slate-500">
+                        Only administrators have permissions to register new operators.
+                      </div>
+                    )}
+                  </div>
+
+                </div>
+
+              </div>
+            )}
+
           </div>
 
           {/* SYSTEM CONTAINER FOOTER */}
@@ -3336,6 +3909,88 @@ export default function App() {
                     <>
                       <span>Wipe & Reset Database</span>
                       <RotateCcw className="h-3 w-3" />
+                    </>
+                  )}
+                </button>
+              </div>
+
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== FORM MODAL 6: SYSTEM-WIDE DESTRUCTIVE WIPE ==================== */}
+      {isSystemWipeModalOpen && (
+        <div id="modal_system_wipe_destructive" className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/90 backdrop-blur-md p-4 animate-fade-in">
+          <div className="bg-slate-900 border-2 border-rose-500/30 rounded-2xl max-w-md w-full p-6 shadow-2xl relative animate-scale-up text-slate-200">
+            <h3 className="text-lg font-bold text-rose-400 border-b border-slate-800 pb-3 mb-4 flex items-center gap-2">
+              <AlertTriangle className="h-6 w-6 text-rose-500 animate-bounce" />
+              CRITICAL: Administrative System Wipe
+            </h3>
+
+            {systemWipeError && (
+              <div className="mb-4 p-3.5 bg-rose-500/20 border border-rose-500/30 text-rose-200 text-xs rounded-xl flex items-center gap-2.5">
+                <AlertTriangle className="h-4 w-4 text-rose-400 shrink-0" />
+                <span>{systemWipeError}</span>
+              </div>
+            )}
+
+            <div className="space-y-3 text-xs text-slate-400 leading-relaxed mb-5">
+              <p>
+                This action is extremely destructive and irreversible. You are about to:
+              </p>
+              <ul className="list-disc pl-5 space-y-1 text-rose-300 font-medium">
+                <li>Permanently delete ALL operator and tenant user accounts.</li>
+                <li>Destroy all created warehouse databases &amp; clearance codes.</li>
+                <li>Wipe all stored inventory items, transactions, suppliers, and historical audit sheets.</li>
+                <li>Reset the multi-tenant PostgreSQL tables and memory arrays to a pristine blank slate.</li>
+              </ul>
+              <p className="font-semibold text-slate-300">
+                Type the verification word <span className="text-white bg-slate-950 px-1.5 py-0.5 rounded font-mono font-bold">WIPE</span> below to confirm your authority.
+              </p>
+            </div>
+
+            <form onSubmit={handleSystemWipeSubmit} className="space-y-4">
+              <div>
+                <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">
+                  Type 'WIPE' to confirm *
+                </label>
+                <input 
+                  id="system_wipe_confirm_input"
+                  type="text"
+                  required
+                  placeholder="Type WIPE in all capitals"
+                  value={systemWipeConfirmWord}
+                  onChange={(e) => setSystemWipeConfirmWord(e.target.value)}
+                  className="w-full bg-slate-950 border border-rose-500/30 rounded-lg p-2.5 text-xs text-slate-250 focus:ring-1 focus:ring-rose-500 outline-none font-bold tracking-widest text-center uppercase"
+                />
+              </div>
+
+              <div className="border-t border-slate-800/85 pt-4 mt-5 flex items-center justify-end gap-3">
+                <button 
+                  id="btn_cancel_system_wipe"
+                  type="button" 
+                  onClick={() => {
+                    setIsSystemWipeModalOpen(false);
+                    setSystemWipeError('');
+                    setSystemWipeConfirmWord('');
+                  }}
+                  className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-slate-200 transition"
+                >
+                  Cancel
+                </button>
+                <button 
+                  id="btn_confirm_system_wipe"
+                  type="submit" 
+                  disabled={systemWipeSubmitting}
+                  className="px-5 py-2.5 bg-rose-600 hover:bg-rose-500 disabled:bg-rose-800 text-white font-bold text-xs rounded-xl transition flex items-center gap-1.5"
+                >
+                  {systemWipeSubmitting ? (
+                    <span className="h-3 w-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                  ) : (
+                    <>
+                      <span>Wipe Database &amp; Accounts</span>
+                      <Trash2 className="h-3 w-3" />
                     </>
                   )}
                 </button>
