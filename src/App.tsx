@@ -33,7 +33,9 @@ import {
   ArrowRight,
   Settings,
   ShieldCheck,
-  UserPlus
+  UserPlus,
+  Layers,
+  Tag
 } from 'lucide-react';
 import { 
   PieChart, 
@@ -92,7 +94,7 @@ export default function App() {
     const saved = localStorage.getItem('siwm_warehouses');
     return saved ? JSON.parse(saved) : [];
   });
-  const [userRole, setUserRole] = useState<'admin' | 'manager' | 'operator' | 'viewer'>('viewer');
+  const [userRole, setUserRole] = useState<'admin' | 'manager' | 'operator' | 'engineer' | 'viewer'>('viewer');
   const [warehouseUsers, setWarehouseUsers] = useState<any[]>([]);
 
   // Auth form states
@@ -164,7 +166,11 @@ export default function App() {
         setTransactions(data.transactions || []);
         setSuppliers(data.suppliers || []);
         setCategories(data.categories || []);
-        setZones(data.zones || INITIAL_ZONES);
+        const fetchedZones = data.zones || [];
+        setZones(fetchedZones);
+        if (fetchedZones.length > 0) {
+          setMapSelectedZone(prev => fetchedZones.some((z: any) => z.id === prev) ? prev : fetchedZones[0].id);
+        }
         
         // Save user role, member operator list and warehouse details
         if (data.userRole) {
@@ -400,9 +406,40 @@ export default function App() {
   const [isAddModalOpen, setIsAddModalOpen] = useState(false);
   const [isEditModalOpen, setIsEditModalOpen] = useState(false);
   const [isAdjustModalOpen, setIsAdjustModalOpen] = useState(false);
+  const [isAddSupplierModalOpen, setIsAddSupplierModalOpen] = useState(false);
   
   const [editingItem, setEditingItem] = useState<InventoryItem | null>(null);
   const [adjustingItem, setAdjustingItem] = useState<InventoryItem | null>(null);
+
+  // --- Supplier Form State ---
+  const [supplierForm, setSupplierForm] = useState({
+    name: '',
+    contactName: '',
+    email: '',
+    phone: '',
+    address: ''
+  });
+  const [supplierSubmitting, setSupplierSubmitting] = useState(false);
+  const [supplierError, setSupplierError] = useState('');
+
+  // --- Zone Form State ---
+  const [zoneForm, setZoneForm] = useState({
+    name: '',
+    description: '',
+    maxCapacity: 100,
+    color: 'indigo'
+  });
+  const [zoneSubmitting, setZoneSubmitting] = useState(false);
+  const [zoneError, setZoneError] = useState('');
+
+  // --- Category Form State ---
+  const [categoryForm, setCategoryForm] = useState({
+    name: '',
+    description: '',
+    color: 'emerald'
+  });
+  const [categorySubmitting, setCategorySubmitting] = useState(false);
+  const [categoryError, setCategoryError] = useState('');
 
   // --- Form Values States ---
   const [itemForm, setItemForm] = useState({
@@ -425,7 +462,11 @@ export default function App() {
     type: 'INBOUND' as TransactionType,
     quantity: 1,
     reason: 'Purchase Order Received',
-    operator: 'Operator Station 01'
+    operator: 'Operator Station 01',
+    outboundTargetType: 'engineer' as 'engineer' | 'warehouse',
+    selectedEngineerId: '',
+    selectedWarehouseId: '',
+    customRecipientName: ''
   });
 
   // --- Procurement Planner state ---
@@ -445,7 +486,7 @@ export default function App() {
   const [inviteForm, setInviteForm] = useState({
     email: '',
     name: '',
-    role: 'operator' as 'admin' | 'manager' | 'operator' | 'viewer'
+    role: 'operator' as 'admin' | 'manager' | 'operator' | 'engineer' | 'viewer'
   });
   const [whSaving, setWhSaving] = useState(false);
   const [inviteSubmitting, setInviteSubmitting] = useState(false);
@@ -726,10 +767,10 @@ export default function App() {
       unit: 'pcs',
       price: 0,
       zone: zones[0]?.id || 'Zone-A',
-      aisle: 'Aisle 01',
-      shelf: 'Level 1',
+      aisle: mapAisles[0] || 'Aisle 01',
+      shelf: mapShelves[0] || 'Level 1',
       bin: 'Bin 01',
-      supplierId: suppliers[0]?.id || 'sup-1',
+      supplierId: suppliers[0]?.id || '',
       minThreshold: 15,
       notes: ''
     });
@@ -754,6 +795,201 @@ export default function App() {
       notes: item.notes || ''
     });
     setIsEditModalOpen(true);
+  };
+
+  const handleSaveSupplier = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!supplierForm.name) {
+      setSupplierError("Supplier name is required.");
+      return;
+    }
+
+    setSupplierSubmitting(true);
+    setSupplierError('');
+
+    try {
+      const res = await fetch('/api/suppliers', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          name: supplierForm.name,
+          contactName: supplierForm.contactName,
+          email: supplierForm.email,
+          phone: supplierForm.phone,
+          address: supplierForm.address
+        })
+      });
+
+      if (res.ok) {
+        await fetchData();
+        setIsAddSupplierModalOpen(false);
+        setSupplierForm({
+          name: '',
+          contactName: '',
+          email: '',
+          phone: '',
+          address: ''
+        });
+        showToast(`Supplier "${supplierForm.name}" registered successfully!`);
+        if (typeof confetti === 'function') {
+          confetti({ particleCount: 30, spread: 50 });
+        }
+      } else {
+        const errData = await res.json();
+        setSupplierError(errData.error || "Failed to save supplier.");
+      }
+    } catch (err) {
+      setSupplierError("Error communicating with database.");
+    } finally {
+      setSupplierSubmitting(false);
+    }
+  };
+
+  const handleSaveZone = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!zoneForm.name) {
+      setZoneError("Zone name is required.");
+      return;
+    }
+
+    setZoneSubmitting(true);
+    setZoneError('');
+
+    try {
+      const res = await fetch('/api/zones', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          name: zoneForm.name,
+          description: zoneForm.description,
+          maxCapacity: Number(zoneForm.maxCapacity) || 100,
+          color: zoneForm.color
+        })
+      });
+
+      if (res.ok) {
+        await fetchData();
+        setZoneForm({
+          name: '',
+          description: '',
+          maxCapacity: 100,
+          color: 'indigo'
+        });
+        showToast(`Zone "${zoneForm.name}" created successfully!`);
+        if (typeof confetti === 'function') {
+          confetti({ particleCount: 20, spread: 40 });
+        }
+      } else {
+        const errData = await res.json();
+        setZoneError(errData.error || "Failed to save zone.");
+      }
+    } catch (err) {
+      setZoneError("Error communicating with database.");
+    } finally {
+      setZoneSubmitting(false);
+    }
+  };
+
+  const handleDeleteZone = async (id: string, name: string) => {
+    if (!confirm(`Are you sure you want to delete zone "${name}"? Items placed here may need to be reallocated.`)) {
+      return;
+    }
+
+    try {
+      const res = await fetch(`/api/zones/${id}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+
+      if (res.ok) {
+        await fetchData();
+        showToast(`Zone "${name}" deleted successfully.`);
+      } else {
+        const errData = await res.json();
+        showToast(errData.error || "Failed to delete zone.", "error");
+      }
+    } catch (err) {
+      showToast("Error communicating with database.", "error");
+    }
+  };
+
+  const handleSaveCategory = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!categoryForm.name) {
+      setCategoryError("Category name is required.");
+      return;
+    }
+
+    setCategorySubmitting(true);
+    setCategoryError('');
+
+    try {
+      const res = await fetch('/api/categories', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`
+        },
+        body: JSON.stringify({
+          name: categoryForm.name,
+          description: categoryForm.description,
+          color: categoryForm.color
+        })
+      });
+
+      if (res.ok) {
+        await fetchData();
+        setCategoryForm({
+          name: '',
+          description: '',
+          color: 'emerald'
+        });
+        showToast(`Category "${categoryForm.name}" created successfully!`);
+        if (typeof confetti === 'function') {
+          confetti({ particleCount: 20, spread: 40 });
+        }
+      } else {
+        const errData = await res.json();
+        setCategoryError(errData.error || "Failed to save category.");
+      }
+    } catch (err) {
+      setCategoryError("Error communicating with database.");
+    } finally {
+      setCategorySubmitting(false);
+    }
+  };
+
+  const handleDeleteCategory = async (id: string, name: string) => {
+    if (!confirm(`Are you sure you want to delete category "${name}"? Product lines with this category will remain, but the category profile itself will be removed.`)) {
+      return;
+    }
+
+    try {
+      const res = await fetch(`/api/categories/${id}`, {
+        method: 'DELETE',
+        headers: {
+          'Authorization': `Bearer ${token}`
+        }
+      });
+
+      if (res.ok) {
+        await fetchData();
+        showToast(`Category "${name}" deleted successfully.`);
+      } else {
+        const errData = await res.json();
+        showToast(errData.error || "Failed to delete category.", "error");
+      }
+    } catch (err) {
+      showToast("Error communicating with database.", "error");
+    }
   };
 
   const handleSaveItem = async (e: React.FormEvent) => {
@@ -890,7 +1126,11 @@ export default function App() {
       type: defaultType,
       quantity: 5,
       reason: defaultType === 'INBOUND' ? 'Purchase Order Received' : 'Customer Shipment Dispatch',
-      operator: 'Floor Terminal B-12'
+      operator: 'Floor Terminal B-12',
+      outboundTargetType: 'engineer',
+      selectedEngineerId: '',
+      selectedWarehouseId: '',
+      customRecipientName: ''
     });
     setIsAdjustModalOpen(true);
   };
@@ -910,6 +1150,31 @@ export default function App() {
       return;
     }
 
+    let destinationText = "";
+    if (adjustForm.type === 'OUTBOUND') {
+      if (adjustForm.outboundTargetType === 'engineer') {
+        if (adjustForm.selectedEngineerId) {
+          const eng = warehouseUsers.find(u => u.id === adjustForm.selectedEngineerId);
+          destinationText = `Engineer: ${eng ? (eng.name || eng.email) : adjustForm.selectedEngineerId}`;
+        } else if (adjustForm.customRecipientName.trim()) {
+          destinationText = `Engineer: ${adjustForm.customRecipientName.trim()}`;
+        } else {
+          showToast("Please select or enter an Engineer recipient for this outbound shipment.", "error");
+          return;
+        }
+      } else { // warehouse
+        if (adjustForm.selectedWarehouseId) {
+          const wh = warehouses.find(w => w.id === adjustForm.selectedWarehouseId);
+          destinationText = `Warehouse: ${wh ? wh.name : adjustForm.selectedWarehouseId}`;
+        } else if (adjustForm.customRecipientName.trim()) {
+          destinationText = `Warehouse: ${adjustForm.customRecipientName.trim()}`;
+        } else {
+          showToast("Please select or enter a Connected Warehouse destination for this outbound shipment.", "error");
+          return;
+        }
+      }
+    }
+
     setLoading(true);
     try {
       const res = await fetch('/api/adjust', {
@@ -923,7 +1188,8 @@ export default function App() {
           type: adjustForm.type,
           quantity: qty,
           reason: adjustForm.reason,
-          operator: adjustForm.operator
+          operator: adjustForm.operator,
+          issuedTo: destinationText || undefined
         })
       });
       if (res.ok) {
@@ -2622,7 +2888,32 @@ export default function App() {
                 
                 {/* ACTIVE SUPPLIERS DIRECTORY */}
                 <div>
-                  <h3 className="text-lg font-bold text-white mb-4">Active Supplier Contacts</h3>
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
+                    <div>
+                      <h3 className="text-lg font-bold text-white">Active Supplier Contacts</h3>
+                      <p className="text-xs text-slate-400 mt-0.5">Directory of registered suppliers for procurement and stock lines.</p>
+                    </div>
+                    {(userRole === 'admin' || userRole === 'manager') && (
+                      <button
+                        id="btn_add_supplier_trigger"
+                        onClick={() => {
+                          setSupplierForm({
+                            name: '',
+                            contactName: '',
+                            email: '',
+                            phone: '',
+                            address: ''
+                          });
+                          setSupplierError('');
+                          setIsAddSupplierModalOpen(true);
+                        }}
+                        className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-lg text-xs shadow-md transition flex items-center gap-1.5 self-start sm:self-auto"
+                      >
+                        <Plus className="h-4 w-4" />
+                        Add New Supplier
+                      </button>
+                    )}
+                  </div>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6" id="suppliers_grid">
                     {suppliers.map(sup => {
                       const supItems = items.filter(i => i.supplierId === sup.id);
@@ -2951,6 +3242,7 @@ export default function App() {
                                     <option value="admin">Administrator</option>
                                     <option value="manager">Manager</option>
                                     <option value="operator">Operator</option>
+                                    <option value="engineer">Engineer</option>
                                     <option value="viewer">Viewer</option>
                                   </select>
                                 ) : (
@@ -2961,6 +3253,8 @@ export default function App() {
                                       ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20' 
                                       : member.role === 'operator' 
                                       ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
+                                      : member.role === 'engineer'
+                                      ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
                                       : 'bg-slate-500/10 text-slate-400 border-slate-500/20'
                                   }`}>
                                     {member.role}
@@ -3025,6 +3319,7 @@ export default function App() {
                                 <option value="admin">Administrator (Full control)</option>
                                 <option value="manager">Manager (Manage inventory catalog)</option>
                                 <option value="operator">Operator (Standard logs & shipments)</option>
+                                <option value="engineer">Engineer (Technical field partner)</option>
                                 <option value="viewer">Viewer (Read-only access)</option>
                               </select>
                             </div>
@@ -3046,6 +3341,293 @@ export default function App() {
                         Only administrators have permissions to register new operators.
                       </div>
                     )}
+                  </div>
+
+                  {/* FULL WIDTH SECTION: WAREHOUSE ZONES MANAGEMENT */}
+                  <div className="bg-slate-900/60 border border-slate-800/80 p-6 rounded-2xl space-y-6 lg:col-span-2 mt-4" id="settings_zones_management">
+                    <div className="border-b border-slate-800 pb-4">
+                      <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                        <Layers className="h-5 w-5 text-indigo-400" />
+                        Warehouse Storage Zones Directory
+                      </h3>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Define physical layout zones, assign color signatures, and establish storage limits.
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                      {/* Left Column: Zones List */}
+                      <div className="lg:col-span-7 space-y-4">
+                        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Active Storage Zones ({zones.length})</h4>
+                        
+                        {zones.length === 0 ? (
+                          <div className="p-8 bg-slate-950/40 border border-slate-800/60 rounded-xl text-center text-xs text-slate-500">
+                            No custom zones defined yet. Default fallback Zone-A is used.
+                          </div>
+                        ) : (
+                          <div className="space-y-3 max-h-[360px] overflow-y-auto pr-1">
+                            {zones.map((zone) => {
+                              const itemInZoneCount = items.filter(i => i.warehouseLocation && i.warehouseLocation.zone === zone.id).length;
+                              return (
+                                <div 
+                                  key={zone.id} 
+                                  className="p-4 bg-slate-950/40 border border-slate-800/60 rounded-xl flex items-center justify-between hover:border-slate-700/80 transition-colors"
+                                >
+                                  <div className="flex items-start gap-3">
+                                    <span 
+                                      className="h-3 w-3 rounded-full mt-1.5 shrink-0" 
+                                      style={{ backgroundColor: COLOR_MAP[zone.color] || '#6366f1' }}
+                                    ></span>
+                                    <div>
+                                      <div className="flex items-center gap-2">
+                                        <h5 className="text-xs font-bold text-white">{zone.name}</h5>
+                                        <span className="text-[9px] font-mono bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded uppercase">
+                                          {zone.id}
+                                        </span>
+                                      </div>
+                                      <p className="text-[11px] text-slate-400 mt-1">{zone.description || 'No description provided.'}</p>
+                                      <div className="flex items-center gap-3 text-[10px] text-slate-500 mt-2 font-mono">
+                                        <span>Max Capacity: <strong className="text-slate-300">{zone.maxCapacity || 100}</strong> units</span>
+                                        <span>•</span>
+                                        <span>Allocated Products: <strong className="text-slate-300">{itemInZoneCount}</strong> SKU lines</span>
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {(userRole === 'admin' || userRole === 'manager') && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteZone(zone.id, zone.name)}
+                                      className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 rounded-lg transition"
+                                      title="Delete Zone"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </button>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Right Column: Add Zone Form */}
+                      <div className="lg:col-span-5 bg-slate-950/40 border border-slate-800/60 p-5 rounded-xl">
+                        <h4 className="text-xs font-bold text-white uppercase tracking-wider mb-4 flex items-center gap-1.5">
+                          <Plus className="h-4 w-4 text-indigo-400" />
+                          Define New Storage Zone
+                        </h4>
+
+                        {(userRole === 'admin' || userRole === 'manager') ? (
+                          <form onSubmit={handleSaveZone} className="space-y-4">
+                            {zoneError && (
+                              <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-lg text-xs text-rose-400">
+                                {zoneError}
+                              </div>
+                            )}
+
+                            <div>
+                              <label className="text-[10px] text-slate-400 font-bold block mb-1">Zone Name *</label>
+                              <input 
+                                type="text"
+                                required
+                                placeholder="e.g. Zone C (Refrigerated)"
+                                value={zoneForm.name}
+                                onChange={e => setZoneForm(prev => ({ ...prev, name: e.target.value }))}
+                                className="w-full bg-slate-900 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-600 focus:outline-none"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="text-[10px] text-slate-400 font-bold block mb-1">Description</label>
+                              <input 
+                                type="text"
+                                placeholder="e.g. Temperature controlled storage unit"
+                                value={zoneForm.description}
+                                onChange={e => setZoneForm(prev => ({ ...prev, description: e.target.value }))}
+                                className="w-full bg-slate-900 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-600 focus:outline-none"
+                              />
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-3">
+                              <div>
+                                <label className="text-[10px] text-slate-400 font-bold block mb-1">Max Capacity (Units)</label>
+                                <input 
+                                  type="number"
+                                  min="1"
+                                  value={zoneForm.maxCapacity}
+                                  onChange={e => setZoneForm(prev => ({ ...prev, maxCapacity: Number(e.target.value) || 100 }))}
+                                  className="w-full bg-slate-900 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none"
+                                />
+                              </div>
+
+                              <div>
+                                <label className="text-[10px] text-slate-400 font-bold block mb-1">Color Code</label>
+                                <select 
+                                  value={zoneForm.color}
+                                  onChange={e => setZoneForm(prev => ({ ...prev, color: e.target.value }))}
+                                  className="w-full bg-slate-900 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none"
+                                >
+                                  <option value="indigo">Indigo Blue</option>
+                                  <option value="blue">Electric Blue</option>
+                                  <option value="emerald">Emerald Green</option>
+                                  <option value="amber">Amber Yellow</option>
+                                  <option value="slate">Slate Gray</option>
+                                </select>
+                              </div>
+                            </div>
+
+                            <button
+                              type="submit"
+                              disabled={zoneSubmitting}
+                              className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-700 text-white text-xs font-bold rounded-lg transition"
+                            >
+                              {zoneSubmitting ? 'Creating Zone...' : 'Create Storage Zone'}
+                            </button>
+                          </form>
+                        ) : (
+                          <div className="p-4 bg-slate-950/40 border border-slate-800/80 rounded-xl text-center text-xs text-slate-500">
+                            Only Administrators and Managers have permissions to define physical layout zones.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  </div>
+
+                  {/* FULL WIDTH SECTION: WAREHOUSE CATEGORIES DIRECTORY */}
+                  <div className="bg-slate-900/60 border border-slate-800/80 p-6 rounded-2xl space-y-6 lg:col-span-2 mt-4" id="settings_categories_management">
+                    <div className="border-b border-slate-800 pb-4">
+                      <h3 className="text-lg font-bold text-white flex items-center gap-2">
+                        <Tag className="h-5 w-5 text-emerald-400" />
+                        Warehouse Product Categories Directory
+                      </h3>
+                      <p className="text-xs text-slate-400 mt-1">
+                        Organize and filter stock lines by defining high-level product classifications and color codes.
+                      </p>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-12 gap-8">
+                      {/* Left Column: Categories List */}
+                      <div className="lg:col-span-7 space-y-4">
+                        <h4 className="text-xs font-bold text-slate-400 uppercase tracking-wider">Active Product Categories ({categories.length})</h4>
+                        
+                        {categories.length === 0 ? (
+                          <div className="p-8 bg-slate-950/40 border border-slate-800/60 rounded-xl text-center text-xs text-slate-500">
+                            No custom categories defined yet. Use the form to establish classifications.
+                          </div>
+                        ) : (
+                          <div className="space-y-3 max-h-[360px] overflow-y-auto pr-1">
+                            {categories.map((cat) => {
+                              const itemInCatCount = items.filter(i => i.category === cat.name).length;
+                              return (
+                                <div 
+                                  key={cat.id} 
+                                  className="p-4 bg-slate-950/40 border border-slate-800/60 rounded-xl flex items-center justify-between hover:border-slate-700/80 transition-colors"
+                                >
+                                  <div className="flex items-start gap-3">
+                                    <span 
+                                      className="h-3 w-3 rounded-full mt-1.5 shrink-0" 
+                                      style={{ backgroundColor: COLOR_MAP[cat.color] || '#10b981' }}
+                                    ></span>
+                                    <div>
+                                      <div className="flex items-center gap-2">
+                                        <h5 className="text-xs font-bold text-white">{cat.name}</h5>
+                                        <span className="text-[9px] font-mono bg-slate-800 text-slate-400 px-1.5 py-0.5 rounded uppercase">
+                                          {cat.id}
+                                        </span>
+                                      </div>
+                                      <p className="text-[11px] text-slate-400 mt-1">{cat.description || 'No description provided.'}</p>
+                                      <div className="flex items-center gap-3 text-[10px] text-slate-500 mt-2 font-mono">
+                                        <span>Matched Products: <strong className="text-slate-300">{itemInCatCount}</strong> SKU lines</span>
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  {(userRole === 'admin' || userRole === 'manager') && (
+                                    <button
+                                      type="button"
+                                      onClick={() => handleDeleteCategory(cat.id, cat.name)}
+                                      className="p-1.5 text-slate-500 hover:text-rose-400 hover:bg-rose-500/10 rounded-lg transition"
+                                      title="Delete Category"
+                                    >
+                                      <Trash2 className="h-4 w-4" />
+                                    </button>
+                                  )}
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
+                      </div>
+
+                      {/* Right Column: Add Category Form */}
+                      <div className="lg:col-span-5 bg-slate-950/40 border border-slate-800/60 p-5 rounded-xl">
+                        <h4 className="text-xs font-bold text-white uppercase tracking-wider mb-4 flex items-center gap-1.5">
+                          <Plus className="h-4 w-4 text-emerald-400" />
+                          Define New Product Category
+                        </h4>
+
+                        {(userRole === 'admin' || userRole === 'manager') ? (
+                          <form onSubmit={handleSaveCategory} className="space-y-4">
+                            {categoryError && (
+                              <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-lg text-xs text-rose-400">
+                                {categoryError}
+                              </div>
+                            )}
+
+                            <div>
+                              <label className="text-[10px] text-slate-400 font-bold block mb-1">Category Name *</label>
+                              <input 
+                                type="text"
+                                required
+                                placeholder="e.g. Critical Safety Spares"
+                                value={categoryForm.name}
+                                onChange={e => setCategoryForm(prev => ({ ...prev, name: e.target.value }))}
+                                className="w-full bg-slate-900 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-600 focus:outline-none"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="text-[10px] text-slate-400 font-bold block mb-1">Description</label>
+                              <input 
+                                type="text"
+                                placeholder="e.g. Parts requiring urgent engineer attention"
+                                value={categoryForm.description}
+                                onChange={e => setCategoryForm(prev => ({ ...prev, description: e.target.value }))}
+                                className="w-full bg-slate-900 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 placeholder-slate-600 focus:outline-none"
+                              />
+                            </div>
+
+                            <div>
+                              <label className="text-[10px] text-slate-400 font-bold block mb-1">Color Indicator</label>
+                              <select 
+                                value={categoryForm.color}
+                                onChange={e => setCategoryForm(prev => ({ ...prev, color: e.target.value }))}
+                                className="w-full bg-slate-900 border border-slate-800 focus:border-indigo-500 rounded-lg px-3 py-2 text-xs text-slate-200 focus:outline-none"
+                              >
+                                <option value="emerald">Emerald Green</option>
+                                <option value="indigo">Indigo Blue</option>
+                                <option value="blue">Electric Blue</option>
+                                <option value="amber">Amber Yellow</option>
+                                <option value="slate">Slate Gray</option>
+                              </select>
+                            </div>
+
+                            <button
+                              type="submit"
+                              disabled={categorySubmitting}
+                              className="w-full py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-700 text-white text-xs font-bold rounded-lg transition"
+                            >
+                              {categorySubmitting ? 'Creating Category...' : 'Create Product Category'}
+                            </button>
+                          </form>
+                        ) : (
+                          <div className="p-4 bg-slate-950/40 border border-slate-800/80 rounded-xl text-center text-xs text-slate-500">
+                            Only Administrators and Managers have permissions to define product categories.
+                          </div>
+                        )}
+                      </div>
+                    </div>
                   </div>
 
                 </div>
@@ -3194,9 +3776,13 @@ export default function App() {
                       id="form_add_zone"
                       value={itemForm.zone}
                       onChange={(e) => setItemForm({ ...itemForm, zone: e.target.value })}
-                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none"
+                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none text-slate-200"
                     >
-                      {zones.map(z => <option key={z.id} value={z.name}>{z.id}</option>)}
+                      {zones.length === 0 ? (
+                        <option value="Zone-A">Zone-A</option>
+                      ) : (
+                        zones.map(z => <option key={z.id} value={z.id}>{z.name}</option>)
+                      )}
                     </select>
                   </div>
                   <div>
@@ -3205,12 +3791,11 @@ export default function App() {
                       id="form_add_aisle"
                       value={itemForm.aisle}
                       onChange={(e) => setItemForm({ ...itemForm, aisle: e.target.value })}
-                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none"
+                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none text-slate-200"
                     >
-                      <option value="Aisle 01">Aisle 01</option>
-                      <option value="Aisle 02">Aisle 02</option>
-                      <option value="Aisle 03">Aisle 03</option>
-                      <option value="Aisle 04">Aisle 04</option>
+                      {mapAisles.map(aisle => (
+                        <option key={aisle} value={aisle}>{aisle}</option>
+                      ))}
                     </select>
                   </div>
                   <div>
@@ -3219,11 +3804,11 @@ export default function App() {
                       id="form_add_shelf"
                       value={itemForm.shelf}
                       onChange={(e) => setItemForm({ ...itemForm, shelf: e.target.value })}
-                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none"
+                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none text-slate-200"
                     >
-                      <option value="Level 1">Level 1 (Lower)</option>
-                      <option value="Level 2">Level 2 (Mid)</option>
-                      <option value="Level 3">Level 3 (High-Rack)</option>
+                      {mapShelves.map(shelf => (
+                        <option key={shelf} value={shelf}>{shelf}</option>
+                      ))}
                     </select>
                   </div>
                   <div>
@@ -3375,9 +3960,13 @@ export default function App() {
                       id="form_edit_zone"
                       value={itemForm.zone}
                       onChange={(e) => setItemForm({ ...itemForm, zone: e.target.value })}
-                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none"
+                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none text-slate-200"
                     >
-                      {zones.map(z => <option key={z.id} value={z.name}>{z.id}</option>)}
+                      {zones.length === 0 ? (
+                        <option value="Zone-A">Zone-A</option>
+                      ) : (
+                        zones.map(z => <option key={z.id} value={z.id}>{z.name}</option>)
+                      )}
                     </select>
                   </div>
                   <div>
@@ -3386,12 +3975,11 @@ export default function App() {
                       id="form_edit_aisle"
                       value={itemForm.aisle}
                       onChange={(e) => setItemForm({ ...itemForm, aisle: e.target.value })}
-                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none"
+                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none text-slate-200"
                     >
-                      <option value="Aisle 01">Aisle 01</option>
-                      <option value="Aisle 02">Aisle 02</option>
-                      <option value="Aisle 03">Aisle 03</option>
-                      <option value="Aisle 04">Aisle 04</option>
+                      {mapAisles.map(aisle => (
+                        <option key={aisle} value={aisle}>{aisle}</option>
+                      ))}
                     </select>
                   </div>
                   <div>
@@ -3400,11 +3988,11 @@ export default function App() {
                       id="form_edit_shelf"
                       value={itemForm.shelf}
                       onChange={(e) => setItemForm({ ...itemForm, shelf: e.target.value })}
-                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none"
+                      className="w-full bg-slate-900 border border-slate-800 rounded p-1.5 text-[11px] outline-none text-slate-200"
                     >
-                      <option value="Level 1">Level 1</option>
-                      <option value="Level 2">Level 2</option>
-                      <option value="Level 3">Level 3</option>
+                      {mapShelves.map(shelf => (
+                        <option key={shelf} value={shelf}>{shelf}</option>
+                      ))}
                     </select>
                   </div>
                   <div>
@@ -3571,6 +4159,98 @@ export default function App() {
                   )}
                 </select>
               </div>
+
+              {adjustForm.type === 'OUTBOUND' && (
+                <div className="p-4 bg-slate-950/80 border border-slate-800 rounded-xl space-y-3" id="outbound_destination_selection">
+                  <span className="text-xs font-bold text-amber-400 block flex items-center gap-1.5">
+                    <span className="h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
+                    Required Outbound Dispatch Destination
+                  </span>
+                  
+                  <div className="flex gap-4">
+                    <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
+                      <input 
+                        type="radio" 
+                        name="outboundTargetType" 
+                        value="engineer" 
+                        checked={adjustForm.outboundTargetType === 'engineer'}
+                        onChange={() => setAdjustForm(prev => ({ ...prev, outboundTargetType: 'engineer' }))}
+                        className="text-indigo-600 focus:ring-indigo-500 bg-slate-900 border-slate-800"
+                      />
+                      Issue to Engineer
+                    </label>
+                    <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
+                      <input 
+                        type="radio" 
+                        name="outboundTargetType" 
+                        value="warehouse" 
+                        checked={adjustForm.outboundTargetType === 'warehouse'}
+                        onChange={() => setAdjustForm(prev => ({ ...prev, outboundTargetType: 'warehouse' }))}
+                        className="text-indigo-600 focus:ring-indigo-500 bg-slate-900 border-slate-800"
+                      />
+                      Issue to Connected Warehouse
+                    </label>
+                  </div>
+
+                  {adjustForm.outboundTargetType === 'engineer' ? (
+                    <div>
+                      <label className="text-[10px] text-slate-400 font-bold block mb-1">Select Engineer *</label>
+                      {warehouseUsers.filter(u => u.role === 'engineer').length > 0 ? (
+                        <select 
+                          value={adjustForm.selectedEngineerId}
+                          onChange={e => setAdjustForm(prev => ({ ...prev, selectedEngineerId: e.target.value, customRecipientName: '' }))}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 outline-none focus:border-indigo-500"
+                        >
+                          <option value="">-- Choose an Engineer --</option>
+                          {warehouseUsers.filter(u => u.role === 'engineer').map(u => (
+                            <option key={u.id} value={u.id}>{u.name || u.email} ({u.email})</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <div className="space-y-2">
+                          <p className="text-[10px] text-amber-500">No active team members are registered with the "Engineer" role. Enter the engineer name manually below, or invite one in Settings:</p>
+                          <input 
+                            type="text"
+                            placeholder="Recipient Engineer Name (e.g. John Doe)"
+                            required
+                            value={adjustForm.customRecipientName}
+                            onChange={e => setAdjustForm(prev => ({ ...prev, customRecipientName: e.target.value, selectedEngineerId: '' }))}
+                            className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-indigo-500"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  ) : (
+                    <div>
+                      <label className="text-[10px] text-slate-400 font-bold block mb-1">Select Connected Warehouse *</label>
+                      {warehouses.filter(w => w.id !== warehouse?.id).length > 0 ? (
+                        <select 
+                          value={adjustForm.selectedWarehouseId}
+                          onChange={e => setAdjustForm(prev => ({ ...prev, selectedWarehouseId: e.target.value, customRecipientName: '' }))}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 outline-none focus:border-indigo-500"
+                        >
+                          <option value="">-- Choose Connected Warehouse --</option>
+                          {warehouses.filter(w => w.id !== warehouse?.id).map(w => (
+                            <option key={w.id} value={w.id}>{w.name} ({w.address || 'No Address'})</option>
+                          ))}
+                        </select>
+                      ) : (
+                        <div className="space-y-2">
+                          <p className="text-[10px] text-amber-500">No other connected warehouses on your profile. Enter the destination warehouse name manually below, or connect one in Settings:</p>
+                          <input 
+                            type="text"
+                            placeholder="Destination Warehouse Name (e.g. East Annex)"
+                            required
+                            value={adjustForm.customRecipientName}
+                            onChange={e => setAdjustForm(prev => ({ ...prev, customRecipientName: e.target.value, selectedWarehouseId: '' }))}
+                            className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-indigo-500"
+                          />
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
 
               <div className="border-t border-slate-800/85 pt-4 mt-5 flex items-center justify-end gap-3">
                 <button 
@@ -3894,6 +4574,132 @@ export default function App() {
                     <>
                       <span>Delete Warehouse &amp; Account</span>
                       <Trash2 className="h-3 w-3" />
+                    </>
+                  )}
+                </button>
+              </div>
+
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* ==================== FORM MODAL 7: ADD SUPPLIER CONTACT ==================== */}
+      {isAddSupplierModalOpen && (
+        <div id="modal_add_supplier" className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/80 backdrop-blur-sm p-4 animate-fade-in">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl max-w-xl w-full p-6 shadow-2xl relative animate-scale-up text-slate-200">
+            <h3 className="text-lg font-bold text-white border-b border-slate-800 pb-3 mb-5 flex items-center gap-2">
+              <Plus className="h-5.5 w-5.5 text-indigo-400" />
+              Register New Supplier Contact
+            </h3>
+
+            {supplierError && (
+              <div className="mb-4 p-3 bg-rose-500/10 border border-rose-500/20 text-rose-300 text-xs rounded-xl flex items-center gap-2">
+                <AlertTriangle className="h-4 w-4 shrink-0" />
+                <span>{supplierError}</span>
+              </div>
+            )}
+
+            <form onSubmit={handleSaveSupplier} className="space-y-4">
+              
+              {/* Row 1: Name and Contact Person */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Supplier Name *</label>
+                  <input 
+                    id="supplier_form_name"
+                    type="text"
+                    required
+                    placeholder="e.g. Apex Electronics Corp"
+                    value={supplierForm.name}
+                    onChange={(e) => setSupplierForm(prev => ({ ...prev, name: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-lg p-2.5 text-xs text-slate-100 outline-none transition"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Contact Person Name</label>
+                  <input 
+                    id="supplier_form_contact_name"
+                    type="text"
+                    placeholder="e.g. Sarah Jenkins"
+                    value={supplierForm.contactName}
+                    onChange={(e) => setSupplierForm(prev => ({ ...prev, contactName: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-lg p-2.5 text-xs text-slate-100 outline-none transition"
+                  />
+                </div>
+              </div>
+
+              {/* Row 2: Email and Phone */}
+              <div className="grid grid-cols-2 gap-4">
+                <div>
+                  <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Email Address</label>
+                  <input 
+                    id="supplier_form_email"
+                    type="email"
+                    placeholder="e.g. sjenkins@apex-corp.com"
+                    value={supplierForm.email}
+                    onChange={(e) => setSupplierForm(prev => ({ ...prev, email: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-lg p-2.5 text-xs text-slate-100 outline-none transition"
+                  />
+                </div>
+                <div>
+                  <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Phone Number</label>
+                  <input 
+                    id="supplier_form_phone"
+                    type="tel"
+                    placeholder="e.g. +1 (555) 019-2834"
+                    value={supplierForm.phone}
+                    onChange={(e) => setSupplierForm(prev => ({ ...prev, phone: e.target.value }))}
+                    className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-lg p-2.5 text-xs text-slate-100 outline-none transition"
+                  />
+                </div>
+              </div>
+
+              {/* Row 3: Address */}
+              <div>
+                <label className="text-xs font-semibold text-slate-400 uppercase tracking-wider block mb-1.5">Registered Office Address</label>
+                <textarea 
+                  id="supplier_form_address"
+                  rows={3}
+                  placeholder="e.g. 482 Silicon Valley Dr, San Jose, CA"
+                  value={supplierForm.address}
+                  onChange={(e) => setSupplierForm(prev => ({ ...prev, address: e.target.value }))}
+                  className="w-full bg-slate-950 border border-slate-800 focus:border-indigo-500 rounded-lg p-2.5 text-xs text-slate-100 outline-none transition resize-none leading-relaxed"
+                />
+              </div>
+
+              {/* Action Buttons */}
+              <div className="border-t border-slate-800/85 pt-4 mt-5 flex items-center justify-end gap-3">
+                <button 
+                  id="btn_cancel_supplier_add"
+                  type="button" 
+                  onClick={() => {
+                    setIsAddSupplierModalOpen(false);
+                    setSupplierForm({
+                      name: '',
+                      contactName: '',
+                      email: '',
+                      phone: '',
+                      address: ''
+                    });
+                    setSupplierError('');
+                  }}
+                  className="px-4 py-2 text-xs font-bold text-slate-400 hover:text-slate-200 transition"
+                >
+                  Cancel
+                </button>
+                <button 
+                  id="btn_confirm_supplier_add"
+                  type="submit" 
+                  disabled={supplierSubmitting}
+                  className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-800 text-white font-bold text-xs rounded-xl transition flex items-center gap-1.5"
+                >
+                  {supplierSubmitting ? (
+                    <span className="h-3 w-3 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
+                  ) : (
+                    <>
+                      <span>Register Supplier</span>
+                      <Check className="h-3.5 w-3.5" />
                     </>
                   )}
                 </button>

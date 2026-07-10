@@ -183,9 +183,9 @@ async function runMigrations() {
     CREATE TABLE IF NOT EXISTS categories (
       id VARCHAR(50) PRIMARY KEY,
       warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
-      name VARCHAR(100) NOT NULL,
+      name VARCHAR(512) NOT NULL,
       description TEXT,
-      color VARCHAR(50),
+      color VARCHAR(512),
       UNIQUE(warehouse_id, name)
     )
   `);
@@ -195,10 +195,10 @@ async function runMigrations() {
     CREATE TABLE IF NOT EXISTS suppliers (
       id VARCHAR(50) PRIMARY KEY,
       warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
-      name VARCHAR(100) NOT NULL,
-      contact_name VARCHAR(100),
-      email VARCHAR(150),
-      phone VARCHAR(50),
+      name VARCHAR(512) NOT NULL,
+      contact_name VARCHAR(512),
+      email VARCHAR(512),
+      phone VARCHAR(512),
       address TEXT,
       UNIQUE(warehouse_id, name)
     )
@@ -209,10 +209,10 @@ async function runMigrations() {
     CREATE TABLE IF NOT EXISTS zones (
       id VARCHAR(50) PRIMARY KEY,
       warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
-      name VARCHAR(100) NOT NULL,
+      name VARCHAR(512) NOT NULL,
       description TEXT,
       max_capacity INT,
-      color VARCHAR(50),
+      color VARCHAR(512),
       UNIQUE(warehouse_id, name)
     )
   `);
@@ -222,16 +222,16 @@ async function runMigrations() {
     CREATE TABLE IF NOT EXISTS items (
       id VARCHAR(50) PRIMARY KEY,
       warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
-      name VARCHAR(255) NOT NULL,
-      sku VARCHAR(100) NOT NULL,
-      category VARCHAR(100) NOT NULL,
+      name VARCHAR(1024) NOT NULL,
+      sku VARCHAR(512) NOT NULL,
+      category VARCHAR(512) NOT NULL,
       quantity INT NOT NULL DEFAULT 0,
       unit VARCHAR(50) NOT NULL DEFAULT 'pcs',
       price DECIMAL(12, 2) NOT NULL DEFAULT 0.00,
-      zone VARCHAR(50) NOT NULL,
-      aisle VARCHAR(50) NOT NULL,
-      shelf VARCHAR(50) NOT NULL,
-      bin VARCHAR(50) NOT NULL,
+      zone VARCHAR(512) NOT NULL,
+      aisle VARCHAR(512) NOT NULL,
+      shelf VARCHAR(512) NOT NULL,
+      bin VARCHAR(512) NOT NULL,
       supplier_id VARCHAR(50) REFERENCES suppliers(id) ON DELETE SET NULL,
       min_threshold INT NOT NULL DEFAULT 10,
       last_updated TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
@@ -246,13 +246,13 @@ async function runMigrations() {
       id VARCHAR(50) PRIMARY KEY,
       warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
       item_id VARCHAR(50),
-      item_name VARCHAR(255) NOT NULL,
-      sku VARCHAR(100) NOT NULL,
+      item_name VARCHAR(1024) NOT NULL,
+      sku VARCHAR(512) NOT NULL,
       type VARCHAR(20) NOT NULL,
       quantity INT NOT NULL,
       reason TEXT,
       timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-      operator VARCHAR(100)
+      operator VARCHAR(512)
     )
   `);
 
@@ -273,6 +273,34 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_cols INT DEFAULT 5`);
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_zones TEXT DEFAULT '[]'`);
   await pool.query(`ALTER TABLE user_warehouses ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'admin'`);
+
+  // Programmatic migration to alter column types to TEXT / VARCHAR(512) to support encrypted payloads in existing databases
+  try {
+    await pool.query(`ALTER TABLE categories ALTER COLUMN name TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE categories ALTER COLUMN color TYPE VARCHAR(512)`);
+    
+    await pool.query(`ALTER TABLE suppliers ALTER COLUMN name TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE suppliers ALTER COLUMN contact_name TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE suppliers ALTER COLUMN email TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE suppliers ALTER COLUMN phone TYPE VARCHAR(512)`);
+    
+    await pool.query(`ALTER TABLE zones ALTER COLUMN name TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE zones ALTER COLUMN color TYPE VARCHAR(512)`);
+    
+    await pool.query(`ALTER TABLE items ALTER COLUMN name TYPE VARCHAR(1024)`);
+    await pool.query(`ALTER TABLE items ALTER COLUMN sku TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE items ALTER COLUMN category TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE items ALTER COLUMN zone TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE items ALTER COLUMN aisle TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE items ALTER COLUMN shelf TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE items ALTER COLUMN bin TYPE VARCHAR(512)`);
+    
+    await pool.query(`ALTER TABLE transactions ALTER COLUMN item_name TYPE VARCHAR(1024)`);
+    await pool.query(`ALTER TABLE transactions ALTER COLUMN sku TYPE VARCHAR(512)`);
+    await pool.query(`ALTER TABLE transactions ALTER COLUMN operator TYPE VARCHAR(512)`);
+  } catch (err: any) {
+    console.warn('⚠️ Non-critical migration warning:', err.message);
+  }
 
   // Demo account/warehouse seeding is opt-in only (SEED_DEMO_DATA=true). It used
   // to run unconditionally on every boot, which meant a well-known credential
@@ -634,6 +662,48 @@ export async function getCategories(warehouseId: string) {
   }));
 }
 
+export async function saveCategory(category: any, warehouseId: string) {
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO categories (id, warehouse_id, name, description, color)
+       VALUES ($1, $2, $3, $4, $5)
+       ON CONFLICT (id) DO UPDATE SET
+         name = $3,
+         description = $4,
+         color = $5`,
+      [
+        category.id,
+        warehouseId,
+        encryptText(category.name, warehouseId),
+        encryptText(category.description || '', warehouseId),
+        encryptText(category.color || '', warehouseId)
+      ]
+    );
+  } else {
+    const idx = memCategories.findIndex(c => c.id === category.id);
+    const mapped = {
+      id: category.id,
+      warehouse_id: warehouseId,
+      name: encryptText(category.name, warehouseId),
+      description: encryptText(category.description || '', warehouseId),
+      color: encryptText(category.color || '', warehouseId)
+    };
+    if (idx >= 0) {
+      memCategories[idx] = mapped;
+    } else {
+      memCategories.push(mapped);
+    }
+  }
+}
+
+export async function deleteCategory(id: string, warehouseId: string) {
+  if (usePostgres) {
+    await pool.query('DELETE FROM categories WHERE id = $1 AND warehouse_id = $2', [id, warehouseId]);
+  } else {
+    memCategories = memCategories.filter(c => !(c.id === id && c.warehouse_id === warehouseId));
+  }
+}
+
 export async function getSuppliers(warehouseId: string) {
   let list = [];
   if (usePostgres) {
@@ -652,6 +722,46 @@ export async function getSuppliers(warehouseId: string) {
   }));
 }
 
+export async function saveSupplier(supplier: any, warehouseId: string) {
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO suppliers (id, warehouse_id, name, contact_name, email, phone, address)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (id) DO UPDATE SET
+         name = $3,
+         contact_name = $4,
+         email = $5,
+         phone = $6,
+         address = $7`,
+      [
+        supplier.id,
+        warehouseId,
+        encryptText(supplier.name, warehouseId),
+        encryptText(supplier.contactName, warehouseId),
+        encryptText(supplier.email, warehouseId),
+        encryptText(supplier.phone, warehouseId),
+        encryptText(supplier.address, warehouseId)
+      ]
+    );
+  } else {
+    const idx = memSuppliers.findIndex(s => s.id === supplier.id);
+    const mapped = {
+      id: supplier.id,
+      warehouse_id: warehouseId,
+      name: encryptText(supplier.name, warehouseId),
+      contact_name: encryptText(supplier.contactName, warehouseId),
+      email: encryptText(supplier.email, warehouseId),
+      phone: encryptText(supplier.phone, warehouseId),
+      address: encryptText(supplier.address, warehouseId)
+    };
+    if (idx >= 0) {
+      memSuppliers[idx] = mapped;
+    } else {
+      memSuppliers.push(mapped);
+    }
+  }
+}
+
 export async function getZones(warehouseId: string) {
   let list = [];
   if (usePostgres) {
@@ -667,6 +777,51 @@ export async function getZones(warehouseId: string) {
     maxCapacity: row.max_capacity || row.maxCapacity,
     color: decryptText(row.color, warehouseId),
   }));
+}
+
+export async function saveZone(zone: any, warehouseId: string) {
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO zones (id, warehouse_id, name, description, max_capacity, color)
+       VALUES ($1, $2, $3, $4, $5, $6)
+       ON CONFLICT (id) DO UPDATE SET
+         name = $3,
+         description = $4,
+         max_capacity = $5,
+         color = $6`,
+      [
+        zone.id,
+        warehouseId,
+        encryptText(zone.name, warehouseId),
+        encryptText(zone.description, warehouseId),
+        zone.maxCapacity,
+        encryptText(zone.color, warehouseId)
+      ]
+    );
+  } else {
+    const idx = memZones.findIndex(z => z.id === zone.id);
+    const mapped = {
+      id: zone.id,
+      warehouse_id: warehouseId,
+      name: encryptText(zone.name, warehouseId),
+      description: encryptText(zone.description, warehouseId),
+      max_capacity: zone.maxCapacity,
+      color: encryptText(zone.color, warehouseId)
+    };
+    if (idx >= 0) {
+      memZones[idx] = mapped;
+    } else {
+      memZones.push(mapped);
+    }
+  }
+}
+
+export async function deleteZone(id: string, warehouseId: string) {
+  if (usePostgres) {
+    await pool.query('DELETE FROM zones WHERE id = $1 AND warehouse_id = $2', [id, warehouseId]);
+  } else {
+    memZones = memZones.filter(z => !(z.id === id && z.warehouse_id === warehouseId));
+  }
 }
 
 export async function getItems(warehouseId: string) {

@@ -8,8 +8,13 @@ import {
   getItems, 
   getTransactions, 
   getSuppliers, 
+  saveSupplier,
   getCategories, 
+  saveCategory,
+  deleteCategory,
   getZones, 
+  saveZone,
+  deleteZone,
   saveItem, 
   updateItem, 
   deleteItem, 
@@ -431,6 +436,145 @@ async function startServer() {
     }
   });
 
+  // Create a new supplier in the user's registered warehouse
+  app.post('/api/suppliers', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      
+      // Permission check: admin/manager only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can add suppliers.' });
+        return;
+      }
+
+      const supplier = req.body;
+      if (!supplier.name) {
+        res.status(400).json({ error: 'Missing required supplier name' });
+        return;
+      }
+
+      if (!supplier.id) {
+        supplier.id = `sup-${Date.now()}`;
+      }
+
+      await saveSupplier(supplier, warehouseId);
+
+      res.status(201).json({ status: 'success', supplier });
+    } catch (err: any) {
+      console.error('Error saving supplier:', err);
+      res.status(500).json({ error: 'Failed to save supplier', details: err.message });
+    }
+  });
+
+  // Create or update a zone in the user's registered warehouse
+  app.post('/api/zones', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      
+      // Permission check: admin/manager only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can add zones.' });
+        return;
+      }
+
+      const zone = req.body;
+      if (!zone.name) {
+        res.status(400).json({ error: 'Missing required zone name' });
+        return;
+      }
+
+      if (!zone.id) {
+        const cleanName = zone.name.trim().replace(/\s+/g, '-');
+        zone.id = `${cleanName}-${Date.now()}`;
+      }
+
+      await saveZone(zone, warehouseId);
+
+      res.status(201).json({ status: 'success', zone });
+    } catch (err: any) {
+      console.error('Error saving zone:', err);
+      res.status(500).json({ error: 'Failed to save zone', details: err.message });
+    }
+  });
+
+  // Delete a zone from the user's registered warehouse
+  app.delete('/api/zones/:id', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      
+      // Permission check: admin/manager only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can delete zones.' });
+        return;
+      }
+
+      const zoneId = req.params.id;
+      await deleteZone(zoneId, warehouseId);
+
+      res.json({ status: 'success' });
+    } catch (err: any) {
+      console.error('Error deleting zone:', err);
+      res.status(500).json({ error: 'Failed to delete zone', details: err.message });
+    }
+  });
+
+  // Create or update a category in the user's registered warehouse
+  app.post('/api/categories', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      
+      // Permission check: admin/manager only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can manage categories.' });
+        return;
+      }
+
+      const category = req.body;
+      if (!category.name) {
+        res.status(400).json({ error: 'Missing required category name' });
+        return;
+      }
+
+      if (!category.id) {
+        const cleanName = category.name.trim().replace(/\s+/g, '-').toLowerCase();
+        category.id = `${cleanName}-${Date.now()}`;
+      }
+
+      await saveCategory(category, warehouseId);
+
+      res.status(201).json({ status: 'success', category });
+    } catch (err: any) {
+      console.error('Error saving category:', err);
+      res.status(500).json({ error: 'Failed to save category', details: err.message });
+    }
+  });
+
+  // Delete a category from the user's registered warehouse
+  app.delete('/api/categories/:id', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      
+      // Permission check: admin/manager only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can delete categories.' });
+        return;
+      }
+
+      const categoryId = req.params.id;
+      await deleteCategory(categoryId, warehouseId);
+
+      res.json({ status: 'success' });
+    } catch (err: any) {
+      console.error('Error deleting category:', err);
+      res.status(500).json({ error: 'Failed to delete category', details: err.message });
+    }
+  });
+
   // Create a new inventory item inside the user's registered warehouse
   app.post('/api/items', authenticateToken, async (req: any, res) => {
     try {
@@ -534,9 +678,14 @@ async function startServer() {
         return;
       }
 
-      const { itemId, type, quantity, reason, operator } = req.body;
+      const { itemId, type, quantity, reason, operator, issuedTo } = req.body;
       if (!itemId || !type || !quantity) {
         res.status(400).json({ error: 'Missing adjustment parameters' });
+        return;
+      }
+
+      if (type === 'OUTBOUND' && (!issuedTo || !issuedTo.trim())) {
+        res.status(400).json({ error: 'Outbound shipments must be issued to an engineer or another connected warehouse.' });
         return;
       }
 
@@ -565,6 +714,8 @@ async function startServer() {
         lastUpdated: new Date().toISOString()
       };
 
+      const finalReason = type === 'OUTBOUND' && issuedTo ? `${reason} [Issued to: ${issuedTo}]` : reason;
+
       // Create transaction record
       const transaction = {
         id: `tx-adjust-${Date.now()}`,
@@ -573,7 +724,7 @@ async function startServer() {
         sku: item.sku,
         type,
         quantity: qty,
-        reason,
+        reason: finalReason,
         timestamp: new Date().toISOString(),
         operator: operator || req.user.name || 'System Operator'
       };
