@@ -3,6 +3,8 @@ import path from 'path';
 import fs from 'fs';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import helmet from 'helmet';
+import rateLimit from 'express-rate-limit';
 import { 
   initDb, 
   getItems, 
@@ -18,7 +20,17 @@ import {
   saveItem, 
   updateItem, 
   deleteItem, 
+  archiveItem,
   saveTransaction, 
+  adjustStockAtomic,
+  restockAtomic,
+  transferStockAtomic,
+  getPurchaseOrders,
+  savePurchaseOrder,
+  updatePurchaseOrderStatus,
+  deletePurchaseOrder,
+  getZoneCapacity,
+  verifyLiveUserAccess,
   resetDb,
   createUser,
   findUserByEmail,
@@ -53,7 +65,7 @@ function resolveJwtSecret(): string {
 
 const JWT_SECRET = resolveJwtSecret();
 
-// Middleware to authenticate JWT access tokens
+// Middleware to authenticate JWT access tokens with live membership validation
 function authenticateToken(req: any, res: any, next: any) {
   const authHeader = req.headers['authorization'];
   const token = authHeader && authHeader.split(' ')[1];
@@ -63,19 +75,49 @@ function authenticateToken(req: any, res: any, next: any) {
     return;
   }
 
-  jwt.verify(token, JWT_SECRET, (err: any, user: any) => {
+  jwt.verify(token, JWT_SECRET, async (err: any, decoded: any) => {
     if (err) {
       res.status(403).json({ error: 'Session expired or invalid token. Please sign in again.' });
       return;
     }
-    req.user = user;
-    next();
+    
+    // Validate live authorization against current tenant database
+    try {
+      const liveStatus = await verifyLiveUserAccess(decoded.id, decoded.warehouseId);
+      if (!liveStatus.valid) {
+        res.status(403).json({ error: 'Clearance revoked or membership is no longer active for this warehouse.' });
+        return;
+      }
+      req.user = {
+        ...decoded,
+        role: liveStatus.role
+      };
+      next();
+    } catch (checkErr) {
+      req.user = decoded;
+      next();
+    }
   });
 }
+
+// Rate limiter for authentication routes
+const authRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000, // 15 minutes
+  max: 40, // 40 requests per 15 minutes per IP
+  message: { error: 'Too many authentication attempts. Please try again in 15 minutes.' },
+  standardHeaders: true,
+  legacyHeaders: false,
+});
 
 async function startServer() {
   const app = express();
   
+  // Configure HTTP Security Headers (relaxed CSP to permit Vite hot reload & iframe preview)
+  app.use(helmet({
+    contentSecurityPolicy: false,
+    crossOriginEmbedderPolicy: false
+  }));
+
   // Configure the port: runs on PORT (3000) inside AI Studio
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
@@ -95,7 +137,7 @@ async function startServer() {
   // --- Authentication & Multi-Tenant Registry Endpoints ---
 
   // Register a new user account + create or join a warehouse tenant
-  app.post('/api/auth/register', async (req, res) => {
+  app.post('/api/auth/register', authRateLimiter, async (req, res) => {
     try {
       const { email, password, name, warehouseOption, warehouseName, warehouseAddress, warehouseCode } = req.body;
       
@@ -182,7 +224,7 @@ async function startServer() {
   });
 
   // Login via Email & Password
-  app.post('/api/auth/login', async (req, res) => {
+  app.post('/api/auth/login', authRateLimiter, async (req, res) => {
     try {
       const { email, password } = req.body;
       if (!email || !password) {
@@ -203,20 +245,22 @@ async function startServer() {
         return;
       }
 
-      const warehouse = await findWarehouseById(user.warehouseId || '');
-      const warehousesList = await getUserWarehouses(user.id);
-      
-      // Fallback association for seed / existing users
-      if (warehousesList.length === 0 && user.warehouseId) {
-        await associateUserWithWarehouse(user.id, user.warehouseId);
-        const mappedWh = await findWarehouseById(user.warehouseId);
-        if (mappedWh) {
-          warehousesList.push(mappedWh);
-        }
+      // Check all accessible warehouses for this user
+      const warehouses = await getUserWarehouses(user.id);
+      if (warehouses.length === 0) {
+        res.status(403).json({ error: 'No warehouse tenants associated with this account.' });
+        return;
       }
 
+      // Determine active warehouse (default to user's saved warehouseId or first available)
+      const activeWhId = (user.warehouseId && warehouses.some((w: any) => w.id === user.warehouseId))
+        ? user.warehouseId
+        : warehouses[0].id;
+
+      const activeWarehouse = warehouses.find((w: any) => w.id === activeWhId) || warehouses[0];
+
       const token = jwt.sign(
-        { id: user.id, email: user.email, name: user.name, warehouseId: user.warehouseId },
+        { id: user.id, email: user.email, name: user.name, warehouseId: activeWhId },
         JWT_SECRET,
         { expiresIn: '24h' }
       );
@@ -224,8 +268,8 @@ async function startServer() {
       res.json({
         token,
         user: { id: user.id, email: user.email, name: user.name },
-        warehouse,
-        warehouses: warehousesList
+        warehouse: activeWarehouse,
+        warehouses
       });
     } catch (err: any) {
       console.error('Login error:', err);
@@ -415,11 +459,11 @@ async function startServer() {
     }
   });
 
-  // Retrieve the entire warehouse dataset (items, transactions, suppliers, categories, zones, warehouse settings, user roles) scoped to user's warehouse
+  // Retrieve the entire warehouse dataset (items, transactions, suppliers, categories, zones, warehouse settings, user roles, purchase orders, zone capacities) scoped to user's warehouse
   app.get('/api/data', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
-      const [items, transactions, suppliers, categories, zones, warehouse, userRole, warehouseUsers] = await Promise.all([
+      const [items, transactions, suppliers, categories, zones, warehouse, userRole, warehouseUsers, purchaseOrders, zoneCapacities] = await Promise.all([
         getItems(warehouseId),
         getTransactions(warehouseId),
         getSuppliers(warehouseId),
@@ -427,9 +471,11 @@ async function startServer() {
         getZones(warehouseId),
         findWarehouseById(warehouseId),
         getUserRoleInWarehouse(req.user.id, warehouseId),
-        getWarehouseUsers(warehouseId)
+        getWarehouseUsers(warehouseId),
+        getPurchaseOrders(warehouseId),
+        getZoneCapacity(warehouseId)
       ]);
-      res.json({ items, transactions, suppliers, categories, zones, warehouse, userRole, warehouseUsers });
+      res.json({ items, transactions, suppliers, categories, zones, warehouse, userRole, warehouseUsers, purchaseOrders, zoneCapacities });
     } catch (err: any) {
       console.error('Error fetching data:', err);
       res.status(500).json({ error: 'Failed to fetch warehouse dataset', details: err.message });
@@ -666,7 +712,44 @@ async function startServer() {
     }
   });
 
-  // Handle inbound intake or outbound dispatch adjustments
+  // Archive or unarchive an item with audit logging
+  app.post('/api/items/:id/archive', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+
+      // Permission check: admin/manager only
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can archive items.' });
+        return;
+      }
+
+      const { id } = req.params;
+      const { archive = true } = req.body;
+      const updatedItem = await archiveItem(id, warehouseId, archive);
+
+      // Log transaction for audit compliance
+      const tx = {
+        id: `tx-arch-${Date.now()}`,
+        itemId: id,
+        itemName: updatedItem?.name || id,
+        sku: updatedItem?.sku || '',
+        type: 'AUDIT',
+        quantity: 0,
+        reason: archive ? 'Item Archived / Decommissioned' : 'Item Restored / Unarchived',
+        timestamp: new Date().toISOString(),
+        operator: req.user.name || 'System Operator'
+      };
+      await saveTransaction(tx, warehouseId);
+
+      res.json({ status: 'success', item: updatedItem, transaction: tx });
+    } catch (err: any) {
+      console.error('Error archiving item:', err);
+      res.status(500).json({ error: 'Failed to update item archive state', details: err.message });
+    }
+  });
+
+  // Handle inbound intake or outbound dispatch adjustments (atomic with concurrency lock)
   app.post('/api/adjust', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
@@ -678,69 +761,38 @@ async function startServer() {
         return;
       }
 
-      const { itemId, type, quantity, reason, operator, issuedTo } = req.body;
+      const { itemId, type, quantity, reason, operator, issuedTo, batchNumber } = req.body;
       if (!itemId || !type || !quantity) {
         res.status(400).json({ error: 'Missing adjustment parameters' });
         return;
       }
 
       if (type === 'OUTBOUND' && (!issuedTo || !issuedTo.trim())) {
-        res.status(400).json({ error: 'Outbound shipments must be issued to an engineer or another connected warehouse.' });
+        res.status(400).json({ error: 'Outbound shipments must be issued to an engineer or destination unit.' });
         return;
       }
 
-      // Fetch items to verify stock levels
-      const itemsList = await getItems(warehouseId);
-      const itemIndex = itemsList.findIndex((i: any) => i.id === itemId);
-      if (itemIndex === -1) {
-        res.status(404).json({ error: 'Item not found in your warehouse' });
-        return;
-      }
+      const finalReason = reason || (type === 'INBOUND' ? 'Manual Inbound Intake' : `Outbound Dispatch (Issued to: ${issuedTo})`);
+      const finalOperator = operator || req.user.name || 'System Operator';
 
-      const item = itemsList[itemIndex];
-      const qty = Number(quantity);
-      if (type === 'OUTBOUND' && item.quantity < qty) {
-        res.status(400).json({ error: 'Insufficient stock level to fulfill dispatch' });
-        return;
-      }
-
-      const multiplier = type === 'INBOUND' ? 1 : -1;
-      const updatedQty = item.quantity + (qty * multiplier);
-
-      // Create updated item entity
-      const updatedItem = {
-        ...item,
-        quantity: updatedQty,
-        lastUpdated: new Date().toISOString()
-      };
-
-      const finalReason = type === 'OUTBOUND' && issuedTo ? `${reason} [Issued to: ${issuedTo}]` : reason;
-
-      // Create transaction record
-      const transaction = {
-        id: `tx-adjust-${Date.now()}`,
-        itemId: item.id,
-        itemName: item.name,
-        sku: item.sku,
+      const result = await adjustStockAtomic(
+        warehouseId,
+        itemId,
         type,
-        quantity: qty,
-        reason: finalReason,
-        timestamp: new Date().toISOString(),
-        operator: operator || req.user.name || 'System Operator'
-      };
+        Number(quantity),
+        finalReason,
+        finalOperator,
+        batchNumber
+      );
 
-      // Save changes to database
-      await updateItem(item.id, updatedItem, warehouseId);
-      await saveTransaction(transaction, warehouseId);
-
-      res.json({ status: 'success', item: updatedItem, transaction });
+      res.json({ status: 'success', item: result.item, transaction: result.transaction });
     } catch (err: any) {
       console.error('Error executing adjustment:', err);
-      res.status(500).json({ error: 'Failed to execute transaction', details: err.message });
+      res.status(400).json({ error: err.message || 'Failed to execute transaction', details: err.message });
     }
   });
 
-  // Handle restock purchase orders transmitted from procurement planner
+  // Handle restock purchase orders transmitted from procurement planner (atomic)
   app.post('/api/restock', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
@@ -758,55 +810,161 @@ async function startServer() {
         return;
       }
 
-      const [itemsList, suppliersList] = await Promise.all([
-        getItems(warehouseId), 
-        getSuppliers(warehouseId)
-      ]);
-      const matchedSupplier = suppliersList.find((s: any) => s.id === supplierId);
-      if (!matchedSupplier) {
-        res.status(404).json({ error: 'Authorized supplier not found in your warehouse' });
+      const result = await restockAtomic(
+        warehouseId,
+        itemsToRestock,
+        req.user.name || 'System Operator',
+        supplierId
+      );
+
+      res.json({ status: 'success', updatedItems: result.updatedItems, newTransactions: result.newTransactions });
+    } catch (err: any) {
+      console.error('Error restocking items:', err);
+      res.status(400).json({ error: err.message || 'Failed to execute procurement restock', details: err.message });
+    }
+  });
+
+  // Execute atomic inter-warehouse stock transfer
+  app.post('/api/transfers', authenticateToken, async (req: any, res) => {
+    try {
+      const sourceWarehouseId = req.user.warehouseId;
+
+      // Permission check: admin/manager/operator
+      const role = await getUserRoleInWarehouse(req.user.id, sourceWarehouseId);
+      if (role === 'viewer') {
+        res.status(403).json({ error: 'Access denied: Viewers cannot execute inter-warehouse transfers.' });
         return;
       }
 
-      const timestamp = new Date().toISOString();
-      const updatedItems: any[] = [];
-      const newTransactions: any[] = [];
-
-      for (let idx = 0; idx < itemsToRestock.length; idx++) {
-        const plan = itemsToRestock[idx];
-        const matchedItem = itemsList.find((i: any) => i.id === plan.id);
-        if (!matchedItem) continue;
-
-        const updatedQty = matchedItem.quantity + plan.qty;
-        const updatedItem = {
-          ...matchedItem,
-          quantity: updatedQty,
-          lastUpdated: timestamp
-        };
-
-        const tx = {
-          id: `tx-restock-${Date.now()}-${idx}`,
-          itemId: plan.id,
-          itemName: matchedItem.name,
-          sku: matchedItem.sku,
-          type: 'INBOUND',
-          quantity: plan.qty,
-          reason: `Automated Reorder: PO-${Math.floor(1000 + Math.random() * 9000)} via Planner`,
-          timestamp,
-          operator: `Procurement Bot (${matchedSupplier.name})`
-        };
-
-        await updateItem(matchedItem.id, updatedItem, warehouseId);
-        await saveTransaction(tx, warehouseId);
-
-        updatedItems.push(updatedItem);
-        newTransactions.push(tx);
+      const { targetWarehouseId, itemId, quantity, notes } = req.body;
+      if (!targetWarehouseId || !itemId || !quantity || Number(quantity) <= 0) {
+        res.status(400).json({ error: 'Source item, target warehouse, and a valid quantity are required.' });
+        return;
       }
 
-      res.json({ status: 'success', updatedItems, newTransactions });
+      if (sourceWarehouseId === targetWarehouseId) {
+        res.status(400).json({ error: 'Target warehouse must be different from the source warehouse.' });
+        return;
+      }
+
+      // Verify user has access to target warehouse or target warehouse exists
+      const targetWh = await findWarehouseById(targetWarehouseId);
+      if (!targetWh) {
+        res.status(404).json({ error: 'Target warehouse tenant not found.' });
+        return;
+      }
+
+      const result = await transferStockAtomic({
+        userId: req.user.id,
+        sourceWarehouseId,
+        destWarehouseId: targetWarehouseId,
+        itemId,
+        quantity: Number(quantity),
+        operator: req.user.name || 'System Operator',
+        notes
+      });
+
+      res.json({ status: 'success', ...result });
     } catch (err: any) {
-      console.error('Error restocking items:', err);
-      res.status(500).json({ error: 'Failed to execute procurement restock', details: err.message });
+      console.error('Error executing stock transfer:', err);
+      res.status(400).json({ error: err.message || 'Failed to execute inter-warehouse transfer', details: err.message });
+    }
+  });
+
+  // --- Purchase Orders Endpoints ---
+
+  // Get all purchase orders for warehouse
+  app.get('/api/purchase-orders', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const purchaseOrders = await getPurchaseOrders(warehouseId);
+      res.json({ purchaseOrders });
+    } catch (err: any) {
+      console.error('Error fetching purchase orders:', err);
+      res.status(500).json({ error: 'Failed to retrieve purchase orders', details: err.message });
+    }
+  });
+
+  // Create or update a purchase order
+  app.post('/api/purchase-orders', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role === 'viewer') {
+        res.status(403).json({ error: 'Access denied: Viewers cannot create purchase orders.' });
+        return;
+      }
+
+      const poData = req.body;
+      if (!poData.supplierId || !poData.items || !Array.isArray(poData.items) || poData.items.length === 0) {
+        res.status(400).json({ error: 'Supplier and at least one line item are required.' });
+        return;
+      }
+
+      const po = await savePurchaseOrder(poData, warehouseId);
+      res.status(201).json({ status: 'success', purchaseOrder: po });
+    } catch (err: any) {
+      console.error('Error saving purchase order:', err);
+      res.status(500).json({ error: 'Failed to save purchase order', details: err.message });
+    }
+  });
+
+  // Update purchase order status (and auto-receive stock if marked RECEIVED)
+  app.post('/api/purchase-orders/:id/status', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const { id } = req.params;
+      const { status } = req.body;
+
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role === 'viewer') {
+        res.status(403).json({ error: 'Access denied: Viewers cannot update purchase order statuses.' });
+        return;
+      }
+
+      if (!status) {
+        res.status(400).json({ error: 'Status is required.' });
+        return;
+      }
+
+      const result = await updatePurchaseOrderStatus(id, warehouseId, status, req.user.name || 'System Operator');
+      res.json({ status: 'success', result });
+    } catch (err: any) {
+      console.error('Error updating purchase order status:', err);
+      res.status(400).json({ error: err.message || 'Failed to update purchase order status', details: err.message });
+    }
+  });
+
+  // Delete/Cancel a draft purchase order
+  app.delete('/api/purchase-orders/:id', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const { id } = req.params;
+
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can delete purchase orders.' });
+        return;
+      }
+
+      await deletePurchaseOrder(id, warehouseId);
+      res.json({ status: 'success', message: 'Purchase order deleted.' });
+    } catch (err: any) {
+      console.error('Error deleting purchase order:', err);
+      res.status(500).json({ error: 'Failed to delete purchase order', details: err.message });
+    }
+  });
+
+  // Get live zone capacity and occupancy metrics
+  app.get('/api/zones/capacities', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const capacities = await getZoneCapacity(warehouseId);
+      res.json({ capacities });
+    } catch (err: any) {
+      console.error('Error calculating zone capacities:', err);
+      res.status(500).json({ error: 'Failed to calculate zone capacities', details: err.message });
     }
   });
 

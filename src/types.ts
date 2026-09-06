@@ -18,6 +18,9 @@ export interface InventoryItem {
   minThreshold: number; // For low stock alerts
   lastUpdated: string; // ISO Date String
   notes?: string;
+  isArchived?: boolean;
+  batchNumber?: string;
+  expiryDate?: string;
 }
 
 export interface Category {
@@ -35,7 +38,7 @@ export interface WarehouseZone {
   color: string;
 }
 
-export type TransactionType = 'INBOUND' | 'OUTBOUND';
+export type TransactionType = 'INBOUND' | 'OUTBOUND' | 'TRANSFER_IN' | 'TRANSFER_OUT';
 
 export interface StockTransaction {
   id: string;
@@ -44,9 +47,12 @@ export interface StockTransaction {
   sku: string;
   type: TransactionType;
   quantity: number;
-  reason: string; // e.g. "Purchase Order Received", "Customer Shipment", "Inventory Audit", "Damaged Goods"
+  reason: string; // e.g. "Purchase Order Received", "Customer Shipment", "Inventory Audit", "Damaged Goods", "Inter-Warehouse Transfer"
   timestamp: string;
   operator: string;
+  batchNumber?: string;
+  sourceWarehouseId?: string;
+  destWarehouseId?: string;
 }
 
 export interface Supplier {
@@ -57,3 +63,41 @@ export interface Supplier {
   phone: string;
   address: string;
 }
+
+export type PurchaseOrderStatus = 'DRAFT' | 'ORDERED' | 'IN_TRANSIT' | 'RECEIVED' | 'CANCELLED';
+
+export interface PurchaseOrderItem {
+  itemId?: string;
+  sku: string;
+  name: string;
+  quantity: number;
+  unitPrice: number;
+  category?: string;
+  zone?: string;
+  batchNumber?: string;
+  expiryDate?: string;
+}
+
+export interface PurchaseOrder {
+  id: string;
+  poNumber: string;
+  supplierId?: string;
+  supplierName?: string;
+  status: PurchaseOrderStatus;
+  items: PurchaseOrderItem[];
+  totalAmount: number;
+  expectedDelivery?: string;
+  notes?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface StockTransferPayload {
+  itemId: string;
+  destWarehouseId: string;
+  quantity: number;
+  reason?: string;
+  notes?: string;
+  batchNumber?: string;
+}
+

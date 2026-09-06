@@ -116,6 +116,8 @@ let memItems: any[] = [];
 
 let memTransactions: any[] = [];
 
+let memPurchaseOrders: any[] = [];
+
 export async function initDb() {
   console.log('Initializing database connectivity...');
   
@@ -265,7 +267,25 @@ async function runMigrations() {
     )
   `);
 
-  // 9. Database Migrations (Safely adding layout, contact details, and role columns)
+  // 9. Purchase Orders Table
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS purchase_orders (
+      id VARCHAR(50) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      po_number VARCHAR(100) NOT NULL,
+      supplier_id VARCHAR(50),
+      supplier_name VARCHAR(512),
+      status VARCHAR(50) NOT NULL DEFAULT 'DRAFT',
+      items_json TEXT NOT NULL,
+      total_amount DECIMAL(12, 2) DEFAULT 0.00,
+      expected_delivery TIMESTAMPTZ,
+      notes TEXT,
+      created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // 10. Database Migrations (Safely adding layout, contact details, role, batch, and archive columns)
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS email VARCHAR(150)`);
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS phone VARCHAR(50)`);
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS contact_name VARCHAR(100)`);
@@ -273,6 +293,15 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_cols INT DEFAULT 5`);
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_zones TEXT DEFAULT '[]'`);
   await pool.query(`ALTER TABLE user_warehouses ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'admin'`);
+
+  // Item & Transaction extensions for Batch tracking, Archiving, and Transfers
+  await pool.query(`ALTER TABLE items ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT false`);
+  await pool.query(`ALTER TABLE items ADD COLUMN IF NOT EXISTS batch_number VARCHAR(512)`);
+  await pool.query(`ALTER TABLE items ADD COLUMN IF NOT EXISTS expiry_date VARCHAR(512)`);
+
+  await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS batch_number VARCHAR(512)`);
+  await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS source_warehouse_id VARCHAR(50)`);
+  await pool.query(`ALTER TABLE transactions ADD COLUMN IF NOT EXISTS dest_warehouse_id VARCHAR(50)`);
 
   // Programmatic migration to alter column types to TEXT / VARCHAR(512) to support encrypted payloads in existing databases
   try {
@@ -850,6 +879,9 @@ export async function getItems(warehouseId: string) {
     minThreshold: row.min_threshold || row.minThreshold,
     lastUpdated: (row.last_updated ? (typeof row.last_updated === 'string' ? row.last_updated : row.last_updated.toISOString()) : (row.lastUpdated || new Date().toISOString())),
     notes: decryptText(row.notes, warehouseId),
+    isArchived: !!(row.is_archived || row.isArchived),
+    batchNumber: decryptText(row.batch_number || row.batchNumber, warehouseId),
+    expiryDate: decryptText(row.expiry_date || row.expiryDate, warehouseId),
   }));
 }
 
@@ -871,6 +903,9 @@ export async function getTransactions(warehouseId: string) {
     reason: decryptText(row.reason, warehouseId),
     timestamp: (row.timestamp ? (typeof row.timestamp === 'string' ? row.timestamp : row.timestamp.toISOString()) : (row.timestamp || new Date().toISOString())),
     operator: decryptText(row.operator, warehouseId),
+    batchNumber: decryptText(row.batch_number || row.batchNumber, warehouseId),
+    sourceWarehouseId: row.source_warehouse_id || row.sourceWarehouseId,
+    destWarehouseId: row.dest_warehouse_id || row.destWarehouseId,
   }));
 }
 
@@ -883,11 +918,14 @@ export async function saveItem(item: any, warehouseId: string) {
   const encShelf = encryptText(item.warehouseLocation.shelf, warehouseId);
   const encBin = encryptText(item.warehouseLocation.bin, warehouseId);
   const encNotes = encryptText(item.notes || '', warehouseId);
+  const encBatch = encryptText(item.batchNumber || '', warehouseId);
+  const encExpiry = encryptText(item.expiryDate || '', warehouseId);
+  const isArchived = !!item.isArchived;
 
   if (usePostgres) {
     await pool.query(
-      `INSERT INTO items (id, warehouse_id, name, sku, category, quantity, unit, price, zone, aisle, shelf, bin, supplier_id, min_threshold, last_updated, notes) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+      `INSERT INTO items (id, warehouse_id, name, sku, category, quantity, unit, price, zone, aisle, shelf, bin, supplier_id, min_threshold, last_updated, notes, is_archived, batch_number, expiry_date) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)`,
       [
         item.id,
         warehouseId,
@@ -904,7 +942,10 @@ export async function saveItem(item: any, warehouseId: string) {
         item.supplierId || null,
         item.minThreshold,
         item.lastUpdated,
-        encNotes
+        encNotes,
+        isArchived,
+        encBatch,
+        encExpiry
       ]
     );
   } else {
@@ -920,7 +961,10 @@ export async function saveItem(item: any, warehouseId: string) {
         shelf: encShelf,
         bin: encBin
       },
-      notes: encNotes
+      notes: encNotes,
+      is_archived: isArchived,
+      batch_number: encBatch,
+      expiry_date: encExpiry
     });
   }
 }
@@ -934,6 +978,9 @@ export async function updateItem(id: string, item: any, warehouseId: string) {
   const encShelf = encryptText(item.warehouseLocation.shelf, warehouseId);
   const encBin = encryptText(item.warehouseLocation.bin, warehouseId);
   const encNotes = encryptText(item.notes || '', warehouseId);
+  const encBatch = encryptText(item.batchNumber || '', warehouseId);
+  const encExpiry = encryptText(item.expiryDate || '', warehouseId);
+  const isArchived = !!item.isArchived;
 
   if (usePostgres) {
     await pool.query(
@@ -951,8 +998,11 @@ export async function updateItem(id: string, item: any, warehouseId: string) {
         supplier_id = $11, 
         min_threshold = $12, 
         last_updated = $13, 
-        notes = $14 
-       WHERE id = $15 AND warehouse_id = $16`,
+        notes = $14,
+        is_archived = $15,
+        batch_number = $16,
+        expiry_date = $17
+       WHERE id = $18 AND warehouse_id = $19`,
       [
         encName,
         encSku,
@@ -968,6 +1018,9 @@ export async function updateItem(id: string, item: any, warehouseId: string) {
         item.minThreshold,
         item.lastUpdated,
         encNotes,
+        isArchived,
+        encBatch,
+        encExpiry,
         id,
         warehouseId
       ]
@@ -985,9 +1038,22 @@ export async function updateItem(id: string, item: any, warehouseId: string) {
         shelf: encShelf,
         bin: encBin
       },
-      notes: encNotes
+      notes: encNotes,
+      is_archived: isArchived,
+      batch_number: encBatch,
+      expiry_date: encExpiry
     } : i);
   }
+}
+
+export async function archiveItem(id: string, warehouseId: string, isArchived: boolean = true) {
+  if (usePostgres) {
+    await pool.query('UPDATE items SET is_archived = $1 WHERE id = $2 AND warehouse_id = $3', [isArchived, id, warehouseId]);
+  } else {
+    memItems = memItems.map(i => (i.id === id && i.warehouse_id === warehouseId) ? { ...i, is_archived: isArchived } : i);
+  }
+  const items = await getItems(warehouseId);
+  return items.find((i: any) => i.id === id);
 }
 
 export async function deleteItem(id: string, warehouseId: string) {
@@ -1003,11 +1069,12 @@ export async function saveTransaction(tx: any, warehouseId: string) {
   const encSku = encryptText(tx.sku, warehouseId);
   const encReason = encryptText(tx.reason, warehouseId);
   const encOperator = encryptText(tx.operator, warehouseId);
+  const encBatch = encryptText(tx.batchNumber || '', warehouseId);
 
   if (usePostgres) {
     await pool.query(
-      `INSERT INTO transactions (id, warehouse_id, item_id, item_name, sku, type, quantity, reason, timestamp, operator) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+      `INSERT INTO transactions (id, warehouse_id, item_id, item_name, sku, type, quantity, reason, timestamp, operator, batch_number, source_warehouse_id, dest_warehouse_id) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
       [
         tx.id,
         warehouseId,
@@ -1018,7 +1085,10 @@ export async function saveTransaction(tx: any, warehouseId: string) {
         tx.quantity,
         encReason,
         tx.timestamp,
-        encOperator
+        encOperator,
+        encBatch,
+        tx.sourceWarehouseId || null,
+        tx.destWarehouseId || null
       ]
     );
   } else {
@@ -1028,8 +1098,757 @@ export async function saveTransaction(tx: any, warehouseId: string) {
       itemName: encItemName,
       sku: encSku,
       reason: encReason,
-      operator: encOperator
+      operator: encOperator,
+      batch_number: encBatch,
+      source_warehouse_id: tx.sourceWarehouseId || null,
+      dest_warehouse_id: tx.destWarehouseId || null
     });
+  }
+}
+
+// --- Atomic Inventory Adjustments with Rollback and Locking ---
+export async function adjustStockAtomic(
+  warehouseId: string,
+  itemId: string,
+  type: 'INBOUND' | 'OUTBOUND',
+  quantityChange: number,
+  reason: string,
+  operator: string,
+  batchNumber?: string
+) {
+  if (quantityChange <= 0) {
+    throw new Error('Quantity must be greater than 0.');
+  }
+
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // Select item with pessimistic locking
+      const itemRes = await client.query(
+        'SELECT * FROM items WHERE id = $1 AND warehouse_id = $2 FOR UPDATE',
+        [itemId, warehouseId]
+      );
+
+      if (itemRes.rows.length === 0) {
+        throw new Error('Item not found in this warehouse.');
+      }
+
+      const row = itemRes.rows[0];
+      const currentQty = row.quantity;
+      let newQty = currentQty;
+
+      if (type === 'INBOUND') {
+        newQty = currentQty + quantityChange;
+      } else {
+        if (currentQty < quantityChange) {
+          throw new Error(`Insufficient stock. Current inventory is ${currentQty} units.`);
+        }
+        newQty = currentQty - quantityChange;
+      }
+
+      const now = new Date().toISOString();
+      const encBatch = batchNumber ? encryptText(batchNumber, warehouseId) : row.batch_number;
+
+      // Update item quantity
+      await client.query(
+        `UPDATE items SET quantity = $1, last_updated = $2, batch_number = COALESCE($3, batch_number) WHERE id = $4 AND warehouse_id = $5`,
+        [newQty, now, encBatch, itemId, warehouseId]
+      );
+
+      // Create transaction log
+      const txId = `tx-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+      await client.query(
+        `INSERT INTO transactions (id, warehouse_id, item_id, item_name, sku, type, quantity, reason, timestamp, operator, batch_number)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+        [
+          txId,
+          warehouseId,
+          itemId,
+          row.name,
+          row.sku,
+          type,
+          quantityChange,
+          encryptText(reason, warehouseId),
+          now,
+          encryptText(operator, warehouseId),
+          encBatch
+        ]
+      );
+
+      await client.query('COMMIT');
+      const itemsList = await getItems(warehouseId);
+      const updatedItem = itemsList.find((i: any) => i.id === itemId);
+      const txObj = {
+        id: txId,
+        itemId,
+        itemName: decryptText(row.name, warehouseId),
+        sku: decryptText(row.sku, warehouseId),
+        type,
+        quantity: quantityChange,
+        reason,
+        timestamp: now,
+        operator,
+        batchNumber: batchNumber || (row.batch_number ? decryptText(row.batch_number, warehouseId) : undefined)
+      };
+      return { success: true, itemId, newQuantity: newQty, txId, item: updatedItem, transaction: txObj };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } else {
+    // In-memory atomic adjustment
+    const itemIndex = memItems.findIndex(i => i.id === itemId && i.warehouse_id === warehouseId);
+    if (itemIndex === -1) {
+      throw new Error('Item not found in this warehouse.');
+    }
+
+    const item = memItems[itemIndex];
+    let newQty = item.quantity;
+
+    if (type === 'INBOUND') {
+      newQty = item.quantity + quantityChange;
+    } else {
+      if (item.quantity < quantityChange) {
+        throw new Error(`Insufficient stock. Current inventory is ${item.quantity} units.`);
+      }
+      newQty = item.quantity - quantityChange;
+    }
+
+    const now = new Date().toISOString();
+    memItems[itemIndex].quantity = newQty;
+    memItems[itemIndex].lastUpdated = now;
+    if (batchNumber) {
+      memItems[itemIndex].batch_number = encryptText(batchNumber, warehouseId);
+    }
+
+    const txId = `tx-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    const txEntry = {
+      id: txId,
+      warehouse_id: warehouseId,
+      itemId,
+      itemName: item.name,
+      sku: item.sku,
+      type,
+      quantity: quantityChange,
+      reason: encryptText(reason, warehouseId),
+      timestamp: now,
+      operator: encryptText(operator, warehouseId),
+      batch_number: batchNumber ? encryptText(batchNumber, warehouseId) : item.batch_number
+    };
+    memTransactions.unshift(txEntry);
+
+    const updatedItem = {
+      ...item,
+      name: decryptText(item.name, warehouseId),
+      sku: decryptText(item.sku, warehouseId),
+      category: decryptText(item.category, warehouseId),
+      quantity: newQty,
+      lastUpdated: now
+    };
+
+    const txObj = {
+      id: txId,
+      itemId,
+      itemName: decryptText(item.name, warehouseId),
+      sku: decryptText(item.sku, warehouseId),
+      type,
+      quantity: quantityChange,
+      reason,
+      timestamp: now,
+      operator,
+      batchNumber: batchNumber || (item.batch_number ? decryptText(item.batch_number, warehouseId) : undefined)
+    };
+
+    return { success: true, itemId, newQuantity: newQty, txId, item: updatedItem, transaction: txObj };
+  }
+}
+
+// --- Atomic Multi-Item Restock ---
+export async function restockAtomic(warehouseId: string, itemsToRestock: any[], operator: string, supplierId?: string) {
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const now = new Date().toISOString();
+      const updatedItems: any[] = [];
+      const newTransactions: any[] = [];
+
+      for (const item of itemsToRestock) {
+        const qtyToAdd = item.qty || item.reorderQty || 0;
+        if (qtyToAdd <= 0) continue;
+
+        const itemRes = await client.query(
+          'SELECT * FROM items WHERE id = $1 AND warehouse_id = $2 FOR UPDATE',
+          [item.id, warehouseId]
+        );
+        if (itemRes.rows.length === 0) continue;
+
+        const row = itemRes.rows[0];
+        const newQty = row.quantity + qtyToAdd;
+        const txId = `tx-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+
+        await client.query(
+          'UPDATE items SET quantity = $1, last_updated = $2 WHERE id = $3 AND warehouse_id = $4',
+          [newQty, now, item.id, warehouseId]
+        );
+
+        const reason = `Automated Restock Order Received${supplierId ? ` (Supplier: ${supplierId})` : ''}`;
+        await client.query(
+          `INSERT INTO transactions (id, warehouse_id, item_id, item_name, sku, type, quantity, reason, timestamp, operator)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+          [
+            txId,
+            warehouseId,
+            item.id,
+            row.name,
+            row.sku,
+            'INBOUND',
+            qtyToAdd,
+            encryptText(reason, warehouseId),
+            now,
+            encryptText(operator, warehouseId)
+          ]
+        );
+
+        newTransactions.push({
+          id: txId,
+          itemId: item.id,
+          itemName: decryptText(row.name, warehouseId),
+          sku: decryptText(row.sku, warehouseId),
+          type: 'INBOUND',
+          quantity: qtyToAdd,
+          reason,
+          timestamp: now,
+          operator
+        });
+      }
+
+      await client.query('COMMIT');
+      const allItems = await getItems(warehouseId);
+      const affectedIds = new Set(itemsToRestock.map(i => i.id));
+      const resUpdatedItems = allItems.filter((i: any) => affectedIds.has(i.id));
+
+      return { success: true, updatedItems: resUpdatedItems, newTransactions };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } else {
+    const now = new Date().toISOString();
+    const updatedItems: any[] = [];
+    const newTransactions: any[] = [];
+
+    itemsToRestock.forEach(item => {
+      const qtyToAdd = item.qty || item.reorderQty || 0;
+      if (qtyToAdd <= 0) return;
+
+      const idx = memItems.findIndex(i => i.id === item.id && i.warehouse_id === warehouseId);
+      if (idx !== -1) {
+        memItems[idx].quantity += qtyToAdd;
+        memItems[idx].lastUpdated = now;
+
+        const txId = `tx-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+        const reason = `Automated Restock Order Received${supplierId ? ` (Supplier: ${supplierId})` : ''}`;
+        
+        memTransactions.unshift({
+          id: txId,
+          warehouse_id: warehouseId,
+          itemId: item.id,
+          itemName: memItems[idx].name,
+          sku: memItems[idx].sku,
+          type: 'INBOUND',
+          quantity: qtyToAdd,
+          reason: encryptText(reason, warehouseId),
+          timestamp: now,
+          operator: encryptText(operator, warehouseId)
+        });
+
+        updatedItems.push({
+          ...memItems[idx],
+          name: decryptText(memItems[idx].name, warehouseId),
+          sku: decryptText(memItems[idx].sku, warehouseId)
+        });
+
+        newTransactions.push({
+          id: txId,
+          itemId: item.id,
+          itemName: decryptText(memItems[idx].name, warehouseId),
+          sku: decryptText(memItems[idx].sku, warehouseId),
+          type: 'INBOUND',
+          quantity: qtyToAdd,
+          reason,
+          timestamp: now,
+          operator
+        });
+      }
+    });
+    return { success: true, updatedItems, newTransactions };
+  }
+}
+
+// --- Atomic Inter-Warehouse Stock Transfer ---
+export async function transferStockAtomic(params: {
+  userId?: string;
+  sourceWarehouseId: string;
+  destWarehouseId: string;
+  itemId: string;
+  quantity: number;
+  operator: string;
+  reason?: string;
+  notes?: string;
+  batchNumber?: string;
+}) {
+  const { userId, sourceWarehouseId, destWarehouseId, itemId, quantity, operator, reason, batchNumber } = params;
+
+  if (sourceWarehouseId === destWarehouseId) {
+    throw new Error('Source and destination warehouse cannot be the same.');
+  }
+  if (quantity <= 0) {
+    throw new Error('Transfer quantity must be greater than 0.');
+  }
+
+  // If userId provided, verify user has access to source warehouse
+  if (userId) {
+    const hasSource = await isUserInWarehouse(userId, sourceWarehouseId);
+    if (!hasSource) {
+      throw new Error('You do not have authorization for the source warehouse.');
+    }
+  }
+
+  const transferReason = reason || `Inter-Warehouse Transfer: from ${sourceWarehouseId} to ${destWarehouseId}`;
+  const now = new Date().toISOString();
+
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+
+      // 1. Lock source item
+      const srcRes = await client.query(
+        'SELECT * FROM items WHERE id = $1 AND warehouse_id = $2 FOR UPDATE',
+        [itemId, sourceWarehouseId]
+      );
+      if (srcRes.rows.length === 0) {
+        throw new Error('Source item not found.');
+      }
+      const srcRow = srcRes.rows[0];
+      if (srcRow.quantity < quantity) {
+        throw new Error(`Insufficient stock in source warehouse. Current stock is ${srcRow.quantity}.`);
+      }
+
+      // 2. Decrement source item
+      const srcNewQty = srcRow.quantity - quantity;
+      await client.query(
+        'UPDATE items SET quantity = $1, last_updated = $2 WHERE id = $3 AND warehouse_id = $4',
+        [srcNewQty, now, itemId, sourceWarehouseId]
+      );
+
+      // 3. Log source TRANSFER_OUT
+      const srcTxId = `tx-out-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+      await client.query(
+        `INSERT INTO transactions (id, warehouse_id, item_id, item_name, sku, type, quantity, reason, timestamp, operator, batch_number, source_warehouse_id, dest_warehouse_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [
+          srcTxId,
+          sourceWarehouseId,
+          itemId,
+          srcRow.name,
+          srcRow.sku,
+          'TRANSFER_OUT',
+          quantity,
+          encryptText(transferReason, sourceWarehouseId),
+          now,
+          encryptText(operator, sourceWarehouseId),
+          batchNumber ? encryptText(batchNumber, sourceWarehouseId) : srcRow.batch_number,
+          sourceWarehouseId,
+          destWarehouseId
+        ]
+      );
+
+      // 4. Decrypt SKU/Name from source to find or match in destination warehouse
+      const decSku = decryptText(srcRow.sku, sourceWarehouseId);
+      const decName = decryptText(srcRow.name, sourceWarehouseId);
+      const decCat = decryptText(srcRow.category, sourceWarehouseId);
+      const decZone = decryptText(srcRow.zone, sourceWarehouseId);
+      const decAisle = decryptText(srcRow.aisle, sourceWarehouseId);
+      const decShelf = decryptText(srcRow.shelf, sourceWarehouseId);
+      const decBin = decryptText(srcRow.bin, sourceWarehouseId);
+
+      // Check destination warehouse for item with matching SKU
+      const destItems = await getItems(destWarehouseId);
+      const existingDestItem = destItems.find((i: any) => i.sku.toLowerCase() === decSku.toLowerCase());
+
+      let destItemId = '';
+      if (existingDestItem) {
+        destItemId = existingDestItem.id;
+        const destNewQty = existingDestItem.quantity + quantity;
+        await client.query(
+          'UPDATE items SET quantity = $1, last_updated = $2 WHERE id = $3 AND warehouse_id = $4',
+          [destNewQty, now, destItemId, destWarehouseId]
+        );
+      } else {
+        destItemId = `item-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+        await client.query(
+          `INSERT INTO items (id, warehouse_id, name, sku, category, quantity, unit, price, zone, aisle, shelf, bin, min_threshold, last_updated, notes, is_archived, batch_number, expiry_date)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)`,
+          [
+            destItemId,
+            destWarehouseId,
+            encryptText(decName, destWarehouseId),
+            encryptText(decSku, destWarehouseId),
+            encryptText(decCat, destWarehouseId),
+            quantity,
+            srcRow.unit,
+            srcRow.price,
+            encryptText(decZone, destWarehouseId),
+            encryptText(decAisle, destWarehouseId),
+            encryptText(decShelf, destWarehouseId),
+            encryptText(decBin, destWarehouseId),
+            srcRow.min_threshold,
+            now,
+            encryptText(`Transferred from ${sourceWarehouseId}`, destWarehouseId),
+            false,
+            batchNumber ? encryptText(batchNumber, destWarehouseId) : null,
+            srcRow.expiry_date ? encryptText(decryptText(srcRow.expiry_date, sourceWarehouseId), destWarehouseId) : null
+          ]
+        );
+      }
+
+      // 5. Log destination TRANSFER_IN
+      const destTxId = `tx-in-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+      await client.query(
+        `INSERT INTO transactions (id, warehouse_id, item_id, item_name, sku, type, quantity, reason, timestamp, operator, batch_number, source_warehouse_id, dest_warehouse_id)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+        [
+          destTxId,
+          destWarehouseId,
+          destItemId,
+          encryptText(decName, destWarehouseId),
+          encryptText(decSku, destWarehouseId),
+          'TRANSFER_IN',
+          quantity,
+          encryptText(transferReason, destWarehouseId),
+          now,
+          encryptText(operator, destWarehouseId),
+          batchNumber ? encryptText(batchNumber, destWarehouseId) : null,
+          sourceWarehouseId,
+          destWarehouseId
+        ]
+      );
+
+      await client.query('COMMIT');
+      return { success: true, sourceTxId: srcTxId, destTxId: destTxId };
+    } catch (err) {
+      await client.query('ROLLBACK');
+      throw err;
+    } finally {
+      client.release();
+    }
+  } else {
+    // In-memory atomic transfer
+    const srcIndex = memItems.findIndex(i => i.id === itemId && i.warehouse_id === sourceWarehouseId);
+    if (srcIndex === -1) {
+      throw new Error('Source item not found.');
+    }
+    const srcItem = memItems[srcIndex];
+    if (srcItem.quantity < quantity) {
+      throw new Error(`Insufficient stock in source warehouse. Current stock is ${srcItem.quantity}.`);
+    }
+
+    // Decrement source item
+    srcItem.quantity -= quantity;
+    srcItem.lastUpdated = now;
+
+    // Log source transfer out
+    const srcTxId = `tx-out-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    memTransactions.unshift({
+      id: srcTxId,
+      warehouse_id: sourceWarehouseId,
+      itemId,
+      itemName: srcItem.name,
+      sku: srcItem.sku,
+      type: 'TRANSFER_OUT',
+      quantity,
+      reason: encryptText(transferReason, sourceWarehouseId),
+      timestamp: now,
+      operator: encryptText(operator, sourceWarehouseId),
+      batch_number: batchNumber ? encryptText(batchNumber, sourceWarehouseId) : srcItem.batch_number,
+      source_warehouse_id: sourceWarehouseId,
+      dest_warehouse_id: destWarehouseId
+    });
+
+    const decSku = decryptText(srcItem.sku, sourceWarehouseId);
+    const decName = decryptText(srcItem.name, sourceWarehouseId);
+
+    // Look for item in dest warehouse
+    const destIndex = memItems.findIndex(i => i.warehouse_id === destWarehouseId && decryptText(i.sku, destWarehouseId).toLowerCase() === decSku.toLowerCase());
+    let destItemId = '';
+    if (destIndex !== -1) {
+      memItems[destIndex].quantity += quantity;
+      memItems[destIndex].lastUpdated = now;
+      destItemId = memItems[destIndex].id;
+    } else {
+      destItemId = `item-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+      memItems.unshift({
+        id: destItemId,
+        warehouse_id: destWarehouseId,
+        name: encryptText(decName, destWarehouseId),
+        sku: encryptText(decSku, destWarehouseId),
+        category: encryptText(decryptText(srcItem.category, sourceWarehouseId), destWarehouseId),
+        quantity,
+        unit: srcItem.unit,
+        price: srcItem.price,
+        warehouseLocation: {
+          zone: encryptText(decryptText(srcItem.warehouseLocation?.zone || 'Zone A', sourceWarehouseId), destWarehouseId),
+          aisle: encryptText(decryptText(srcItem.warehouseLocation?.aisle || 'Aisle 01', sourceWarehouseId), destWarehouseId),
+          shelf: encryptText(decryptText(srcItem.warehouseLocation?.shelf || 'Level 1', sourceWarehouseId), destWarehouseId),
+          bin: encryptText(decryptText(srcItem.warehouseLocation?.bin || 'Bin 01', sourceWarehouseId), destWarehouseId)
+        },
+        minThreshold: srcItem.minThreshold || 10,
+        lastUpdated: now,
+        notes: encryptText(`Transferred from ${sourceWarehouseId}`, destWarehouseId),
+        is_archived: false,
+        batch_number: batchNumber ? encryptText(batchNumber, destWarehouseId) : undefined
+      });
+    }
+
+    // Log destination transfer in
+    const destTxId = `tx-in-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+    memTransactions.unshift({
+      id: destTxId,
+      warehouse_id: destWarehouseId,
+      itemId: destItemId,
+      itemName: encryptText(decName, destWarehouseId),
+      sku: encryptText(decSku, destWarehouseId),
+      type: 'TRANSFER_IN',
+      quantity,
+      reason: encryptText(transferReason, destWarehouseId),
+      timestamp: now,
+      operator: encryptText(operator, destWarehouseId),
+      batch_number: batchNumber ? encryptText(batchNumber, destWarehouseId) : undefined,
+      source_warehouse_id: sourceWarehouseId,
+      dest_warehouse_id: destWarehouseId
+    });
+
+    return { success: true, sourceTxId: srcTxId, destTxId: destTxId };
+  }
+}
+
+// --- Purchase Orders Workflow ---
+export async function getPurchaseOrders(warehouseId: string) {
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM purchase_orders WHERE warehouse_id = $1 ORDER BY created_at DESC', [warehouseId]);
+    return res.rows.map((row: any) => ({
+      id: row.id,
+      poNumber: row.po_number,
+      supplierId: row.supplier_id,
+      supplierName: decryptText(row.supplier_name, warehouseId),
+      status: row.status,
+      items: JSON.parse(row.items_json || '[]'),
+      totalAmount: parseFloat(row.total_amount || '0'),
+      expectedDelivery: row.expected_delivery ? new Date(row.expected_delivery).toISOString() : undefined,
+      notes: row.notes,
+      createdAt: row.created_at ? new Date(row.created_at).toISOString() : new Date().toISOString(),
+      updatedAt: row.updated_at ? new Date(row.updated_at).toISOString() : new Date().toISOString(),
+    }));
+  } else {
+    const pos = memPurchaseOrders.filter(po => po.warehouse_id === warehouseId);
+    return pos.map(po => ({
+      ...po,
+      supplierName: decryptText(po.supplier_name, warehouseId)
+    }));
+  }
+}
+
+export async function savePurchaseOrder(po: any, warehouseId: string) {
+  const encSupplierName = encryptText(po.supplierName || '', warehouseId);
+  const itemsJson = JSON.stringify(po.items || []);
+  const now = new Date().toISOString();
+
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO purchase_orders (id, warehouse_id, po_number, supplier_id, supplier_name, status, items_json, total_amount, expected_delivery, notes, created_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       ON CONFLICT (id) DO UPDATE SET
+         po_number = $3,
+         supplier_id = $4,
+         supplier_name = $5,
+         status = $6,
+         items_json = $7,
+         total_amount = $8,
+         expected_delivery = $9,
+         notes = $10,
+         updated_at = $12`,
+      [
+        po.id,
+        warehouseId,
+        po.poNumber,
+        po.supplierId || null,
+        encSupplierName,
+        po.status || 'DRAFT',
+        itemsJson,
+        po.totalAmount || 0,
+        po.expectedDelivery ? new Date(po.expectedDelivery) : null,
+        po.notes || '',
+        po.createdAt || now,
+        now
+      ]
+    );
+  } else {
+    const idx = memPurchaseOrders.findIndex(p => p.id === po.id);
+    const entry = {
+      ...po,
+      warehouse_id: warehouseId,
+      supplier_name: encSupplierName,
+      items: po.items || [],
+      totalAmount: po.totalAmount || 0,
+      updatedAt: now
+    };
+    if (idx !== -1) {
+      memPurchaseOrders[idx] = entry;
+    } else {
+      memPurchaseOrders.unshift({ ...entry, createdAt: now });
+    }
+  }
+}
+
+export async function updatePurchaseOrderStatus(poId: string, warehouseId: string, newStatus: string, operator: string) {
+  const now = new Date().toISOString();
+  let po: any = null;
+
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM purchase_orders WHERE id = $1 AND warehouse_id = $2', [poId, warehouseId]);
+    if (res.rows.length === 0) throw new Error('Purchase order not found.');
+    po = {
+      ...res.rows[0],
+      items: JSON.parse(res.rows[0].items_json || '[]')
+    };
+
+    await pool.query('UPDATE purchase_orders SET status = $1, updated_at = $2 WHERE id = $3 AND warehouse_id = $4', [newStatus, now, poId, warehouseId]);
+  } else {
+    const idx = memPurchaseOrders.findIndex(p => p.id === poId && p.warehouse_id === warehouseId);
+    if (idx === -1) throw new Error('Purchase order not found.');
+    memPurchaseOrders[idx].status = newStatus;
+    memPurchaseOrders[idx].updatedAt = now;
+    po = memPurchaseOrders[idx];
+  }
+
+  // If status is changed to RECEIVED, automatically restock inventory items!
+  if (newStatus === 'RECEIVED' && po.items && po.items.length > 0) {
+    const existingItems = await getItems(warehouseId);
+    for (const poItem of po.items) {
+      const match = existingItems.find((i: any) => i.sku.toLowerCase() === poItem.sku.toLowerCase());
+      if (match) {
+        await adjustStockAtomic(
+          warehouseId,
+          match.id,
+          'INBOUND',
+          poItem.quantity,
+          `Received Purchase Order #${po.po_number || po.poNumber}`,
+          operator,
+          poItem.batchNumber
+        );
+      } else {
+        // Create new inventory item for this PO receipt
+        const newItemId = `item-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+        await saveItem({
+          id: newItemId,
+          name: poItem.name,
+          sku: poItem.sku,
+          category: poItem.category || 'General',
+          quantity: poItem.quantity,
+          unit: 'pcs',
+          price: poItem.unitPrice || 0,
+          warehouseLocation: {
+            zone: poItem.zone || 'Zone A',
+            aisle: 'Aisle 01',
+            shelf: 'Level 1',
+            bin: 'Bin 01'
+          },
+          supplierId: po.supplier_id || po.supplierId,
+          minThreshold: 10,
+          lastUpdated: now,
+          notes: `Created from PO #${po.po_number || po.poNumber}`,
+          batchNumber: poItem.batchNumber,
+          expiryDate: poItem.expiryDate
+        }, warehouseId);
+
+        await saveTransaction({
+          id: `tx-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+          itemId: newItemId,
+          itemName: poItem.name,
+          sku: poItem.sku,
+          type: 'INBOUND',
+          quantity: poItem.quantity,
+          reason: `Initial stock receipt from PO #${po.po_number || po.poNumber}`,
+          timestamp: now,
+          operator,
+          batchNumber: poItem.batchNumber
+        }, warehouseId);
+      }
+    }
+  }
+
+  return { success: true, poId, status: newStatus };
+}
+
+export async function deletePurchaseOrder(poId: string, warehouseId: string) {
+  if (usePostgres) {
+    await pool.query('DELETE FROM purchase_orders WHERE id = $1 AND warehouse_id = $2', [poId, warehouseId]);
+  } else {
+    memPurchaseOrders = memPurchaseOrders.filter(p => !(p.id === poId && p.warehouse_id === warehouseId));
+  }
+}
+
+// --- Zone Capacity Calculation ---
+export async function getZoneCapacity(warehouseId: string) {
+  const zones = await getZones(warehouseId);
+  const items = await getItems(warehouseId);
+
+  return zones.map((z: any) => {
+    const zoneItems = items.filter((i: any) => !i.isArchived && (i.warehouseLocation?.zone?.toLowerCase() === z.name.toLowerCase() || i.warehouseLocation?.zone === z.id));
+    const currentOccupancy = zoneItems.reduce((acc: number, curr: any) => acc + (curr.quantity || 0), 0);
+    const maxCapacity = z.maxCapacity || 1000;
+    const occupancyPercentage = maxCapacity > 0 ? Math.round((currentOccupancy / maxCapacity) * 100) : 0;
+    const isOverCapacity = currentOccupancy > maxCapacity;
+
+    return {
+      zoneId: z.id,
+      zoneName: z.name,
+      maxCapacity,
+      currentOccupancy,
+      occupancyPercentage,
+      isOverCapacity,
+      itemCount: zoneItems.length
+    };
+  });
+}
+
+// --- Live User Authentication & Role Verification ---
+export async function verifyLiveUserAccess(userId: string, warehouseId: string) {
+  if (usePostgres) {
+    const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
+    if (userRes.rows.length === 0) return { valid: false, role: 'viewer', user: null };
+    const user = userRes.rows[0];
+
+    const roleRes = await pool.query('SELECT role FROM user_warehouses WHERE user_id = $1 AND warehouse_id = $2', [userId, warehouseId]);
+    if (roleRes.rows.length === 0) return { valid: false, role: 'viewer', user };
+
+    return { valid: true, role: roleRes.rows[0].role || 'operator', user };
+  } else {
+    const user = memUsers.find(u => u.id === userId);
+    if (!user) return { valid: false, role: 'viewer', user: null };
+
+    const mapping = memUserWarehouses.find(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
+    if (!mapping) return { valid: false, role: 'viewer', user };
+
+    return { valid: true, role: mapping.role || 'operator', user };
   }
 }
 
