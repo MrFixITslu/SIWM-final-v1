@@ -28,12 +28,19 @@ import {
   getPurchaseOrders,
   savePurchaseOrder,
   updatePurchaseOrderStatus,
+  receivePurchaseOrderPartial,
   deletePurchaseOrder,
   getZoneCapacity,
   verifyLiveUserAccess,
   resetDb,
   createUser,
   findUserByEmail,
+  findUserById,
+  changeUserPassword,
+  logSystemAudit,
+  getSystemAuditLogs,
+  recordPersonnelDispatch,
+  getPersonnelDispatches,
   createWarehouse,
   findWarehouseByCode,
   findWarehouseById,
@@ -83,8 +90,12 @@ function authenticateToken(req: any, res: any, next: any) {
     
     // Validate live authorization against current tenant database
     try {
-      const liveStatus = await verifyLiveUserAccess(decoded.id, decoded.warehouseId);
+      const liveStatus = await verifyLiveUserAccess(decoded.id, decoded.warehouseId, decoded.tokenVersion);
       if (!liveStatus.valid) {
+        if (liveStatus.reason === 'SESSION_REVOKED') {
+          res.status(401).json({ error: 'Password was changed on this account. Please sign in with your new password.', code: 'SESSION_REVOKED' });
+          return;
+        }
         res.status(403).json({ error: 'Clearance revoked or membership is no longer active for this warehouse.' });
         return;
       }
@@ -206,10 +217,20 @@ async function startServer() {
       await associateUserWithWarehouse(newUser.id, warehouseId);
 
       const token = jwt.sign(
-        { id: newUser.id, email: newUser.email, name: newUser.name, warehouseId },
+        { id: newUser.id, email: newUser.email, name: newUser.name, warehouseId, tokenVersion: 1 },
         JWT_SECRET,
         { expiresIn: '24h' }
       );
+
+      await logSystemAudit({
+        warehouseId,
+        action: 'USER_REGISTERED',
+        category: 'USER',
+        details: `New user account registered for ${newUser.email}.`,
+        operator: newUser.name,
+        operatorId: newUser.id,
+        status: 'SUCCESS'
+      });
 
       res.status(201).json({
         token,
@@ -241,6 +262,16 @@ async function startServer() {
 
       const passwordMatch = await bcrypt.compare(password, user.passwordHash || '');
       if (!passwordMatch) {
+        if (user.warehouseId) {
+          await logSystemAudit({
+            warehouseId: user.warehouseId,
+            action: 'AUTH_LOGIN_FAILED',
+            category: 'SECURITY',
+            details: `Failed authentication attempt for ${user.email}.`,
+            operator: user.email,
+            status: 'FAILED'
+          });
+        }
         res.status(401).json({ error: 'Invalid email or password.' });
         return;
       }
@@ -260,10 +291,20 @@ async function startServer() {
       const activeWarehouse = warehouses.find((w: any) => w.id === activeWhId) || warehouses[0];
 
       const token = jwt.sign(
-        { id: user.id, email: user.email, name: user.name, warehouseId: activeWhId },
+        { id: user.id, email: user.email, name: user.name, warehouseId: activeWhId, tokenVersion: user.tokenVersion || 1 },
         JWT_SECRET,
         { expiresIn: '24h' }
       );
+
+      await logSystemAudit({
+        warehouseId: activeWhId,
+        action: 'AUTH_LOGIN_SUCCESS',
+        category: 'SECURITY',
+        details: `Successful login session initiated for ${user.email}.`,
+        operator: user.name || user.email,
+        operatorId: user.id,
+        status: 'SUCCESS'
+      });
 
       res.json({
         token,
@@ -274,6 +315,47 @@ async function startServer() {
     } catch (err: any) {
       console.error('Login error:', err);
       res.status(500).json({ error: 'Failed to authenticate user.', details: err.message });
+    }
+  });
+
+  // Change Password & Session Rotation (Self-Service)
+  app.post('/api/auth/change-password', authenticateToken, async (req: any, res) => {
+    try {
+      const { currentPassword, newPassword } = req.body;
+      if (!currentPassword || !newPassword) {
+        res.status(400).json({ error: 'Current password and new password are required.' });
+        return;
+      }
+
+      if (newPassword.length < 6) {
+        res.status(400).json({ error: 'New password must be at least 6 characters long.' });
+        return;
+      }
+
+      const clientIp = req.headers['x-forwarded-for'] || req.socket?.remoteAddress;
+      const result = await changeUserPassword(
+        req.user.id,
+        currentPassword,
+        newPassword,
+        req.user.warehouseId,
+        typeof clientIp === 'string' ? clientIp : Array.isArray(clientIp) ? clientIp[0] : undefined
+      );
+
+      // Issue fresh JWT with updated tokenVersion
+      const freshToken = jwt.sign(
+        { id: req.user.id, email: req.user.email, name: req.user.name, warehouseId: req.user.warehouseId, tokenVersion: result.tokenVersion },
+        JWT_SECRET,
+        { expiresIn: '24h' }
+      );
+
+      res.json({
+        status: 'success',
+        message: 'Password updated successfully. All other active sessions have been rotated.',
+        token: freshToken
+      });
+    } catch (err: any) {
+      console.error('Password change error:', err);
+      res.status(400).json({ error: err.message || 'Failed to change password.', details: err.message });
     }
   });
 
@@ -761,14 +843,14 @@ async function startServer() {
         return;
       }
 
-      const { itemId, type, quantity, reason, operator, issuedTo, batchNumber } = req.body;
+      const { itemId, type, quantity, reason, operator, issuedTo, department, badgeNumber, projectCode, batchNumber } = req.body;
       if (!itemId || !type || !quantity) {
         res.status(400).json({ error: 'Missing adjustment parameters' });
         return;
       }
 
       if (type === 'OUTBOUND' && (!issuedTo || !issuedTo.trim())) {
-        res.status(400).json({ error: 'Outbound shipments must be issued to an engineer or destination unit.' });
+        res.status(400).json({ error: 'Outbound shipments must be issued to an engineer, personnel, or destination unit.' });
         return;
       }
 
@@ -784,6 +866,32 @@ async function startServer() {
         finalOperator,
         batchNumber
       );
+
+      // Record direct personnel dispatch record if outbound
+      if (type === 'OUTBOUND' && issuedTo) {
+        await recordPersonnelDispatch({
+          itemId,
+          itemName: result.item?.name || result.transaction?.itemName || 'Item',
+          sku: result.item?.sku || result.transaction?.sku || '',
+          quantity: Number(quantity),
+          recipientName: issuedTo,
+          department: department || '',
+          badgeNumber: badgeNumber || '',
+          projectCode: projectCode || '',
+          operator: finalOperator,
+          notes: finalReason
+        }, warehouseId);
+      }
+
+      await logSystemAudit({
+        warehouseId,
+        action: type === 'INBOUND' ? 'INVENTORY_INTAKE' : 'INVENTORY_DISPATCH',
+        category: 'INVENTORY',
+        details: `${type} adjustment: ${quantity} units for ${result.item?.name || itemId}. Reason: ${finalReason}`,
+        operator: finalOperator,
+        operatorId: req.user.id,
+        status: 'SUCCESS'
+      });
 
       res.json({ status: 'success', item: result.item, transaction: result.transaction });
     } catch (err: any) {
@@ -816,6 +924,16 @@ async function startServer() {
         req.user.name || 'System Operator',
         supplierId
       );
+
+      await logSystemAudit({
+        warehouseId,
+        action: 'INVENTORY_RESTOCK',
+        category: 'INVENTORY',
+        details: `Procurement restock executed for ${itemsToRestock.length} item line(s).`,
+        operator: req.user.name || 'System Operator',
+        operatorId: req.user.id,
+        status: 'SUCCESS'
+      });
 
       res.json({ status: 'success', updatedItems: result.updatedItems, newTransactions: result.newTransactions });
     } catch (err: any) {
@@ -864,6 +982,26 @@ async function startServer() {
         notes
       });
 
+      await logSystemAudit({
+        warehouseId: sourceWarehouseId,
+        action: 'STOCK_TRANSFER_OUTBOUND',
+        category: 'TRANSFER',
+        details: `Transferred ${quantity} units of item ${itemId} to warehouse ${targetWh.name || targetWarehouseId}.`,
+        operator: req.user.name || 'System Operator',
+        operatorId: req.user.id,
+        status: 'SUCCESS'
+      });
+
+      await logSystemAudit({
+        warehouseId: targetWarehouseId,
+        action: 'STOCK_TRANSFER_INBOUND',
+        category: 'TRANSFER',
+        details: `Received ${quantity} units from warehouse ${sourceWarehouseId}.`,
+        operator: req.user.name || 'System Operator',
+        operatorId: req.user.id,
+        status: 'SUCCESS'
+      });
+
       res.json({ status: 'success', ...result });
     } catch (err: any) {
       console.error('Error executing stock transfer:', err);
@@ -903,6 +1041,17 @@ async function startServer() {
       }
 
       const po = await savePurchaseOrder(poData, warehouseId);
+
+      await logSystemAudit({
+        warehouseId,
+        action: 'PO_SAVED',
+        category: 'PROCUREMENT',
+        details: `Purchase order #${(po as any)?.poNumber || poData.poNumber} created/updated with ${poData.items.length} item(s).`,
+        operator: req.user.name || 'System Operator',
+        operatorId: req.user.id,
+        status: 'SUCCESS'
+      });
+
       res.status(201).json({ status: 'success', purchaseOrder: po });
     } catch (err: any) {
       console.error('Error saving purchase order:', err);
@@ -910,7 +1059,39 @@ async function startServer() {
     }
   });
 
-  // Update purchase order status (and auto-receive stock if marked RECEIVED)
+  // Partial / Staged Receiving of Purchase Order Items
+  app.post('/api/purchase-orders/:id/receive', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const { id } = req.params;
+      const { receivedItems } = req.body;
+
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role === 'viewer') {
+        res.status(403).json({ error: 'Access denied: Viewers cannot intake purchase orders.' });
+        return;
+      }
+
+      if (!receivedItems || !Array.isArray(receivedItems) || receivedItems.length === 0) {
+        res.status(400).json({ error: 'At least one item receipt record is required.' });
+        return;
+      }
+
+      const result = await receivePurchaseOrderPartial(
+        id,
+        warehouseId,
+        receivedItems,
+        req.user.name || 'System Operator'
+      );
+
+      res.json({ ...result, status: 'success' });
+    } catch (err: any) {
+      console.error('Error receiving purchase order:', err);
+      res.status(400).json({ error: err.message || 'Failed to receive purchase order', details: err.message });
+    }
+  });
+
+  // Update purchase order status
   app.post('/api/purchase-orders/:id/status', authenticateToken, async (req: any, res) => {
     try {
       const warehouseId = req.user.warehouseId;
@@ -953,6 +1134,90 @@ async function startServer() {
     } catch (err: any) {
       console.error('Error deleting purchase order:', err);
       res.status(500).json({ error: 'Failed to delete purchase order', details: err.message });
+    }
+  });
+
+  // --- Personnel Dispatches Endpoints ---
+  app.get('/api/dispatches', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const dispatches = await getPersonnelDispatches(warehouseId);
+      res.json({ dispatches });
+    } catch (err: any) {
+      console.error('Error retrieving dispatches:', err);
+      res.status(500).json({ error: 'Failed to retrieve dispatch records', details: err.message });
+    }
+  });
+
+  app.post('/api/dispatches', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role === 'viewer') {
+        res.status(403).json({ error: 'Access denied: Viewers cannot record dispatches.' });
+        return;
+      }
+
+      const dispatchData = req.body;
+      if (!dispatchData.sku || !dispatchData.quantity || !dispatchData.recipientName) {
+        res.status(400).json({ error: 'SKU, quantity, and recipient name are required.' });
+        return;
+      }
+
+      const saved = await recordPersonnelDispatch({
+        ...dispatchData,
+        operator: req.user.name || 'System Operator'
+      }, warehouseId);
+
+      res.status(201).json({ status: 'success', dispatch: saved });
+    } catch (err: any) {
+      console.error('Error recording dispatch:', err);
+      res.status(500).json({ error: 'Failed to record dispatch', details: err.message });
+    }
+  });
+
+  // --- System Audit Logs Endpoints ---
+  app.get('/api/audit-logs', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
+      if (role !== 'admin' && role !== 'manager') {
+        res.status(403).json({ error: 'Access denied: Only Administrators and Managers can view audit logs.' });
+        return;
+      }
+
+      const limit = Number(req.query.limit || 100);
+      const auditLogs = await getSystemAuditLogs(warehouseId, limit);
+      res.json({ auditLogs });
+    } catch (err: any) {
+      console.error('Error fetching audit logs:', err);
+      res.status(500).json({ error: 'Failed to retrieve system audit logs', details: err.message });
+    }
+  });
+
+  app.post('/api/audit-logs', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = req.user.warehouseId;
+      const { action, category, details, status } = req.body;
+      if (!action || !category || !details) {
+        res.status(400).json({ error: 'Action, category, and details are required for audit records.' });
+        return;
+      }
+
+      await logSystemAudit({
+        warehouseId,
+        action,
+        category,
+        details,
+        operator: req.user.name || 'System Operator',
+        operatorId: req.user.id,
+        status: status || 'SUCCESS'
+      });
+
+      res.json({ status: 'success' });
+    } catch (err: any) {
+      console.error('Error logging audit record:', err);
+      res.status(500).json({ error: 'Failed to record audit log', details: err.message });
     }
   });
 

@@ -64,13 +64,14 @@ export interface Supplier {
   address: string;
 }
 
-export type PurchaseOrderStatus = 'DRAFT' | 'ORDERED' | 'IN_TRANSIT' | 'RECEIVED' | 'CANCELLED';
+export type PurchaseOrderStatus = 'DRAFT' | 'ORDERED' | 'IN_TRANSIT' | 'PARTIALLY_RECEIVED' | 'RECEIVED' | 'CANCELLED';
 
 export interface PurchaseOrderItem {
   itemId?: string;
   sku: string;
   name: string;
   quantity: number;
+  quantityReceived?: number;
   unitPrice: number;
   category?: string;
   zone?: string;
@@ -99,5 +100,45 @@ export interface StockTransferPayload {
   reason?: string;
   notes?: string;
   batchNumber?: string;
+}
+
+export interface ZoneCapacity {
+  zoneId: string;
+  zoneName: string;
+  maxCapacity: number;
+  currentOccupancy: number;
+  occupancyPercentage: number;
+  isOverCapacity: boolean;
+  itemCount: number;
+}
+
+export type AuditCategory = 'SECURITY' | 'INVENTORY' | 'TENANT' | 'USER' | 'TRANSFER' | 'PROCUREMENT';
+
+export interface SystemAuditLog {
+  id: string;
+  warehouseId: string;
+  action: string;
+  category: AuditCategory;
+  details: string;
+  operator: string;
+  operatorId?: string;
+  ipAddress?: string;
+  status: 'SUCCESS' | 'WARNING' | 'FAILED';
+  timestamp: string;
+}
+
+export interface PersonnelDispatchRecord {
+  id: string;
+  itemId: string;
+  itemName: string;
+  sku: string;
+  quantity: number;
+  recipientName: string;
+  department?: string;
+  badgeNumber?: string;
+  projectCode?: string;
+  operator: string;
+  timestamp: string;
+  notes?: string;
 }
 

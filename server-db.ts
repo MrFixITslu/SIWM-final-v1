@@ -118,6 +118,10 @@ let memTransactions: any[] = [];
 
 let memPurchaseOrders: any[] = [];
 
+let memAuditLogs: any[] = [];
+
+let memDispatchRecords: any[] = [];
+
 export async function initDb() {
   console.log('Initializing database connectivity...');
   
@@ -286,6 +290,7 @@ async function runMigrations() {
   `);
 
   // 10. Database Migrations (Safely adding layout, contact details, role, batch, and archive columns)
+  await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS token_version INT DEFAULT 1`);
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS email VARCHAR(150)`);
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS phone VARCHAR(50)`);
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS contact_name VARCHAR(100)`);
@@ -293,6 +298,41 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_cols INT DEFAULT 5`);
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_zones TEXT DEFAULT '[]'`);
   await pool.query(`ALTER TABLE user_warehouses ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'admin'`);
+
+  // 11. System Audit Logs Table (immutable security, authorization, & operations ledger)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS audit_logs (
+      id VARCHAR(50) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      action VARCHAR(100) NOT NULL,
+      category VARCHAR(50) NOT NULL,
+      details TEXT,
+      operator VARCHAR(512),
+      operator_id VARCHAR(50),
+      ip_address VARCHAR(100),
+      status VARCHAR(50) DEFAULT 'SUCCESS',
+      timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // 12. Personnel Dispatch Records Table (direct personnel and department tracking)
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS dispatch_records (
+      id VARCHAR(50) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      item_id VARCHAR(50),
+      item_name VARCHAR(1024) NOT NULL,
+      sku VARCHAR(512) NOT NULL,
+      quantity INT NOT NULL,
+      recipient_name VARCHAR(512) NOT NULL,
+      department VARCHAR(512),
+      badge_number VARCHAR(512),
+      project_code VARCHAR(512),
+      operator VARCHAR(512),
+      timestamp TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+      notes TEXT
+    )
+  `);
 
   // Item & Transaction extensions for Batch tracking, Archiving, and Transfers
   await pool.query(`ALTER TABLE items ADD COLUMN IF NOT EXISTS is_archived BOOLEAN DEFAULT false`);
@@ -552,16 +592,18 @@ export async function seedWarehouseData(warehouseId: string) {
 }
 
 // --- User Management ---
-export async function createUser(user: { id: string, email: string, passwordHash?: string, name: string, warehouseId: string, provider: string, providerId?: string }) {
+export async function createUser(user: { id: string, email: string, passwordHash?: string, name: string, warehouseId: string, provider: string, providerId?: string, tokenVersion?: number }) {
+  const tokenVersion = user.tokenVersion || 1;
   if (usePostgres) {
     await pool.query(
-      `INSERT INTO users (id, email, password_hash, name, warehouse_id, provider, provider_id) 
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [user.id, user.email, user.passwordHash || null, user.name, user.warehouseId, user.provider, user.providerId || null]
+      `INSERT INTO users (id, email, password_hash, name, warehouse_id, provider, provider_id, token_version) 
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+      [user.id, user.email, user.passwordHash || null, user.name, user.warehouseId, user.provider, user.providerId || null, tokenVersion]
     );
   } else {
     memUsers.push({
       ...user,
+      tokenVersion,
       createdAt: new Date().toISOString()
     });
   }
@@ -581,11 +623,33 @@ export async function findUserByEmail(email: string) {
       name: row.name,
       warehouseId: row.warehouse_id,
       provider: row.provider,
-      providerId: row.provider_id
+      providerId: row.provider_id,
+      tokenVersion: row.token_version || 1
     };
   } else {
     const matched = memUsers.find(u => u.email.toLowerCase().trim() === normEmail);
-    return matched ? { ...matched } : null;
+    return matched ? { ...matched, tokenVersion: matched.tokenVersion || 1 } : null;
+  }
+}
+
+export async function findUserById(id: string) {
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM users WHERE id = $1', [id]);
+    if (res.rows.length === 0) return null;
+    const row = res.rows[0];
+    return {
+      id: row.id,
+      email: row.email,
+      passwordHash: row.password_hash,
+      name: row.name,
+      warehouseId: row.warehouse_id,
+      provider: row.provider,
+      providerId: row.provider_id,
+      tokenVersion: row.token_version || 1
+    };
+  } else {
+    const matched = memUsers.find(u => u.id === id);
+    return matched ? { ...matched, tokenVersion: matched.tokenVersion || 1 } : null;
   }
 }
 
@@ -601,12 +665,67 @@ export async function findUserByOAuth(provider: string, providerId: string) {
       name: row.name,
       warehouseId: row.warehouse_id,
       provider: row.provider,
-      providerId: row.provider_id
+      providerId: row.provider_id,
+      tokenVersion: row.token_version || 1
     };
   } else {
     const matched = memUsers.find(u => u.provider === provider && u.providerId === providerId);
-    return matched ? { ...matched } : null;
+    return matched ? { ...matched, tokenVersion: matched.tokenVersion || 1 } : null;
   }
+}
+
+export async function changeUserPassword(userId: string, currentPass: string, newPass: string, warehouseId: string, ipAddress?: string) {
+  const user = await findUserById(userId);
+  if (!user) {
+    throw new Error('User account not found.');
+  }
+
+  if (user.passwordHash) {
+    const isMatch = await bcrypt.compare(currentPass, user.passwordHash);
+    if (!isMatch) {
+      await logSystemAudit({
+        warehouseId,
+        action: 'PASSWORD_CHANGE_FAILED',
+        category: 'SECURITY',
+        details: `Failed password change attempt for user ${user.email} (invalid current credentials).`,
+        operator: user.name || user.email,
+        operatorId: userId,
+        ipAddress,
+        status: 'FAILED'
+      });
+      throw new Error('Incorrect current password.');
+    }
+  }
+
+  if (!newPass || newPass.length < 6) {
+    throw new Error('New password must be at least 6 characters long.');
+  }
+
+  const newHash = await bcrypt.hash(newPass, 10);
+  const nextTokenVersion = (user.tokenVersion || 1) + 1;
+
+  if (usePostgres) {
+    await pool.query('UPDATE users SET password_hash = $1, token_version = $2 WHERE id = $3', [newHash, nextTokenVersion, userId]);
+  } else {
+    const idx = memUsers.findIndex(u => u.id === userId);
+    if (idx !== -1) {
+      memUsers[idx].passwordHash = newHash;
+      memUsers[idx].tokenVersion = nextTokenVersion;
+    }
+  }
+
+  await logSystemAudit({
+    warehouseId,
+    action: 'PASSWORD_CHANGED',
+    category: 'SECURITY',
+    details: `Password changed and prior active sessions rotated/invalidated for ${user.email}.`,
+    operator: user.name || user.email,
+    operatorId: userId,
+    ipAddress,
+    status: 'SUCCESS'
+  });
+
+  return { success: true, tokenVersion: nextTokenVersion };
 }
 
 // --- Warehouse Management ---
@@ -1798,11 +1917,321 @@ export async function updatePurchaseOrderStatus(poId: string, warehouseId: strin
   return { success: true, poId, status: newStatus };
 }
 
+export async function receivePurchaseOrderPartial(
+  poId: string,
+  warehouseId: string,
+  receivedItems: { sku: string; quantityToReceive: number; batchNumber?: string }[],
+  operator: string
+) {
+  const now = new Date().toISOString();
+  let po: any = null;
+
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM purchase_orders WHERE id = $1 AND warehouse_id = $2', [poId, warehouseId]);
+    if (res.rows.length === 0) throw new Error('Purchase order not found.');
+    po = {
+      ...res.rows[0],
+      items: JSON.parse(res.rows[0].items_json || '[]')
+    };
+  } else {
+    const idx = memPurchaseOrders.findIndex(p => p.id === poId && p.warehouse_id === warehouseId);
+    if (idx === -1) throw new Error('Purchase order not found.');
+    po = memPurchaseOrders[idx];
+  }
+
+  const existingItems = await getItems(warehouseId);
+  const updatedItemsList = [...(po.items || [])];
+  let totalIntakeCount = 0;
+
+  for (const rec of receivedItems) {
+    if (!rec.quantityToReceive || rec.quantityToReceive <= 0) continue;
+
+    const lineItem = updatedItemsList.find(i => i.sku.toLowerCase() === rec.sku.toLowerCase());
+    if (!lineItem) continue;
+
+    const prevReceived = lineItem.quantityReceived || 0;
+    lineItem.quantityReceived = prevReceived + rec.quantityToReceive;
+    totalIntakeCount += rec.quantityToReceive;
+
+    // Adjust inventory stock atomically
+    const existingInv = existingItems.find((i: any) => i.sku.toLowerCase() === rec.sku.toLowerCase());
+    if (existingInv) {
+      await adjustStockAtomic(
+        warehouseId,
+        existingInv.id,
+        'INBOUND',
+        rec.quantityToReceive,
+        `PO Intake #${po.po_number || po.poNumber} (${rec.quantityToReceive} ${lineItem.unit || 'units'})`,
+        operator,
+        rec.batchNumber || lineItem.batchNumber
+      );
+    } else {
+      const newItemId = `item-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+      await saveItem({
+        id: newItemId,
+        name: lineItem.name,
+        sku: lineItem.sku,
+        category: lineItem.category || 'General',
+        quantity: rec.quantityToReceive,
+        unit: 'pcs',
+        price: lineItem.unitPrice || 0,
+        warehouseLocation: {
+          zone: lineItem.zone || 'Zone A',
+          aisle: 'Aisle 01',
+          shelf: 'Level 1',
+          bin: 'Bin 01'
+        },
+        supplierId: po.supplier_id || po.supplierId,
+        minThreshold: 10,
+        lastUpdated: now,
+        notes: `Created from PO #${po.po_number || po.poNumber}`,
+        batchNumber: rec.batchNumber || lineItem.batchNumber,
+        expiryDate: lineItem.expiryDate
+      }, warehouseId);
+
+      await saveTransaction({
+        id: `tx-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`,
+        itemId: newItemId,
+        itemName: lineItem.name,
+        sku: lineItem.sku,
+        type: 'INBOUND',
+        quantity: rec.quantityToReceive,
+        reason: `Initial PO intake #${po.po_number || po.poNumber}`,
+        timestamp: now,
+        operator,
+        batchNumber: rec.batchNumber || lineItem.batchNumber
+      }, warehouseId);
+    }
+  }
+
+  // Determine overall status
+  const allFullyReceived = updatedItemsList.length > 0 && updatedItemsList.every(i => (i.quantityReceived || 0) >= i.quantity);
+  const anyPartiallyReceived = updatedItemsList.some(i => (i.quantityReceived || 0) > 0);
+  const newStatus = allFullyReceived ? 'RECEIVED' : (anyPartiallyReceived ? 'PARTIALLY_RECEIVED' : po.status);
+
+  if (usePostgres) {
+    await pool.query(
+      'UPDATE purchase_orders SET status = $1, items_json = $2, updated_at = $3 WHERE id = $4 AND warehouse_id = $5',
+      [newStatus, JSON.stringify(updatedItemsList), now, poId, warehouseId]
+    );
+  } else {
+    const idx = memPurchaseOrders.findIndex(p => p.id === poId && p.warehouse_id === warehouseId);
+    if (idx !== -1) {
+      memPurchaseOrders[idx].items = updatedItemsList;
+      memPurchaseOrders[idx].status = newStatus;
+      memPurchaseOrders[idx].updatedAt = now;
+    }
+  }
+
+  await logSystemAudit({
+    warehouseId,
+    action: newStatus === 'RECEIVED' ? 'PO_FULLY_RECEIVED' : 'PO_PARTIAL_INTAKE',
+    category: 'PROCUREMENT',
+    details: `PO #${po.po_number || po.poNumber} intake processed (${totalIntakeCount} units received). Status: ${newStatus}.`,
+    operator,
+    status: 'SUCCESS'
+  });
+
+  const updatedPOList = await getPurchaseOrders(warehouseId);
+  const updatedPO = updatedPOList.find((p: any) => p.id === poId);
+
+  return { success: true, purchaseOrder: updatedPO, status: newStatus };
+}
+
 export async function deletePurchaseOrder(poId: string, warehouseId: string) {
   if (usePostgres) {
     await pool.query('DELETE FROM purchase_orders WHERE id = $1 AND warehouse_id = $2', [poId, warehouseId]);
   } else {
     memPurchaseOrders = memPurchaseOrders.filter(p => !(p.id === poId && p.warehouse_id === warehouseId));
+  }
+}
+
+// --- Audit Logging System ---
+export async function logSystemAudit(params: {
+  warehouseId: string;
+  action: string;
+  category: 'SECURITY' | 'INVENTORY' | 'TENANT' | 'USER' | 'TRANSFER' | 'PROCUREMENT';
+  details: string;
+  operator: string;
+  operatorId?: string;
+  ipAddress?: string;
+  status?: 'SUCCESS' | 'WARNING' | 'FAILED';
+}) {
+  const { warehouseId, action, category, details, operator, operatorId, ipAddress, status = 'SUCCESS' } = params;
+  const id = `audit-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+  const now = new Date().toISOString();
+
+  if (usePostgres) {
+    try {
+      await pool.query(
+        `INSERT INTO audit_logs (id, warehouse_id, action, category, details, operator, operator_id, ip_address, status, timestamp)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+        [
+          id,
+          warehouseId,
+          action,
+          category,
+          encryptText(details, warehouseId),
+          encryptText(operator, warehouseId),
+          operatorId || null,
+          ipAddress || null,
+          status,
+          now
+        ]
+      );
+    } catch (err) {
+      console.error('Failed to write audit log to PostgreSQL:', err);
+    }
+  } else {
+    memAuditLogs.unshift({
+      id,
+      warehouse_id: warehouseId,
+      action,
+      category,
+      details: encryptText(details, warehouseId),
+      operator: encryptText(operator, warehouseId),
+      operator_id: operatorId,
+      ip_address: ipAddress,
+      status,
+      timestamp: now
+    });
+    if (memAuditLogs.length > 1000) {
+      memAuditLogs.pop();
+    }
+  }
+}
+
+export async function getSystemAuditLogs(warehouseId: string, limit: number = 100) {
+  if (usePostgres) {
+    const res = await pool.query(
+      'SELECT * FROM audit_logs WHERE warehouse_id = $1 ORDER BY timestamp DESC LIMIT $2',
+      [warehouseId, limit]
+    );
+    return res.rows.map((row: any) => ({
+      id: row.id,
+      warehouseId: row.warehouse_id,
+      action: row.action,
+      category: row.category,
+      details: decryptText(row.details, warehouseId),
+      operator: decryptText(row.operator, warehouseId),
+      operatorId: row.operator_id,
+      ipAddress: row.ip_address,
+      status: row.status,
+      timestamp: (row.timestamp ? (typeof row.timestamp === 'string' ? row.timestamp : row.timestamp.toISOString()) : new Date().toISOString())
+    }));
+  } else {
+    const filtered = memAuditLogs.filter(a => a.warehouse_id === warehouseId).slice(0, limit);
+    return filtered.map(row => ({
+      id: row.id,
+      warehouseId: row.warehouse_id,
+      action: row.action,
+      category: row.category,
+      details: decryptText(row.details, warehouseId),
+      operator: decryptText(row.operator, warehouseId),
+      operatorId: row.operator_id,
+      ipAddress: row.ip_address,
+      status: row.status,
+      timestamp: row.timestamp
+    }));
+  }
+}
+
+// --- Personnel Dispatch Records System ---
+export async function recordPersonnelDispatch(dispatch: any, warehouseId: string) {
+  const id = `disp-${Date.now()}-${Math.random().toString(36).substr(2, 6)}`;
+  const now = new Date().toISOString();
+  const encItemName = encryptText(dispatch.itemName, warehouseId);
+  const encSku = encryptText(dispatch.sku, warehouseId);
+  const encRecipient = encryptText(dispatch.recipientName, warehouseId);
+  const encDept = encryptText(dispatch.department || '', warehouseId);
+  const encBadge = encryptText(dispatch.badgeNumber || '', warehouseId);
+  const encProject = encryptText(dispatch.projectCode || '', warehouseId);
+  const encOperator = encryptText(dispatch.operator, warehouseId);
+  const encNotes = encryptText(dispatch.notes || '', warehouseId);
+
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO dispatch_records (id, warehouse_id, item_id, item_name, sku, quantity, recipient_name, department, badge_number, project_code, operator, timestamp, notes)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+      [
+        id,
+        warehouseId,
+        dispatch.itemId,
+        encItemName,
+        encSku,
+        dispatch.quantity,
+        encRecipient,
+        encDept,
+        encBadge,
+        encProject,
+        encOperator,
+        now,
+        encNotes
+      ]
+    );
+  } else {
+    memDispatchRecords.unshift({
+      id,
+      warehouse_id: warehouseId,
+      itemId: dispatch.itemId,
+      itemName: encItemName,
+      sku: encSku,
+      quantity: dispatch.quantity,
+      recipientName: encRecipient,
+      department: encDept,
+      badgeNumber: encBadge,
+      projectCode: encProject,
+      operator: encOperator,
+      timestamp: now,
+      notes: encNotes
+    });
+  }
+
+  await logSystemAudit({
+    warehouseId,
+    action: 'OUTBOUND_DISPATCH',
+    category: 'INVENTORY',
+    details: `Dispatched ${dispatch.quantity} units of SKU ${dispatch.sku} (${dispatch.itemName}) to ${dispatch.recipientName}${dispatch.department ? ` [${dispatch.department}]` : ''}.`,
+    operator: dispatch.operator,
+    status: 'SUCCESS'
+  });
+
+  return { id, ...dispatch, timestamp: now };
+}
+
+export async function getPersonnelDispatches(warehouseId: string) {
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM dispatch_records WHERE warehouse_id = $1 ORDER BY timestamp DESC', [warehouseId]);
+    return res.rows.map((row: any) => ({
+      id: row.id,
+      itemId: row.item_id,
+      itemName: decryptText(row.item_name, warehouseId),
+      sku: decryptText(row.sku, warehouseId),
+      quantity: row.quantity,
+      recipientName: decryptText(row.recipient_name, warehouseId),
+      department: decryptText(row.department, warehouseId),
+      badgeNumber: decryptText(row.badge_number, warehouseId),
+      projectCode: decryptText(row.project_code, warehouseId),
+      operator: decryptText(row.operator, warehouseId),
+      timestamp: (row.timestamp ? (typeof row.timestamp === 'string' ? row.timestamp : row.timestamp.toISOString()) : new Date().toISOString()),
+      notes: decryptText(row.notes, warehouseId)
+    }));
+  } else {
+    const filtered = memDispatchRecords.filter(d => d.warehouse_id === warehouseId);
+    return filtered.map(row => ({
+      id: row.id,
+      itemId: row.itemId,
+      itemName: decryptText(row.itemName, warehouseId),
+      sku: decryptText(row.sku, warehouseId),
+      quantity: row.quantity,
+      recipientName: decryptText(row.recipientName, warehouseId),
+      department: decryptText(row.department, warehouseId),
+      badgeNumber: decryptText(row.badgeNumber, warehouseId),
+      projectCode: decryptText(row.projectCode, warehouseId),
+      operator: decryptText(row.operator, warehouseId),
+      timestamp: row.timestamp,
+      notes: decryptText(row.notes, warehouseId)
+    }));
   }
 }
 
@@ -1831,11 +2260,16 @@ export async function getZoneCapacity(warehouseId: string) {
 }
 
 // --- Live User Authentication & Role Verification ---
-export async function verifyLiveUserAccess(userId: string, warehouseId: string) {
+export async function verifyLiveUserAccess(userId: string, warehouseId: string, tokenVersion?: number) {
   if (usePostgres) {
     const userRes = await pool.query('SELECT * FROM users WHERE id = $1', [userId]);
     if (userRes.rows.length === 0) return { valid: false, role: 'viewer', user: null };
     const user = userRes.rows[0];
+
+    // Verify token version to revoke stale sessions immediately upon password change
+    if (tokenVersion !== undefined && user.token_version !== undefined && user.token_version !== tokenVersion) {
+      return { valid: false, role: 'viewer', user, reason: 'SESSION_REVOKED' };
+    }
 
     const roleRes = await pool.query('SELECT role FROM user_warehouses WHERE user_id = $1 AND warehouse_id = $2', [userId, warehouseId]);
     if (roleRes.rows.length === 0) return { valid: false, role: 'viewer', user };
@@ -1844,6 +2278,10 @@ export async function verifyLiveUserAccess(userId: string, warehouseId: string) 
   } else {
     const user = memUsers.find(u => u.id === userId);
     if (!user) return { valid: false, role: 'viewer', user: null };
+
+    if (tokenVersion !== undefined && user.tokenVersion !== undefined && user.tokenVersion !== tokenVersion) {
+      return { valid: false, role: 'viewer', user, reason: 'SESSION_REVOKED' };
+    }
 
     const mapping = memUserWarehouses.find(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
     if (!mapping) return { valid: false, role: 'viewer', user };

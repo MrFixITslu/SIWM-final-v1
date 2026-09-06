@@ -35,7 +35,9 @@ import {
   ShieldCheck,
   UserPlus,
   Layers,
-  Tag
+  Tag,
+  Truck,
+  Activity
 } from 'lucide-react';
 import { 
   PieChart, 
@@ -53,6 +55,11 @@ import {
   CartesianGrid
 } from 'recharts';
 import confetti from 'canvas-confetti';
+
+import { PasswordChangeCard } from './components/PasswordChangeCard';
+import { AuditLedgerView } from './components/AuditLedgerView';
+import { PersonnelDispatchesView } from './components/PersonnelDispatchesView';
+import { PurchaseOrdersManager } from './components/PurchaseOrdersManager';
 
 import { 
   InventoryItem, 
@@ -408,6 +415,7 @@ export default function App() {
 
   // --- UI Navigation ---
   const [activeTab, setActiveTab] = useState<'dashboard' | 'inventory' | 'map' | 'history' | 'suppliers' | 'settings'>('dashboard');
+  const [historySubTab, setHistorySubTab] = useState<'movements' | 'dispatches' | 'audit'>('movements');
 
   // --- Search & Filter States ---
   const [searchTerm, setSearchTerm] = useState('');
@@ -485,7 +493,10 @@ export default function App() {
     outboundTargetType: 'engineer' as 'engineer' | 'warehouse',
     selectedEngineerId: '',
     selectedWarehouseId: '',
-    customRecipientName: ''
+    customRecipientName: '',
+    department: '',
+    badgeNumber: '',
+    projectCode: ''
   });
 
   // --- Procurement Planner state ---
@@ -1149,7 +1160,10 @@ export default function App() {
       outboundTargetType: 'engineer',
       selectedEngineerId: '',
       selectedWarehouseId: '',
-      customRecipientName: ''
+      customRecipientName: '',
+      department: '',
+      badgeNumber: '',
+      projectCode: ''
     });
     setIsAdjustModalOpen(true);
   };
@@ -1169,14 +1183,32 @@ export default function App() {
       return;
     }
 
+    // Check Zone Hard Cap for INBOUND
+    if (adjustForm.type === 'INBOUND') {
+      const itemZone = adjustingItem.warehouseLocation.zone;
+      const targetZoneObj = zones.find(z => z.id === itemZone || z.name === itemZone);
+      const zoneMaxCap = targetZoneObj ? targetZoneObj.maxCapacity : 100;
+      const currentZoneTotal = items
+        .filter(i => (i.warehouseLocation.zone === itemZone || (targetZoneObj && i.warehouseLocation.zone === targetZoneObj.id)))
+        .reduce((sum, i) => sum + i.quantity, 0);
+
+      if (currentZoneTotal + qty > zoneMaxCap) {
+        showToast(`Intake rejected: Zone "${targetZoneObj ? targetZoneObj.name : itemZone}" is at maximum capacity (${currentZoneTotal}/${zoneMaxCap} units). Cannot exceed hard-cap!`, "error");
+        return;
+      }
+    }
+
     let destinationText = "";
+    let recipientName = "";
     if (adjustForm.type === 'OUTBOUND') {
       if (adjustForm.outboundTargetType === 'engineer') {
         if (adjustForm.selectedEngineerId) {
           const eng = warehouseUsers.find(u => u.id === adjustForm.selectedEngineerId);
-          destinationText = `Engineer: ${eng ? (eng.name || eng.email) : adjustForm.selectedEngineerId}`;
+          recipientName = eng ? (eng.name || eng.email) : adjustForm.selectedEngineerId;
+          destinationText = `Engineer: ${recipientName}`;
         } else if (adjustForm.customRecipientName.trim()) {
-          destinationText = `Engineer: ${adjustForm.customRecipientName.trim()}`;
+          recipientName = adjustForm.customRecipientName.trim();
+          destinationText = `Engineer: ${recipientName}`;
         } else {
           showToast("Please select or enter an Engineer recipient for this outbound shipment.", "error");
           return;
@@ -1184,9 +1216,11 @@ export default function App() {
       } else { // warehouse
         if (adjustForm.selectedWarehouseId) {
           const wh = warehouses.find(w => w.id === adjustForm.selectedWarehouseId);
-          destinationText = `Warehouse: ${wh ? wh.name : adjustForm.selectedWarehouseId}`;
+          recipientName = wh ? wh.name : adjustForm.selectedWarehouseId;
+          destinationText = `Warehouse: ${recipientName}`;
         } else if (adjustForm.customRecipientName.trim()) {
-          destinationText = `Warehouse: ${adjustForm.customRecipientName.trim()}`;
+          recipientName = adjustForm.customRecipientName.trim();
+          destinationText = `Warehouse: ${recipientName}`;
         } else {
           showToast("Please select or enter a Connected Warehouse destination for this outbound shipment.", "error");
           return;
@@ -1208,7 +1242,11 @@ export default function App() {
           quantity: qty,
           reason: adjustForm.reason,
           operator: adjustForm.operator,
-          issuedTo: destinationText || undefined
+          issuedTo: destinationText || undefined,
+          recipientName: recipientName || undefined,
+          department: adjustForm.department || undefined,
+          badgeNumber: adjustForm.badgeNumber || undefined,
+          projectCode: adjustForm.projectCode || undefined
         })
       });
       if (res.ok) {
@@ -2781,122 +2819,171 @@ export default function App() {
             {activeTab === 'history' && (
               <div className="space-y-6 animate-fade-in" id="panel_history">
                 
-                {/* Audit trail stats summary */}
-                <div className="grid grid-cols-1 md:grid-cols-3 gap-6" id="history_stats_cards">
-                  <div className="p-4 bg-slate-900/40 border border-slate-800 rounded-xl flex items-center gap-3">
-                    <History className="h-5 w-5 text-indigo-400" />
-                    <div>
-                      <span className="text-[10px] text-slate-400 uppercase tracking-wider block font-semibold">Total Logged Movements</span>
-                      <span className="text-lg font-bold text-white">{transactions.length} entries</span>
-                    </div>
-                  </div>
-                  <div className="p-4 bg-slate-900/40 border border-slate-800 rounded-xl flex items-center gap-3">
-                    <ArrowDownLeft className="h-5 w-5 text-emerald-400" />
-                    <div>
-                      <span className="text-[10px] text-slate-400 uppercase tracking-wider block font-semibold">Inbound Intake Loggings</span>
-                      <span className="text-lg font-bold text-white">
-                        {transactions.filter(t => t.type === 'INBOUND').length} records
-                      </span>
-                    </div>
-                  </div>
-                  <div className="p-4 bg-slate-900/40 border border-slate-800 rounded-xl flex items-center gap-3">
-                    <ArrowUpRight className="h-5 w-5 text-amber-400" />
-                    <div>
-                      <span className="text-[10px] text-slate-400 uppercase tracking-wider block font-semibold">Outbound Dispatches</span>
-                      <span className="text-lg font-bold text-white">
-                        {transactions.filter(t => t.type === 'OUTBOUND').length} dispatches
-                      </span>
-                    </div>
-                  </div>
+                {/* Sub-navigation bar for History & Ledger */}
+                <div className="flex items-center gap-2 border-b border-slate-800/80 pb-3">
+                  <button
+                    onClick={() => setHistorySubTab('movements')}
+                    className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 ${
+                      historySubTab === 'movements'
+                        ? 'bg-indigo-600 text-white shadow-md'
+                        : 'bg-slate-900/60 text-slate-400 hover:text-white border border-slate-800'
+                    }`}
+                  >
+                    <History className="h-4 w-4" />
+                    Stock Movements
+                  </button>
+                  <button
+                    onClick={() => setHistorySubTab('dispatches')}
+                    className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 ${
+                      historySubTab === 'dispatches'
+                        ? 'bg-indigo-600 text-white shadow-md'
+                        : 'bg-slate-900/60 text-slate-400 hover:text-white border border-slate-800'
+                    }`}
+                  >
+                    <Truck className="h-4 w-4 text-amber-400" />
+                    Personnel Dispatches
+                  </button>
+                  <button
+                    onClick={() => setHistorySubTab('audit')}
+                    className={`px-4 py-2 rounded-xl text-xs font-bold transition flex items-center gap-2 ${
+                      historySubTab === 'audit'
+                        ? 'bg-indigo-600 text-white shadow-md'
+                        : 'bg-slate-900/60 text-slate-400 hover:text-white border border-slate-800'
+                    }`}
+                  >
+                    <Activity className="h-4 w-4 text-emerald-400" />
+                    System Audit Ledger
+                  </button>
                 </div>
 
-                {/* HISTORICAL TABLE LIST */}
-                <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl overflow-hidden shadow-xl" id="history_table_panel">
-                  <div className="overflow-x-auto">
-                    <table className="w-full text-left border-collapse animate-fade-in" id="tbl_history">
-                      <thead>
-                        <tr className="bg-slate-950/80 border-b border-slate-800/80 text-xs font-bold text-slate-400 uppercase tracking-widest">
-                          <th className="py-4.5 px-6">Timestamp UTC</th>
-                          <th className="py-4.5 px-6">Product Item</th>
-                          <th className="py-4.5 px-6">SKU Identifier</th>
-                          <th className="py-4.5 px-6">Flow Direction</th>
-                          <th className="py-4.5 px-6 text-right">Adjustment Qty</th>
-                          <th className="py-4.5 px-6">Logging Operator</th>
-                          <th className="py-4.5 px-6">Operation Reason</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-slate-800/50 text-sm">
-                        {transactions.length === 0 ? (
-                          <tr>
-                            <td colSpan={7} className="py-12 text-center text-slate-500">
-                              <History className="h-10 w-10 mx-auto mb-3 opacity-30" />
-                              Audit log contains zero adjustment logs.
-                            </td>
-                          </tr>
-                        ) : (
-                          transactions.map(tx => {
-                            const isInbound = tx.type === 'INBOUND';
-                            
-                            return (
-                              <tr key={tx.id} className="hover:bg-slate-900/20 transition-colors" id={`row_tx_${tx.id}`}>
-                                {/* Timestamp */}
-                                <td className="py-4 px-6 font-mono text-xs text-slate-400">
-                                  {new Date(tx.timestamp).toLocaleString(undefined, {
-                                    year: 'numeric',
-                                    month: 'short',
-                                    day: 'numeric',
-                                    hour: '2-digit',
-                                    minute: '2-digit',
-                                    second: '2-digit'
-                                  })}
-                                </td>
+                {historySubTab === 'movements' && (
+                  <>
+                    {/* Audit trail stats summary */}
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-6" id="history_stats_cards">
+                      <div className="p-4 bg-slate-900/40 border border-slate-800 rounded-xl flex items-center gap-3">
+                        <History className="h-5 w-5 text-indigo-400" />
+                        <div>
+                          <span className="text-[10px] text-slate-400 uppercase tracking-wider block font-semibold">Total Logged Movements</span>
+                          <span className="text-lg font-bold text-white">{transactions.length} entries</span>
+                        </div>
+                      </div>
+                      <div className="p-4 bg-slate-900/40 border border-slate-800 rounded-xl flex items-center gap-3">
+                        <ArrowDownLeft className="h-5 w-5 text-emerald-400" />
+                        <div>
+                          <span className="text-[10px] text-slate-400 uppercase tracking-wider block font-semibold">Inbound Intake Loggings</span>
+                          <span className="text-lg font-bold text-white">
+                            {transactions.filter(t => t.type === 'INBOUND').length} records
+                          </span>
+                        </div>
+                      </div>
+                      <div className="p-4 bg-slate-900/40 border border-slate-800 rounded-xl flex items-center gap-3">
+                        <ArrowUpRight className="h-5 w-5 text-amber-400" />
+                        <div>
+                          <span className="text-[10px] text-slate-400 uppercase tracking-wider block font-semibold">Outbound Dispatches</span>
+                          <span className="text-lg font-bold text-white">
+                            {transactions.filter(t => t.type === 'OUTBOUND').length} dispatches
+                          </span>
+                        </div>
+                      </div>
+                    </div>
 
-                                {/* Item Name */}
-                                <td className="py-4 px-6 font-bold text-slate-100">
-                                  {tx.itemName}
-                                </td>
-
-                                {/* SKU */}
-                                <td className="py-4 px-6 font-mono font-bold text-xs">
-                                  <span className="px-2 py-0.5 bg-slate-950 text-slate-400 border border-slate-850 rounded">
-                                    {tx.sku}
-                                  </span>
-                                </td>
-
-                                {/* Type Tag */}
-                                <td className="py-4 px-6">
-                                  <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-extrabold tracking-widest uppercase border ${
-                                    isInbound 
-                                      ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
-                                      : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
-                                  }`}>
-                                    {isInbound ? <ArrowDownLeft className="h-3.5 w-3.5 shrink-0" /> : <ArrowUpRight className="h-3.5 w-3.5 shrink-0" />}
-                                    {tx.type}
-                                  </span>
-                                </td>
-
-                                {/* Qty */}
-                                <td className={`py-4 px-6 text-right font-bold font-mono text-base ${isInbound ? 'text-emerald-400' : 'text-amber-400'}`}>
-                                  {isInbound ? '+' : '-'}{tx.quantity}
-                                </td>
-
-                                {/* Operator */}
-                                <td className="py-4 px-6 text-xs text-slate-300 font-medium">
-                                  {tx.operator}
-                                </td>
-
-                                {/* Reason comment */}
-                                <td className="py-4 px-6 text-xs text-slate-400 italic">
-                                  {tx.reason}
+                    {/* HISTORICAL TABLE LIST */}
+                    <div className="bg-slate-900/60 border border-slate-800/80 rounded-2xl overflow-hidden shadow-xl" id="history_table_panel">
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-left border-collapse animate-fade-in" id="tbl_history">
+                          <thead>
+                            <tr className="bg-slate-950/80 border-b border-slate-800/80 text-xs font-bold text-slate-400 uppercase tracking-widest">
+                              <th className="py-4.5 px-6">Timestamp UTC</th>
+                              <th className="py-4.5 px-6">Product Item</th>
+                              <th className="py-4.5 px-6">SKU Identifier</th>
+                              <th className="py-4.5 px-6">Flow Direction</th>
+                              <th className="py-4.5 px-6 text-right">Adjustment Qty</th>
+                              <th className="py-4.5 px-6">Logging Operator</th>
+                              <th className="py-4.5 px-6">Operation Reason</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-slate-800/50 text-sm">
+                            {transactions.length === 0 ? (
+                              <tr>
+                                <td colSpan={7} className="py-12 text-center text-slate-500">
+                                  <History className="h-10 w-10 mx-auto mb-3 opacity-30" />
+                                  Audit log contains zero adjustment logs.
                                 </td>
                               </tr>
-                            );
-                          })
-                        )}
-                      </tbody>
-                    </table>
-                  </div>
-                </div>
+                            ) : (
+                              transactions.map(tx => {
+                                const isInbound = tx.type === 'INBOUND';
+                                
+                                return (
+                                  <tr key={tx.id} className="hover:bg-slate-900/20 transition-colors" id={`row_tx_${tx.id}`}>
+                                    {/* Timestamp */}
+                                    <td className="py-4 px-6 font-mono text-xs text-slate-400">
+                                      {new Date(tx.timestamp).toLocaleString(undefined, {
+                                        year: 'numeric',
+                                        month: 'short',
+                                        day: 'numeric',
+                                        hour: '2-digit',
+                                        minute: '2-digit',
+                                        second: '2-digit'
+                                      })}
+                                    </td>
+
+                                    {/* Item Name */}
+                                    <td className="py-4 px-6 font-bold text-slate-100">
+                                      {tx.itemName}
+                                    </td>
+
+                                    {/* SKU */}
+                                    <td className="py-4 px-6 font-mono font-bold text-xs">
+                                      <span className="px-2 py-0.5 bg-slate-950 text-slate-400 border border-slate-850 rounded">
+                                        {tx.sku}
+                                      </span>
+                                    </td>
+
+                                    {/* Type Tag */}
+                                    <td className="py-4 px-6">
+                                      <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-full text-[10px] font-extrabold tracking-widest uppercase border ${
+                                        isInbound 
+                                          ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
+                                          : 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                                      }`}>
+                                        {isInbound ? <ArrowDownLeft className="h-3.5 w-3.5 shrink-0" /> : <ArrowUpRight className="h-3.5 w-3.5 shrink-0" />}
+                                        {tx.type}
+                                      </span>
+                                    </td>
+
+                                    {/* Qty */}
+                                    <td className={`py-4 px-6 text-right font-bold font-mono text-base ${isInbound ? 'text-emerald-400' : 'text-amber-400'}`}>
+                                      {isInbound ? '+' : '-'}{tx.quantity}
+                                    </td>
+
+                                    {/* Operator */}
+                                    <td className="py-4 px-6 text-xs text-slate-300 font-medium">
+                                      {tx.operator}
+                                    </td>
+
+                                    {/* Reason comment */}
+                                    <td className="py-4 px-6 text-xs text-slate-400 italic">
+                                      {tx.reason}
+                                    </td>
+                                  </tr>
+                                );
+                              })
+                            )}
+                          </tbody>
+                        </table>
+                      </div>
+                    </div>
+                  </>
+                )}
+
+                {historySubTab === 'dispatches' && (
+                  <PersonnelDispatchesView token={token} />
+                )}
+
+                {historySubTab === 'audit' && (
+                  <AuditLedgerView token={token} userRole={userRole} />
+                )}
 
               </div>
             )}
@@ -3076,6 +3163,16 @@ export default function App() {
 
                 </div>
 
+                {/* PURCHASE ORDERS & STAGED RECEIPTS MANAGEMENT */}
+                <PurchaseOrdersManager
+                  token={token}
+                  userRole={userRole}
+                  suppliers={suppliers}
+                  items={items}
+                  onRefreshData={fetchData}
+                  showToast={showToast}
+                />
+
               </div>
             )}
 
@@ -3100,6 +3197,16 @@ export default function App() {
                     </p>
                   </div>
                 </div>
+
+                {/* USER PASSWORD SECURITY CARD */}
+                <PasswordChangeCard
+                  token={token}
+                  onSuccess={(newToken) => {
+                    setToken(newToken);
+                    localStorage.setItem('auth_token', newToken);
+                  }}
+                  showToast={showToast}
+                />
 
                 <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
                   
@@ -4179,11 +4286,55 @@ export default function App() {
                 </select>
               </div>
 
+              {/* Zone Hard-Cap Capacity Indicator for Inbound */}
+              {adjustForm.type === 'INBOUND' && adjustingItem && (() => {
+                const itemZone = adjustingItem.warehouseLocation.zone;
+                const targetZoneObj = zones.find(z => z.id === itemZone || z.name === itemZone);
+                const zoneMaxCap = targetZoneObj ? targetZoneObj.maxCapacity : 100;
+                const currentZoneTotal = items
+                  .filter(i => (i.warehouseLocation.zone === itemZone || (targetZoneObj && i.warehouseLocation.zone === targetZoneObj.id)))
+                  .reduce((sum, i) => sum + i.quantity, 0);
+                const prospectiveTotal = currentZoneTotal + (Number(adjustForm.quantity) || 0);
+                const isOverCap = prospectiveTotal > zoneMaxCap;
+                const occupancyPercent = Math.min(100, Math.round((currentZoneTotal / zoneMaxCap) * 100));
+
+                return (
+                  <div className={`p-3.5 rounded-xl border text-xs space-y-1.5 ${
+                    isOverCap 
+                      ? 'bg-rose-500/10 border-rose-500/30 text-rose-300' 
+                      : 'bg-indigo-500/10 border-indigo-500/20 text-indigo-200'
+                  }`}>
+                    <div className="flex justify-between items-center font-semibold">
+                      <span>Target Zone: {targetZoneObj ? targetZoneObj.name : itemZone}</span>
+                      <span>{currentZoneTotal} / {zoneMaxCap} Units ({occupancyPercent}%)</span>
+                    </div>
+                    <div className="w-full bg-slate-950 rounded-full h-2 border border-slate-800 overflow-hidden">
+                      <div 
+                        className={`h-2 rounded-full transition-all ${
+                          isOverCap ? 'bg-rose-500' : occupancyPercent > 85 ? 'bg-amber-500' : 'bg-indigo-500'
+                        }`}
+                        style={{ width: `${Math.min(100, Math.round((prospectiveTotal / zoneMaxCap) * 100))}%` }}
+                      />
+                    </div>
+                    {isOverCap ? (
+                      <p className="text-[11px] text-rose-400 font-bold flex items-center gap-1 mt-1">
+                        <AlertTriangle className="h-3.5 w-3.5 shrink-0" />
+                        Zone Hard-Cap Alert: Adding {adjustForm.quantity} units will exceed maximum capacity ({prospectiveTotal}/{zoneMaxCap}).
+                      </p>
+                    ) : (
+                      <p className="text-[10px] text-slate-400">
+                        Prospective zone load after intake: {prospectiveTotal} / {zoneMaxCap} units.
+                      </p>
+                    )}
+                  </div>
+                );
+              })()}
+
               {adjustForm.type === 'OUTBOUND' && (
                 <div className="p-4 bg-slate-950/80 border border-slate-800 rounded-xl space-y-3" id="outbound_destination_selection">
                   <span className="text-xs font-bold text-amber-400 block flex items-center gap-1.5">
                     <span className="h-2 w-2 rounded-full bg-amber-500 animate-pulse"></span>
-                    Required Outbound Dispatch Destination
+                    Outbound Personnel & Project Allocation
                   </span>
                   
                   <div className="flex gap-4">
@@ -4196,7 +4347,7 @@ export default function App() {
                         onChange={() => setAdjustForm(prev => ({ ...prev, outboundTargetType: 'engineer' }))}
                         className="text-indigo-600 focus:ring-indigo-500 bg-slate-900 border-slate-800"
                       />
-                      Issue to Engineer
+                      Issue to Engineer / Personnel
                     </label>
                     <label className="flex items-center gap-2 text-xs text-slate-300 cursor-pointer select-none">
                       <input 
@@ -4212,32 +4363,66 @@ export default function App() {
                   </div>
 
                   {adjustForm.outboundTargetType === 'engineer' ? (
-                    <div>
-                      <label className="text-[10px] text-slate-400 font-bold block mb-1">Select Engineer *</label>
-                      {warehouseUsers.filter(u => u.role === 'engineer').length > 0 ? (
-                        <select 
-                          value={adjustForm.selectedEngineerId}
-                          onChange={e => setAdjustForm(prev => ({ ...prev, selectedEngineerId: e.target.value, customRecipientName: '' }))}
-                          className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 outline-none focus:border-indigo-500"
-                        >
-                          <option value="">-- Choose an Engineer --</option>
-                          {warehouseUsers.filter(u => u.role === 'engineer').map(u => (
-                            <option key={u.id} value={u.id}>{u.name || u.email} ({u.email})</option>
-                          ))}
-                        </select>
-                      ) : (
-                        <div className="space-y-2">
-                          <p className="text-[10px] text-amber-500">No active team members are registered with the "Engineer" role. Enter the engineer name manually below, or invite one in Settings:</p>
+                    <div className="space-y-3">
+                      <div>
+                        <label className="text-[10px] text-slate-400 font-bold block mb-1">Select Registered Engineer or Custom Recipient *</label>
+                        {warehouseUsers.filter(u => u.role === 'engineer').length > 0 ? (
+                          <select 
+                            value={adjustForm.selectedEngineerId}
+                            onChange={e => setAdjustForm(prev => ({ ...prev, selectedEngineerId: e.target.value, customRecipientName: '' }))}
+                            className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 outline-none focus:border-indigo-500"
+                          >
+                            <option value="">-- Choose an Engineer --</option>
+                            {warehouseUsers.filter(u => u.role === 'engineer').map(u => (
+                              <option key={u.id} value={u.id}>{u.name || u.email} ({u.email})</option>
+                            ))}
+                          </select>
+                        ) : null}
+                      </div>
+
+                      <div>
+                        <label className="text-[10px] text-slate-400 font-bold block mb-1">Recipient Name *</label>
+                        <input 
+                          type="text"
+                          placeholder="Personnel / Engineer Full Name"
+                          value={adjustForm.customRecipientName}
+                          onChange={e => setAdjustForm(prev => ({ ...prev, customRecipientName: e.target.value, selectedEngineerId: '' }))}
+                          className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-indigo-500"
+                        />
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                        <div>
+                          <label className="text-[10px] text-slate-400 font-bold block mb-1">Department</label>
                           <input 
                             type="text"
-                            placeholder="Recipient Engineer Name (e.g. John Doe)"
-                            required
-                            value={adjustForm.customRecipientName}
-                            onChange={e => setAdjustForm(prev => ({ ...prev, customRecipientName: e.target.value, selectedEngineerId: '' }))}
+                            placeholder="e.g. Field Ops / IT"
+                            value={adjustForm.department}
+                            onChange={e => setAdjustForm(prev => ({ ...prev, department: e.target.value }))}
                             className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-indigo-500"
                           />
                         </div>
-                      )}
+                        <div>
+                          <label className="text-[10px] text-slate-400 font-bold block mb-1">Badge Number</label>
+                          <input 
+                            type="text"
+                            placeholder="e.g. BDG-4819"
+                            value={adjustForm.badgeNumber}
+                            onChange={e => setAdjustForm(prev => ({ ...prev, badgeNumber: e.target.value }))}
+                            className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-indigo-500"
+                          />
+                        </div>
+                        <div>
+                          <label className="text-[10px] text-slate-400 font-bold block mb-1">Project / WO Code</label>
+                          <input 
+                            type="text"
+                            placeholder="e.g. PRJ-2026-X"
+                            value={adjustForm.projectCode}
+                            onChange={e => setAdjustForm(prev => ({ ...prev, projectCode: e.target.value }))}
+                            className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-xs text-slate-200 placeholder-slate-600 outline-none focus:border-indigo-500"
+                          />
+                        </div>
+                      </div>
                     </div>
                   ) : (
                     <div>
