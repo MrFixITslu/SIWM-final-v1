@@ -97,6 +97,21 @@ const getZoneDisplayName = (zoneVal: string | null | undefined, zonesList?: any[
   return clean || zoneVal;
 };
 
+function initialSiwmToken() {
+  const params = new URLSearchParams(window.location.hash.replace(/^#/, ''));
+  const hubToken = params.get('hub_token');
+  if (hubToken && hubToken.length < 4096) {
+    sessionStorage.setItem('siwm_hub_token', hubToken);
+    localStorage.removeItem('siwm_token');
+    localStorage.removeItem('siwm_user');
+    localStorage.removeItem('siwm_warehouse');
+    localStorage.removeItem('siwm_warehouses');
+    window.history.replaceState({}, '', window.location.pathname + window.location.search);
+    return hubToken;
+  }
+  return sessionStorage.getItem('siwm_hub_token') || localStorage.getItem('siwm_token');
+}
+
 export default function App() {
   // --- Persistent State ---
   const [items, setItems] = useState<InventoryItem[]>([]);
@@ -107,7 +122,7 @@ export default function App() {
   const [loading, setLoading] = useState(true);
 
   // --- Authentication & Multi-Tenancy States ---
-  const [token, setToken] = useState<string | null>(() => localStorage.getItem('siwm_token'));
+  const [token, setToken] = useState<string | null>(() => initialSiwmToken());
   const [user, setUser] = useState<any>(() => {
     const saved = localStorage.getItem('siwm_user');
     return saved ? JSON.parse(saved) : null;
@@ -160,6 +175,7 @@ export default function App() {
 
   const handleLogout = () => {
     localStorage.removeItem('siwm_token');
+    sessionStorage.removeItem('siwm_hub_token');
     localStorage.removeItem('siwm_user');
     localStorage.removeItem('siwm_warehouse');
     localStorage.removeItem('siwm_warehouses');
@@ -181,6 +197,17 @@ export default function App() {
       return;
     }
     try {
+      const meRes = await fetch('/api/auth/me', {
+        headers: { 'Authorization': `Bearer ${tokenToUse}` }
+      });
+      if (meRes.ok) {
+        const identity = await meRes.json();
+        setUser(identity.user);
+        setWarehouse(identity.warehouse);
+        localStorage.setItem('siwm_user', JSON.stringify(identity.user));
+        localStorage.setItem('siwm_warehouse', JSON.stringify(identity.warehouse));
+      }
+
       const res = await fetch('/api/data', {
         headers: {
           'Authorization': `Bearer ${tokenToUse}`

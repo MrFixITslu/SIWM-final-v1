@@ -55,8 +55,15 @@ import {
   getWarehouseUsers,
   updateWarehouseUserRole,
   removeUserFromWarehouse,
-  inviteUserToWarehouse
+  inviteUserToWarehouse,
+  findWarehouseByHubOrganizationId
 } from './server-db.js';
+import {
+  consumeHubLaunchTicket,
+  hubPublicUrl,
+  provisionHubWarehouse,
+  verifyHubPlatformRequest
+} from './server-hub.js';
 
 function resolveJwtSecret(): string {
   if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
@@ -105,8 +112,9 @@ function authenticateToken(req: any, res: any, next: any) {
       };
       next();
     } catch (checkErr) {
-      req.user = decoded;
-      next();
+      console.error('Live SIWM membership validation failed:', checkErr);
+      res.status(503).json({ error: 'Unable to validate warehouse access. Please try again.' });
+      return;
     }
   });
 }
@@ -132,8 +140,13 @@ async function startServer() {
   // Configure the port: runs on PORT (3000) inside AI Studio
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
-  // Middleware for parsing JSON requests
-  app.use(express.json());
+  // Middleware for parsing JSON requests. Preserve the exact body so
+  // V79 Hub service signatures bind the bytes that were actually received.
+  app.use(express.json({
+    verify: (req: any, _res, body) => {
+      req.rawBody = Buffer.from(body);
+    }
+  }));
 
   // Initialize PostgreSQL database connection and migrations
   await initDb();
@@ -143,6 +156,127 @@ async function startServer() {
   // Health check endpoint
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date() });
+  });
+
+  // --- V79 Hub platform integration ---
+  app.get('/api/platform/start', (_req, res) => {
+    const target = new URL(hubPublicUrl());
+    target.searchParams.set('return', 'siwm');
+    res.redirect(302, target.toString());
+  });
+
+  app.post('/api/platform/provision', verifyHubPlatformRequest, async (req: any, res) => {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const organization = body.organization && typeof body.organization === 'object' ? body.organization : {};
+    const user = body.user && typeof body.user === 'object' ? body.user : {};
+    try {
+      const local = await provisionHubWarehouse({
+        organization: {
+          id: String(organization.id || ''),
+          name: String(organization.name || ''),
+          slug: String(organization.slug || ''),
+        },
+        user: {
+          id: String(user.id || ''),
+          email: String(user.email || ''),
+          name: String(user.name || ''),
+        },
+        role: body.role,
+        plan: body.plan || 'hub',
+        entitlement: { product: 'siwm', enabled: true, access: 'owner' },
+      });
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        provisioned: true,
+        organizationId: local.organizationId,
+        ownerHubUserId: local.hubUserId,
+        warehouseId: local.warehouseId,
+        userId: local.userId,
+      });
+    } catch (error: any) {
+      console.warn('[V79 Hub] SIWM provisioning denied:', error?.message || error);
+      res.status(409).json({ error: 'SIWM warehouse provisioning could not be completed.' });
+    }
+  });
+
+  app.get('/api/platform/summary/:organizationId', verifyHubPlatformRequest, async (req, res) => {
+    const organizationId = String(req.params.organizationId || '').trim();
+    if (!/^[A-Za-z0-9._:@-]{8,180}$/.test(organizationId)) {
+      return res.status(400).json({ error: 'Invalid Hub organization identifier.' });
+    }
+    try {
+      const warehouse = await findWarehouseByHubOrganizationId(organizationId);
+      if (!warehouse) return res.status(404).json({ error: 'SIWM warehouse not found.' });
+      const [items, transactions, suppliers, purchaseOrders, users] = await Promise.all([
+        getItems(warehouse.id),
+        getTransactions(warehouse.id),
+        getSuppliers(warehouse.id),
+        getPurchaseOrders(warehouse.id),
+        getWarehouseUsers(warehouse.id),
+      ]);
+      const activeItems = items.filter((item: any) => !item.isArchived && !item.is_archived);
+      const totalUnits = activeItems.reduce((sum: number, item: any) => sum + Number(item.quantity || 0), 0);
+      const lowStock = activeItems.filter((item: any) => Number(item.quantity || 0) <= Number(item.minThreshold ?? item.min_threshold ?? 0)).length;
+      const inventoryValue = activeItems.reduce((sum: number, item: any) =>
+        sum + Number(item.quantity || 0) * Number(item.price || 0), 0);
+      const openPurchaseOrders = purchaseOrders.filter((po: any) =>
+        !['CLOSED', 'CANCELLED', 'RECEIVED'].includes(String(po.status || '').toUpperCase())
+      ).length;
+      res.json({
+        product: 'siwm',
+        subjectId: warehouse.id,
+        warehouse: { name: warehouse.name, hubOrganizationId: organizationId },
+        metrics: {
+          itemCount: activeItems.length,
+          totalUnits,
+          lowStockItems: lowStock,
+          inventoryValue,
+          suppliers: suppliers.length,
+          openPurchaseOrders,
+          transactions: transactions.length,
+          teamMembers: users.length,
+        },
+        generatedAt: new Date().toISOString(),
+      });
+    } catch (error: any) {
+      console.error('[V79 Hub] SIWM summary failed:', error?.message || error);
+      res.status(500).json({ error: 'Unable to build SIWM platform summary.' });
+    }
+  });
+
+  app.get('/api/platform/launch', async (req, res) => {
+    const ticket = String(req.query.ticket || '').trim();
+    if (!/^[A-Za-z0-9_-]{32,180}$/.test(ticket)) return res.status(400).send('Invalid V79 Hub launch ticket.');
+    try {
+      const hubSession = await consumeHubLaunchTicket(ticket);
+      const local = await provisionHubWarehouse(hubSession);
+      const token = jwt.sign({
+        id: local.userId,
+        email: local.email,
+        name: local.name,
+        warehouseId: local.warehouseId,
+        tokenVersion: local.tokenVersion,
+        hubManaged: true,
+        hubOrganizationId: local.organizationId,
+      }, JWT_SECRET, { expiresIn: '30m' });
+      await logSystemAudit({
+        warehouseId: local.warehouseId,
+        action: 'HUB_LOGIN_SUCCESS',
+        category: 'SECURITY',
+        details: `V79 Hub owner session started for ${local.email}.`,
+        operator: local.name,
+        operatorId: local.userId,
+        status: 'SUCCESS',
+      });
+      res.setHeader('Cache-Control', 'no-store');
+      res.redirect(302, `/#hub_token=${encodeURIComponent(token)}`);
+    } catch (error: any) {
+      console.warn('[V79 Hub] SIWM launch denied:', error?.message || error);
+      const target = new URL(hubPublicUrl());
+      target.searchParams.set('return', 'siwm');
+      target.searchParams.set('error', 'launch_denied');
+      res.redirect(302, target.toString());
+    }
   });
 
   // --- Authentication & Multi-Tenant Registry Endpoints ---
@@ -379,9 +513,33 @@ async function startServer() {
 
   // --- Secure Scoped Data API Endpoints ---
 
-  // Fetch all warehouses for the authenticated operator (max 2)
+  app.get('/api/auth/me', authenticateToken, async (req: any, res) => {
+    try {
+      const [currentUser, currentWarehouse] = await Promise.all([
+        findUserById(req.user.id),
+        findWarehouseById(req.user.warehouseId),
+      ]);
+      if (!currentUser || !currentWarehouse) return res.status(404).json({ error: 'SIWM session identity not found.' });
+      res.setHeader('Cache-Control', 'no-store');
+      res.json({
+        user: { id: currentUser.id, email: currentUser.email, name: currentUser.name },
+        warehouse: currentWarehouse,
+        hubManaged: req.user.hubManaged === true,
+      });
+    } catch (err: any) {
+      res.status(500).json({ error: 'Unable to read current SIWM session.', details: err.message });
+    }
+  });
+
+  // Fetch all warehouses for the authenticated operator (max 2).
+  // Hub-managed sessions are pinned to one Hub organization and must never
+  // use SIWM's native warehouse switcher to cross that boundary.
   app.get('/api/auth/warehouses', authenticateToken, async (req: any, res) => {
     try {
+      if (req.user.hubManaged === true) {
+        const current = await findWarehouseById(req.user.warehouseId);
+        return res.json({ warehouses: current ? [current] : [] });
+      }
       const warehousesList = await getUserWarehouses(req.user.id);
       res.json({ warehouses: warehousesList });
     } catch (err: any) {
@@ -393,6 +551,9 @@ async function startServer() {
   // Create an additional warehouse (max 2 warehouses per account)
   app.post('/api/auth/warehouses/create', authenticateToken, async (req: any, res) => {
     try {
+      if (req.user.hubManaged === true) {
+        return res.status(403).json({ error: 'Hub-managed SIWM sessions are pinned to their Hub workspace.' });
+      }
       const { name, address } = req.body;
       if (!name) {
         res.status(400).json({ error: 'Warehouse designation is required.' });
@@ -446,6 +607,9 @@ async function startServer() {
   // Join an existing warehouse via access clearance code (max 2 warehouses per account)
   app.post('/api/auth/warehouses/join', authenticateToken, async (req: any, res) => {
     try {
+      if (req.user.hubManaged === true) {
+        return res.status(403).json({ error: 'Hub-managed SIWM sessions are pinned to their Hub workspace.' });
+      }
       const { code } = req.body;
       if (!code) {
         res.status(400).json({ error: 'Warehouse clearance access code is required.' });
@@ -500,6 +664,9 @@ async function startServer() {
   // Switch active warehouse
   app.post('/api/auth/warehouses/switch', authenticateToken, async (req: any, res) => {
     try {
+      if (req.user.hubManaged === true) {
+        return res.status(403).json({ error: 'Hub-managed SIWM sessions are pinned to their Hub workspace.' });
+      }
       const { warehouseId } = req.body;
       if (!warehouseId) {
         res.status(400).json({ error: 'Target warehouse ID is required.' });
