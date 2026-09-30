@@ -298,6 +298,16 @@ async function runMigrations() {
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_cols INT DEFAULT 5`);
   await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS layout_zones TEXT DEFAULT '[]'`);
   await pool.query(`ALTER TABLE user_warehouses ADD COLUMN IF NOT EXISTS role VARCHAR(50) DEFAULT 'admin'`);
+  await pool.query(`ALTER TABLE warehouses ADD COLUMN IF NOT EXISTS hub_organization_id VARCHAR(180)`);
+  await pool.query(`ALTER TABLE user_warehouses ADD COLUMN IF NOT EXISTS hub_user_id VARCHAR(180)`);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_warehouses_hub_organization
+    ON warehouses(hub_organization_id) WHERE hub_organization_id IS NOT NULL
+  `);
+  await pool.query(`
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_user_warehouses_hub_identity
+    ON user_warehouses(warehouse_id, hub_user_id) WHERE hub_user_id IS NOT NULL
+  `);
 
   // 11. System Audit Logs Table (immutable security, authorization, & operations ledger)
   await pool.query(`
@@ -2541,4 +2551,126 @@ export async function inviteUserToWarehouse(warehouseId: string, email: string, 
 
   await associateUserWithWarehouse(user.id, warehouseId, role);
   return { user, isNewUser, tempPassword };
+}
+
+
+// --- V79 Hub tenant identity links ---
+export async function findWarehouseByHubOrganizationId(hubOrganizationId: string) {
+  const value = String(hubOrganizationId || '').trim();
+  if (!value) return null;
+  if (usePostgres) {
+    const res = await pool.query('SELECT * FROM warehouses WHERE hub_organization_id = $1 LIMIT 1', [value]);
+    return res.rows[0] || null;
+  }
+  const matched = memWarehouses.find(w => w.hub_organization_id === value);
+  return matched ? { ...matched } : null;
+}
+
+export async function findUnlinkedWarehousesByAdminEmail(email: string) {
+  const normalized = String(email || '').trim().toLowerCase();
+  if (!normalized) return [];
+  if (usePostgres) {
+    const res = await pool.query(
+      `SELECT DISTINCT w.*
+       FROM warehouses w
+       JOIN user_warehouses uw ON uw.warehouse_id = w.id
+       JOIN users u ON u.id = uw.user_id
+       WHERE LOWER(u.email) = $1
+         AND LOWER(COALESCE(uw.role, '')) = 'admin'
+         AND w.hub_organization_id IS NULL
+       LIMIT 3`,
+      [normalized]
+    );
+    return res.rows;
+  }
+  const userIds = new Set(
+    memUsers.filter(u => String(u.email || '').trim().toLowerCase() === normalized).map(u => u.id)
+  );
+  const warehouseIds = new Set(
+    memUserWarehouses
+      .filter(uw => userIds.has(uw.user_id) && String(uw.role || '').toLowerCase() === 'admin')
+      .map(uw => uw.warehouse_id)
+  );
+  return memWarehouses
+    .filter(w => warehouseIds.has(w.id) && !w.hub_organization_id)
+    .slice(0, 3)
+    .map(w => ({ ...w }));
+}
+
+export async function linkWarehouseToHubOrganization(warehouseId: string, hubOrganizationId: string) {
+  if (usePostgres) {
+    await pool.query(
+      'UPDATE warehouses SET hub_organization_id = $1 WHERE id = $2',
+      [hubOrganizationId, warehouseId]
+    );
+  } else {
+    const warehouse = memWarehouses.find(w => w.id === warehouseId);
+    if (!warehouse) throw new Error('Warehouse not found.');
+    if (warehouse.hub_organization_id && warehouse.hub_organization_id !== hubOrganizationId) {
+      throw new Error('Warehouse is already linked to another Hub organization.');
+    }
+    warehouse.hub_organization_id = hubOrganizationId;
+  }
+}
+
+export async function findUserByHubWarehouseIdentity(warehouseId: string, hubUserId: string) {
+  if (usePostgres) {
+    const res = await pool.query(
+      `SELECT u.*
+       FROM users u
+       JOIN user_warehouses uw ON uw.user_id = u.id
+       WHERE uw.warehouse_id = $1 AND uw.hub_user_id = $2
+       LIMIT 1`,
+      [warehouseId, hubUserId]
+    );
+    if (!res.rows[0]) return null;
+    const row = res.rows[0];
+    return {
+      id: row.id,
+      email: row.email,
+      passwordHash: row.password_hash,
+      name: row.name,
+      warehouseId: row.warehouse_id,
+      provider: row.provider,
+      providerId: row.provider_id,
+      tokenVersion: row.token_version || 1
+    };
+  }
+  const mapping = memUserWarehouses.find(
+    uw => uw.warehouse_id === warehouseId && uw.hub_user_id === hubUserId
+  );
+  if (!mapping) return null;
+  const user = memUsers.find(u => u.id === mapping.user_id);
+  return user ? { ...user, tokenVersion: user.tokenVersion || 1 } : null;
+}
+
+export async function linkUserWarehouseHubIdentity(
+  userId: string,
+  warehouseId: string,
+  hubUserId: string,
+  role: string = 'admin'
+) {
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO user_warehouses (user_id, warehouse_id, role, hub_user_id)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (user_id, warehouse_id)
+       DO UPDATE SET role = EXCLUDED.role, hub_user_id = EXCLUDED.hub_user_id`,
+      [userId, warehouseId, role, hubUserId]
+    );
+  } else {
+    const conflict = memUserWarehouses.find(
+      uw => uw.warehouse_id === warehouseId && uw.hub_user_id === hubUserId && uw.user_id !== userId
+    );
+    if (conflict) throw new Error('Hub user identity is already linked to another warehouse member.');
+    const existing = memUserWarehouses.find(
+      uw => uw.user_id === userId && uw.warehouse_id === warehouseId
+    );
+    if (existing) {
+      existing.role = role;
+      existing.hub_user_id = hubUserId;
+    } else {
+      memUserWarehouses.push({ user_id: userId, warehouse_id: warehouseId, role, hub_user_id: hubUserId });
+    }
+  }
 }
