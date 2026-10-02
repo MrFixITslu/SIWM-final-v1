@@ -121,7 +121,7 @@ export default function App() {
     const saved = localStorage.getItem('siwm_warehouses');
     return saved ? JSON.parse(saved) : [];
   });
-  const [userRole, setUserRole] = useState<'admin' | 'manager' | 'operator' | 'engineer' | 'viewer'>('viewer');
+  const [userRole, setUserRole] = useState<'admin' | 'manager' | 'operator' | 'viewer'>('viewer');
   const [warehouseUsers, setWarehouseUsers] = useState<any[]>([]);
 
   // Auth form states
@@ -135,6 +135,12 @@ export default function App() {
   const [warehouseCode, setWarehouseCode] = useState('');
   const [authSubmitting, setAuthSubmitting] = useState(false);
   const [authError, setAuthError] = useState('');
+  const [workspaceInviteToken, setWorkspaceInviteToken] = useState<string>(() => {
+    const match = window.location.hash.match(/(?:^#|&)invite=([^&]+)/);
+    return match ? decodeURIComponent(match[1]) : '';
+  });
+  const [workspaceInvitePreview, setWorkspaceInvitePreview] = useState<any>(null);
+  const [invitePreviewLoading, setInvitePreviewLoading] = useState(false);
 
   // Secondary warehouse form states
   const [isSecondWhModalOpen, setIsSecondWhModalOpen] = useState(false);
@@ -327,6 +333,46 @@ export default function App() {
     }
   }, [token]);
 
+  useEffect(() => {
+    if (!workspaceInviteToken) {
+      setWorkspaceInvitePreview(null);
+      return;
+    }
+    let cancelled = false;
+    setInvitePreviewLoading(true);
+    fetch(`/api/auth/invitations/${encodeURIComponent(workspaceInviteToken)}`)
+      .then(async (res) => {
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Invitation is invalid or expired.');
+        if (!cancelled) setWorkspaceInvitePreview(data.invitation);
+      })
+      .catch((err) => {
+        if (!cancelled) {
+          setWorkspaceInvitePreview(null);
+          setAuthError(err.message || 'Invitation is invalid or expired.');
+        }
+      })
+      .finally(() => { if (!cancelled) setInvitePreviewLoading(false); });
+    return () => { cancelled = true; };
+  }, [workspaceInviteToken]);
+
+  const clearWorkspaceInvite = () => {
+    window.history.replaceState(null, document.title, window.location.pathname + window.location.search);
+    setWorkspaceInviteToken('');
+    setWorkspaceInvitePreview(null);
+  };
+
+  const saveAuthenticatedWorkspace = (data: any) => {
+    localStorage.setItem('siwm_token', data.token);
+    localStorage.setItem('siwm_user', JSON.stringify(data.user || user));
+    localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
+    localStorage.setItem('siwm_warehouses', JSON.stringify(data.warehouses || [data.warehouse]));
+    setToken(data.token);
+    if (data.user) setUser(data.user);
+    setWarehouse(data.warehouse);
+    setWarehouses(data.warehouses || [data.warehouse]);
+  };
+
   // --- Auth Handlers ---
   const handleEmailAuth = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -336,79 +382,69 @@ export default function App() {
     try {
       if (isRegisterMode) {
         if (!authEmail || !authPassword || !authName) {
-          setAuthError('Please fill out all required register fields.');
-          setAuthSubmitting(false);
-          return;
-        }
-        if (warehouseOption === 'create' && !warehouseName) {
-          setAuthError('Warehouse designation is required to establish a new tenant space.');
-          setAuthSubmitting(false);
-          return;
-        }
-        if (warehouseOption === 'join' && !warehouseCode) {
-          setAuthError('Warehouse clearance access code is required to join an existing tenant.');
-          setAuthSubmitting(false);
+          setAuthError('Please fill out all required registration fields.');
           return;
         }
 
-        const res = await fetch('/api/auth/register', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            email: authEmail,
-            password: authPassword,
-            name: authName,
-            warehouseOption,
-            warehouseName,
-            warehouseAddress,
-            warehouseCode: warehouseCode.toUpperCase().trim()
-          })
+        const endpoint = workspaceInviteToken ? '/api/auth/invitations/register' : '/api/auth/register';
+        if (!workspaceInviteToken && !warehouseName) {
+          setAuthError('Warehouse designation is required to establish a new workspace.');
+          return;
+        }
+        const body = workspaceInviteToken
+          ? { token: workspaceInviteToken, email: authEmail, password: authPassword, name: authName }
+          : { email: authEmail, password: authPassword, name: authName, warehouseOption: 'create', warehouseName, warehouseAddress };
+
+        const res = await fetch(endpoint, {
+          method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body)
         });
-
         const data = await res.json();
-        if (res.ok) {
-          localStorage.setItem('siwm_token', data.token);
-          localStorage.setItem('siwm_user', JSON.stringify(data.user));
-          localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
-          setToken(data.token);
-          setUser(data.user);
-          setWarehouse(data.warehouse);
-          showToast(`Workspace Established: Welcome to ${data.warehouse.name}`, 'success');
-          confetti({ particleCount: 50, spread: 60 });
-        } else {
-          setAuthError(data.error || 'Failed to complete tenant registration.');
-        }
-      } else {
-        if (!authEmail || !authPassword) {
-          setAuthError('Please enter both your email address and password.');
-          setAuthSubmitting(false);
+        if (!res.ok) {
+          setAuthError(data.error || 'Unable to complete registration.');
           return;
         }
-        const res = await fetch('/api/auth/login', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            email: authEmail,
-            password: authPassword
-          })
-        });
-
-        const data = await res.json();
-        if (res.ok) {
-          localStorage.setItem('siwm_token', data.token);
-          localStorage.setItem('siwm_user', JSON.stringify(data.user));
-          localStorage.setItem('siwm_warehouse', JSON.stringify(data.warehouse));
-          setToken(data.token);
-          setUser(data.user);
-          setWarehouse(data.warehouse);
-          showToast(`Access Granted: Welcome back, ${data.user.name}!`, 'success');
-          confetti({ particleCount: 40, spread: 40 });
-        } else {
-          setAuthError(data.error || 'Invalid authentication credentials.');
-        }
+        saveAuthenticatedWorkspace(data);
+        if (workspaceInviteToken) clearWorkspaceInvite();
+        showToast(`Access Granted: Welcome to ${data.warehouse.name}`, 'success');
+        confetti({ particleCount: 50, spread: 60 });
+        return;
       }
-    } catch (err) {
-      setAuthError('Unable to connect to central authentication endpoint.');
+
+      if (!authEmail || !authPassword) {
+        setAuthError('Please enter both your email address and password.');
+        return;
+      }
+      const loginRes = await fetch('/api/auth/login', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmail, password: authPassword })
+      });
+      const loginData = await loginRes.json();
+      if (!loginRes.ok) {
+        setAuthError(loginData.error || 'Authentication failed.');
+        return;
+      }
+
+      if (workspaceInviteToken) {
+        const acceptRes = await fetch('/api/auth/invitations/accept', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${loginData.token}` },
+          body: JSON.stringify({ token: workspaceInviteToken })
+        });
+        const accepted = await acceptRes.json();
+        if (!acceptRes.ok) {
+          setAuthError(accepted.error || 'Unable to accept workspace invitation.');
+          return;
+        }
+        saveAuthenticatedWorkspace({ ...accepted, user: loginData.user });
+        clearWorkspaceInvite();
+        showToast(`Invitation accepted: ${accepted.warehouse.name}`, 'success');
+      } else {
+        saveAuthenticatedWorkspace(loginData);
+        showToast(`Access Granted: Welcome back, ${loginData.user.name}!`, 'success');
+      }
+      confetti({ particleCount: 40, spread: 40 });
+    } catch {
+      setAuthError('Unable to connect securely. Please try again.');
     } finally {
       setAuthSubmitting(false);
     }
@@ -517,10 +553,11 @@ export default function App() {
   const [inviteForm, setInviteForm] = useState({
     email: '',
     name: '',
-    role: 'operator' as 'admin' | 'manager' | 'operator' | 'engineer' | 'viewer'
+    role: 'operator' as 'admin' | 'manager' | 'operator' | 'viewer'
   });
   const [whSaving, setWhSaving] = useState(false);
   const [inviteSubmitting, setInviteSubmitting] = useState(false);
+  const [lastInviteLink, setLastInviteLink] = useState('');
 
   useEffect(() => {
     if (warehouse) {
@@ -605,7 +642,7 @@ export default function App() {
     }
     setInviteSubmitting(true);
     try {
-      const res = await fetch('/api/warehouse/users', {
+      const res = await fetch('/api/warehouse/invitations', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json',
@@ -619,9 +656,11 @@ export default function App() {
       });
       const data = await res.json();
       if (res.ok) {
-        showToast(data.message || "Operator authorized successfully.", "success");
+        const rawToken = data.invitation?.token || '';
+        const inviteLink = rawToken ? `${window.location.origin}${window.location.pathname}#invite=${encodeURIComponent(rawToken)}` : '';
+        setLastInviteLink(inviteLink);
+        showToast(data.message || "Secure invitation created.", "success");
         setInviteForm({ email: '', name: '', role: 'operator' });
-        await fetchData();
       } else {
         showToast(data.error || "Failed to add operator.", "error");
       }
@@ -1537,12 +1576,14 @@ export default function App() {
           <div className="w-full md:w-[58%] p-8 md:p-10 flex flex-col justify-center" id="auth_right_col">
             <div className="mb-6">
               <h2 className="text-xl font-bold text-white tracking-tight">
-                {isRegisterMode ? 'Establish Your Warehouse Tenant' : 'Operator Secure Access'}
+                {workspaceInviteToken ? (isRegisterMode ? 'Create Account & Accept Invitation' : 'Sign In & Accept Invitation') : (isRegisterMode ? 'Establish Your SWIM Workspace' : 'Operator Secure Access')}
               </h2>
               <p className="text-xs text-slate-400 mt-1">
-                {isRegisterMode 
-                  ? 'Sign up to create your isolated tenant warehouse space or join an active hub.' 
-                  : 'Enter your credentials to connect with your registered warehouse database.'}
+                {workspaceInviteToken
+                  ? (invitePreviewLoading ? 'Validating secure invitation…' : workspaceInvitePreview ? `Invitation to ${workspaceInvitePreview.warehouseName} · ${workspaceInvitePreview.role} · ${workspaceInvitePreview.maskedEmail}` : 'This invitation could not be validated.')
+                  : isRegisterMode
+                  ? 'Create a new isolated shipping, warehouse and inventory workspace.'
+                  : 'Enter your credentials to connect with your registered SWIM workspace.'}
               </p>
             </div>
 
@@ -1605,7 +1646,7 @@ export default function App() {
               </div>
 
               {/* Tenant Configuration Settings (Registration Only) */}
-              {isRegisterMode && (
+              {isRegisterMode && !workspaceInviteToken && (
                 <div className="p-4 bg-slate-950/60 border border-slate-800/80 rounded-xl space-y-4 mt-2" id="tenant_config_box">
                   <div>
                     <span className="text-[10px] font-bold text-indigo-400 uppercase tracking-wider block mb-2">Workspace Tenancy Option</span>
@@ -1623,24 +1664,10 @@ export default function App() {
                         <Building2 className="h-3.5 w-3.5" />
                         Create Workspace
                       </button>
-                      <button
-                        id="btn_select_join_wh"
-                        type="button"
-                        onClick={() => setWarehouseOption('join')}
-                        className={`py-2 px-3 rounded-lg font-bold text-[11px] border transition flex items-center justify-center gap-2 ${
-                          warehouseOption === 'join'
-                            ? 'bg-indigo-500/20 text-indigo-300 border-indigo-500/40'
-                            : 'bg-slate-900 text-slate-500 border-slate-800 hover:text-slate-300'
-                        }`}
-                      >
-                        <KeyRound className="h-3.5 w-3.5" />
-                        Join Workspace
-                      </button>
                     </div>
                   </div>
 
-                  {warehouseOption === 'create' ? (
-                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3" id="create_wh_fields">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3" id="create_wh_fields">
                       <div>
                         <label className="text-[9px] font-bold text-slate-500 uppercase tracking-wider block mb-1">Warehouse Designation *</label>
                         <input 
@@ -1665,21 +1692,6 @@ export default function App() {
                         />
                       </div>
                     </div>
-                  ) : (
-                    <div id="join_wh_fields">
-                      <label className="text-[9px] font-bold text-slate-500 uppercase tracking-wider block mb-1">Clearance Access Code (6 Digits) *</label>
-                      <input 
-                        id="wh_input_code"
-                        type="text"
-                        required={warehouseOption === 'join'}
-                        placeholder="e.g. WH-104928"
-                        maxLength={9}
-                        value={warehouseCode}
-                        onChange={(e) => setWarehouseCode(e.target.value)}
-                        className="w-full bg-slate-900 border border-slate-800 rounded-lg p-2 text-[11px] text-slate-250 outline-none focus:border-indigo-500 font-mono text-center tracking-wider"
-                      />
-                    </div>
-                  )}
                 </div>
               )}
 
@@ -1693,7 +1705,7 @@ export default function App() {
                   <span className="h-4 w-4 border-2 border-white border-t-transparent rounded-full animate-spin"></span>
                 ) : (
                   <>
-                    <span>{isRegisterMode ? 'Verify & Launch Space' : 'Establish Operational Access'}</span>
+                    <span>{workspaceInviteToken ? (isRegisterMode ? 'Create Account & Join' : 'Sign In & Join') : (isRegisterMode ? 'Create SWIM Workspace' : 'Establish Operational Access')}</span>
                     <ArrowRight className="h-4 w-4" />
                   </>
                 )}
@@ -1711,9 +1723,9 @@ export default function App() {
                 }}
                 className="text-indigo-400 hover:text-indigo-300 font-semibold transition"
               >
-                {isRegisterMode 
-                  ? 'Already have an active operator slot? Log In' 
-                  : 'New operator team? Establish Warehouse Tenant'}
+                {isRegisterMode
+                  ? (workspaceInviteToken ? 'Already have a SWIM account? Sign in to accept' : 'Already have a SWIM account? Log In')
+                  : (workspaceInviteToken ? 'New to SWIM? Create an account to accept' : 'New business? Establish a SWIM Workspace')}
               </button>
             </div>
 
@@ -3408,8 +3420,6 @@ export default function App() {
                                       ? 'bg-indigo-500/10 text-indigo-400 border-indigo-500/20' 
                                       : member.role === 'operator' 
                                       ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20' 
-                                      : member.role === 'engineer'
-                                      ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
                                       : 'bg-slate-500/10 text-slate-400 border-slate-500/20'
                                   }`}>
                                     {member.role}
@@ -3438,7 +3448,7 @@ export default function App() {
                       <div className="border-t border-slate-800/80 pt-5 space-y-4">
                         <div className="flex items-center gap-2">
                           <UserPlus className="h-4.5 w-4.5 text-indigo-400" />
-                          <h4 className="text-xs font-bold text-white uppercase tracking-wider">Register & Authorize New Team Member</h4>
+                          <h4 className="text-xs font-bold text-white uppercase tracking-wider">Invite Team Member</h4>
                         </div>
 
                         <form onSubmit={handleInviteUser} className="space-y-3">
@@ -3474,7 +3484,6 @@ export default function App() {
                                 <option value="admin">Administrator (Full control)</option>
                                 <option value="manager">Manager (Manage inventory catalog)</option>
                                 <option value="operator">Operator (Standard logs & shipments)</option>
-                                <option value="engineer">Engineer (Technical field partner)</option>
                                 <option value="viewer">Viewer (Read-only access)</option>
                               </select>
                             </div>
@@ -3483,12 +3492,22 @@ export default function App() {
                               disabled={inviteSubmitting}
                               className="px-4 bg-indigo-600 hover:bg-indigo-500 disabled:bg-indigo-700 text-white text-xs font-bold rounded-lg transition shrink-0"
                             >
-                              {inviteSubmitting ? 'Authorizing...' : 'Invite Operator'}
+                              {inviteSubmitting ? 'Creating invite…' : 'Create Secure Invite'}
                             </button>
                           </div>
                           <p className="text-[10px] text-slate-500">
-                            Inviting a new email automatically generates a unique temporary password, shown once after the invite is sent.
+                            SWIM creates a single-use invitation link that expires after 72 hours. Passwords are never generated or exposed to workspace administrators.
                           </p>
+                          {lastInviteLink && (
+                            <div className="rounded-xl border border-emerald-500/20 bg-emerald-500/[0.06] p-3">
+                              <div className="text-[9px] font-black uppercase tracking-wider text-emerald-300">One-time invitation link</div>
+                              <div className="mt-2 flex gap-2">
+                                <input readOnly value={lastInviteLink} className="min-w-0 flex-1 bg-[#07121f] border border-[#244560] rounded-lg px-2.5 py-2 text-[9px] text-slate-400 font-mono" />
+                                <button type="button" onClick={() => navigator.clipboard.writeText(lastInviteLink).then(() => showToast('Invitation link copied.', 'success'))} className="px-3 rounded-lg border border-emerald-500/25 bg-emerald-500/10 text-[9px] font-bold text-emerald-300">Copy</button>
+                              </div>
+                              <p className="mt-2 text-[9px] text-slate-600">Share this link only with the invited person. Creating a replacement invite revokes the previous unused link for that email.</p>
+                            </div>
+                          )}
                         </form>
                       </div>
                     ) : (
