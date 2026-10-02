@@ -13,6 +13,7 @@ import {
   logSystemAudit,
   getSwimShipment,
   getSwimReplenishmentPolicy,
+  getSwimTrackingSubscription,
   listSwimChildShipments,
   listSwimBusinessEvents,
   listSwimLogisticsUnits,
@@ -33,6 +34,7 @@ import { canContain, type LogisticsUnitType } from '../src/domain/shipping.js';
 import { detectCarrier, summarizeTracking } from '../src/domain/tracking.js';
 import { buildReplenishmentForecast } from './replenishment-service.js';
 import { buildOperationsInbox } from './operations-service.js';
+import { refreshShipmentTracking, subscribeShipmentTracking } from './tracking-service.js';
 
 const shipmentStatus = z.enum(['PLANNED','BOOKED','IN_TRANSIT','CUSTOMS','RECEIVED','DELIVERED','EXCEPTION','CANCELLED']);
 const shipmentMode = z.enum(['PARCEL','AIR','OCEAN','GROUND','COURIER','INTER_ISLAND']);
@@ -211,11 +213,12 @@ export function createSwimRouter() {
     try {
       const shipment = await getSwimShipment(req.user.warehouseId, req.params.id);
       if (!shipment) { res.status(404).json({ error: 'Shipment not found.' }); return; }
-      const [tracking, units, legs, childShipments] = await Promise.all([
+      const [tracking, units, legs, childShipments, trackingSubscription] = await Promise.all([
         listSwimTrackingCheckpoints(req.user.warehouseId, shipment.id),
         listSwimLogisticsUnits(req.user.warehouseId, shipment.id),
         listSwimShipmentLegs(req.user.warehouseId, shipment.id),
         listSwimChildShipments(req.user.warehouseId, shipment.id),
+        getSwimTrackingSubscription(req.user.warehouseId, shipment.id),
       ]);
       res.json({
         shipment,
@@ -224,6 +227,7 @@ export function createSwimRouter() {
         logisticsUnits: units,
         legs,
         childShipments,
+        trackingSubscription,
       });
     } catch (error) {
       console.error('SWIM shipment detail error:', error);
@@ -278,20 +282,80 @@ export function createSwimRouter() {
     }
   });
 
+  router.get('/shipments/:id/tracking-subscription', requirePermission('tracking.read'), async (req: any, res) => {
+    try {
+      const shipment = await getSwimShipment(req.user.warehouseId, req.params.id);
+      if (!shipment) {
+        res.status(404).json({ error: 'Shipment not found.' });
+        return;
+      }
+      res.json({
+        subscription: await getSwimTrackingSubscription(req.user.warehouseId, req.params.id),
+      });
+    } catch (error) {
+      res.status(500).json({ error: 'Unable to retrieve tracking subscription.' });
+    }
+  });
+
+  router.post('/shipments/:id/tracking/subscribe', requirePermission('tracking.write'), async (req: any, res) => {
+    try {
+      const result = await subscribeShipmentTracking({
+        warehouseId: req.user.warehouseId,
+        shipmentId: req.params.id,
+        actorId: req.user.id,
+      });
+      res.status(201).json(result);
+    } catch (error: any) {
+      const message = error?.message || 'Unable to subscribe shipment tracking.';
+      const configurationError = /not configured|not supported/i.test(message);
+      console.error('SWIM tracking subscription error:', {
+        shipmentId: req.params.id,
+        reason: message,
+      });
+      res.status(configurationError ? 503 : 400).json({
+        error: configurationError
+          ? 'Shipment tracking provider is not available.'
+          : message,
+      });
+    }
+  });
+
+  router.post('/shipments/:id/tracking/refresh', requirePermission('tracking.write'), async (req: any, res) => {
+    try {
+      res.json(await refreshShipmentTracking({
+        warehouseId: req.user.warehouseId,
+        shipmentId: req.params.id,
+        actorId: req.user.id,
+      }));
+    } catch (error: any) {
+      const message = error?.message || 'Unable to refresh shipment tracking.';
+      const providerFailure = /AfterShip|provider|timed out|temporarily unavailable/i.test(message);
+      console.error('SWIM tracking refresh error:', {
+        shipmentId: req.params.id,
+        reason: message,
+      });
+      res.status(providerFailure ? 502 : 400).json({
+        error: providerFailure ? 'Tracking provider synchronization failed.' : message,
+      });
+    }
+  });
+
   router.post('/shipments/:id/tracking-events', requirePermission('tracking.write'), async (req: any, res) => {
     const parsed = trackingCheckpointSchema.safeParse(req.body);
     if (!parsed.success) return invalid(res, parsed.error);
     try {
       const checkpoint = { ...parsed.data, id: newId('track') };
       const payloadHash = crypto.createHash('sha256').update(JSON.stringify(parsed.data)).digest('hex');
-      await addSwimTrackingCheckpoint(req.user.warehouseId, req.params.id, { ...checkpoint, payloadHash });
-      await appendSwimBusinessEvent({
-        eventId: newId('evt'), warehouseId: req.user.warehouseId,
-        eventType: checkpoint.status === 'EXCEPTION' ? 'SHIPMENT_DELAYED' : 'SHIPMENT_CHECKPOINT_RECORDED',
-        aggregateType: 'shipment', aggregateId: req.params.id, actorId: req.user.id,
-        occurredAt: checkpoint.occurredAt,
-        payload: { status: checkpoint.status, location: checkpoint.location || null, source: checkpoint.source, carrierEventId: checkpoint.carrierEventId || null },
-      });
+      const stored = await addSwimTrackingCheckpoint(req.user.warehouseId, req.params.id, { ...checkpoint, payloadHash });
+      if (stored.inserted) {
+        await appendSwimBusinessEvent({
+          eventId: newId('evt'), warehouseId: req.user.warehouseId,
+          eventType: checkpoint.status === 'EXCEPTION' ? 'SHIPMENT_DELAYED' : 'SHIPMENT_CHECKPOINT_RECORDED',
+          aggregateType: 'shipment', aggregateId: req.params.id, actorId: req.user.id,
+          occurredAt: checkpoint.occurredAt,
+          payload: { status: checkpoint.status, location: checkpoint.location || null, source: checkpoint.source, carrierEventId: checkpoint.carrierEventId || null },
+        });
+      }
       const tracking = await listSwimTrackingCheckpoints(req.user.warehouseId, req.params.id);
       res.status(201).json({ checkpoint, trackingSummary: summarizeTracking(tracking) });
     } catch (error: any) {
