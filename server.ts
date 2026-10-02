@@ -15,6 +15,7 @@ import {
 } from './server/security.js';
 import { createSwimRouter } from './server/swim-routes.js';
 import { createTrackingWebhookRouter } from './server/tracking-webhooks.js';
+import { createAfterShipWebhookRouter } from './server/aftership-webhooks.js';
 import { 
   initDb, 
   getItems, 
@@ -100,7 +101,9 @@ async function startServer() {
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
   // Carrier webhook signatures must be verified against the exact raw request body.
-  // Mount this ingress before the general JSON parser. Provider secrets remain server-side.
+  // Mount provider-native and normalized ingress before the general JSON parser.
+  // Provider credentials and webhook secrets remain server-side.
+  app.use('/api/integrations/aftership/webhook', createAfterShipWebhookRouter());
   app.use('/api/integrations/tracking', createTrackingWebhookRouter());
 
   // Middleware for normal authenticated JSON requests.
