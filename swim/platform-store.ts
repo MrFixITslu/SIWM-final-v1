@@ -145,9 +145,11 @@ export async function initSwimPlatformStore(): Promise<void> {
       source_title TEXT NOT NULL,
       verified_at TIMESTAMPTZ NOT NULL,
       version VARCHAR(80) NOT NULL,
+      calculation_policy JSONB NOT NULL DEFAULT '{}'::jsonb,
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
+  await swimDbQuery(`ALTER TABLE swim_customs_rules ADD COLUMN IF NOT EXISTS calculation_policy JSONB NOT NULL DEFAULT '{}'::jsonb`);
   await swimDbQuery(`CREATE INDEX IF NOT EXISTS idx_swim_customs_lookup ON swim_customs_rules(jurisdiction_code, hs_code_prefix, effective_from DESC)`);
 
   await swimDbQuery(`
@@ -464,9 +466,9 @@ export async function upsertCustomsRules(
         id, jurisdiction_code, hs_code_prefix, description,
         import_duty_rate, vat_rate, customs_service_rate, excise_rate,
         environmental_levy_rate, other_rate, effective_from, effective_to,
-        official_source_url, source_title, verified_at, version
+        official_source_url, source_title, verified_at, version, calculation_policy
       ) VALUES (
-        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17::jsonb
       )
       ON CONFLICT (id) DO UPDATE SET
         jurisdiction_code = EXCLUDED.jurisdiction_code,
@@ -483,7 +485,8 @@ export async function upsertCustomsRules(
         official_source_url = EXCLUDED.official_source_url,
         source_title = EXCLUDED.source_title,
         verified_at = EXCLUDED.verified_at,
-        version = EXCLUDED.version`,
+        version = EXCLUDED.version,
+        calculation_policy = EXCLUDED.calculation_policy`,
       [
         rule.id,
         rule.jurisdictionCode.toUpperCase(),
@@ -500,7 +503,8 @@ export async function upsertCustomsRules(
         rule.officialSourceUrl,
         rule.sourceTitle,
         rule.verifiedAt,
-        rule.version
+        rule.version,
+        JSON.stringify(rule.calculationPolicy || {})
       ]
     );
     changed += 1;
@@ -556,7 +560,10 @@ export async function listCustomsRules(
     officialSourceUrl: row.official_source_url,
     sourceTitle: row.source_title,
     verifiedAt: row.verified_at,
-    version: row.version
+    version: row.version,
+    calculationPolicy: row.calculation_policy && Object.keys(row.calculation_policy).length
+      ? row.calculation_policy
+      : undefined
   }));
 }
 
