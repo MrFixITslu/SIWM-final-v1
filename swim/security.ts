@@ -78,3 +78,12 @@ export function verifyHmacSha256(
   const supplied = suppliedSignature.replace(/^sha256=/i, '').trim().toLowerCase();
   return timingSafeEqualString(expected, supplied);
 }
+
+export function verifyHmacSha256Base64(
+  rawBody: Buffer,
+  suppliedSignature: string,
+  secret: string
+): boolean {
+  const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
+  return timingSafeEqualString(expected, String(suppliedSignature || '').trim());
+}
