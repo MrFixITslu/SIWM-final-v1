@@ -14,6 +14,7 @@ import {
   writeRateLimiter,
 } from './server/security.js';
 import { createSwimRouter } from './server/swim-routes.js';
+import { createTrackingWebhookRouter } from './server/tracking-webhooks.js';
 import { 
   initDb, 
   getItems, 
@@ -98,7 +99,11 @@ async function startServer() {
   // Configure the port: runs on PORT (3000) inside AI Studio
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
-  // Middleware for parsing JSON requests
+  // Carrier webhook signatures must be verified against the exact raw request body.
+  // Mount this ingress before the general JSON parser. Provider secrets remain server-side.
+  app.use('/api/integrations/tracking', createTrackingWebhookRouter());
+
+  // Middleware for normal authenticated JSON requests.
   app.use(express.json({ limit: '1mb', strict: true }));
   app.use('/api', writeRateLimiter);
 
