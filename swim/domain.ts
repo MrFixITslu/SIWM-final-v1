@@ -123,6 +123,23 @@ export interface CarrierTrackingSnapshot {
   checkpoints: Omit<TrackingCheckpoint, 'id' | 'warehouseId' | 'shipmentId'>[];
 }
 
+export type CustomsBaseComponent =
+  | 'CUSTOMS_VALUE'
+  | 'IMPORT_DUTY'
+  | 'CUSTOMS_SERVICE_CHARGE'
+  | 'EXCISE'
+  | 'ENVIRONMENTAL_LEVY'
+  | 'OTHER_TAXES';
+
+export interface CustomsCalculationPolicy {
+  importDutyBase?: CustomsBaseComponent[];
+  customsServiceBase?: CustomsBaseComponent[];
+  exciseBase?: CustomsBaseComponent[];
+  environmentalLevyBase?: CustomsBaseComponent[];
+  otherTaxBase?: CustomsBaseComponent[];
+  vatBase?: CustomsBaseComponent[];
+}
+
 export interface CustomsRule {
   id: string;
   jurisdictionCode: string;
@@ -140,6 +157,7 @@ export interface CustomsRule {
   sourceTitle: string;
   verifiedAt: string;
   version: string;
+  calculationPolicy?: CustomsCalculationPolicy;
 }
 
 export interface LandedCostInput {
