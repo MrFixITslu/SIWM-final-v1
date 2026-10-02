@@ -87,3 +87,22 @@ export function verifyHmacSha256Base64(
   const expected = crypto.createHmac('sha256', secret).update(rawBody).digest('base64');
   return timingSafeEqualString(expected, String(suppliedSignature || '').trim());
 }
+
+export function newWarehouseJoinCode(): string {
+  const value = crypto.randomInt(0, 36 ** 8);
+  return `WH-${value.toString(36).toUpperCase().padStart(8, '0')}`;
+}
+
+export function validatePasswordPolicy(value: unknown): string | undefined {
+  const password = String(value || '');
+  if (password.length < 12) {
+    return 'Password must be at least 12 characters long.';
+  }
+  if (password.length > 128) {
+    return 'Password must be 128 characters or fewer.';
+  }
+  if (/^\s+$/.test(password)) {
+    return 'Password cannot contain only spaces.';
+  }
+  return undefined;
+}
