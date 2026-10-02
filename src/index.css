@@ -6,3 +6,27 @@
     background-color: #f8fafc;
   }
 }
+
+
+/* V79 Digital SIWM premium operations theme */
+.v79-siwm-app{--siwm-bg:#07111f;--siwm-panel:#091728;--siwm-panel2:#0b1a2c;--siwm-border:#1a3854;--siwm-blue:#0a86ff;--siwm-teal:#14b8a6;color-scheme:dark;background:var(--siwm-bg)}
+.v79-siwm-app .bg-slate-950{background-color:#07111f!important}
+.v79-siwm-app .bg-slate-900,.v79-siwm-app .bg-slate-900\/60{background-color:#091728!important}
+.v79-siwm-app .bg-slate-850,.v79-siwm-app .bg-slate-800{background-color:#0b1a2c!important}
+.v79-siwm-app .border-slate-800,.v79-siwm-app .border-slate-800\/80,.v79-siwm-app .border-slate-850{border-color:#1a3854!important}
+.v79-siwm-app .text-indigo-400,.v79-siwm-app .text-indigo-300{color:#74d0ff!important}
+.v79-siwm-app .bg-indigo-600{background:#0a86ff!important}
+.v79-siwm-app .bg-indigo-500\/10{background-color:rgba(10,134,255,.10)!important}
+.v79-siwm-app .border-indigo-500\/15,.v79-siwm-app .border-indigo-500\/20,.v79-siwm-app .border-indigo-500\/30{border-color:rgba(10,134,255,.28)!important}
+.v79-siwm-app input,.v79-siwm-app select,.v79-siwm-app textarea{background:#07121f!important;border-color:#244560!important;color:#e8eef7!important}
+.v79-siwm-app input::placeholder,.v79-siwm-app textarea::placeholder{color:#526276!important}
+.v79-siwm-app input:focus,.v79-siwm-app select:focus,.v79-siwm-app textarea:focus{border-color:rgba(20,184,166,.65)!important;box-shadow:0 0 0 3px rgba(20,184,166,.10)!important}
+.v79-siwm-app #dashboard_stats_grid>div{position:relative;overflow:hidden;box-shadow:0 16px 42px rgba(0,0,0,.12);transition:transform .18s ease,border-color .18s ease}
+.v79-siwm-app #dashboard_stats_grid>div:hover{transform:translateY(-2px);border-color:#2b5275!important}
+.v79-siwm-app #dashboard_stats_grid>div::after{content:"";position:absolute;width:110px;height:110px;border-radius:999px;right:-48px;top:-58px;background:rgba(10,134,255,.09);filter:blur(5px);pointer-events:none}
+.v79-siwm-app table,.v79-siwm-app tr{border-color:#18324b!important}
+.v79-siwm-app ::-webkit-scrollbar{width:9px;height:9px}
+.v79-siwm-app ::-webkit-scrollbar-track{background:#06101d}
+.v79-siwm-app ::-webkit-scrollbar-thumb{background:#1d3d59;border-radius:999px;border:2px solid #06101d}
+.v79-siwm-app ::-webkit-scrollbar-thumb:hover{background:#2c5677}
+.v79-siwm-app :where(button,a,input,select,textarea,[tabindex]):focus-visible{outline-color:#14b8a6}
