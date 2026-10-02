@@ -3544,6 +3544,121 @@ export async function upsertSwimReplenishmentPolicy(input: {
   return mapReplenishmentPolicy(record);
 }
 
+export async function upsertSwimCustomsRules(
+  rules: Array<CustomsChargeRule & { active?: boolean }>,
+): Promise<{ imported: number }> {
+  if (!rules.length) return { imported: 0 };
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      for (const rule of rules) {
+        await client.query(
+          `INSERT INTO swim_customs_rules (
+            id, destination_country, hs_code_prefix, charge_code, label, sequence, basis,
+            rate_bps, fixed_amount_minor, effective_from, effective_to, eligible_origins,
+            excluded_origins, required_concession_code, authority, source_url, verified_at, active
+          ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13::jsonb,$14,$15,$16,$17,$18)
+          ON CONFLICT (id) DO UPDATE SET
+            destination_country=EXCLUDED.destination_country,
+            hs_code_prefix=EXCLUDED.hs_code_prefix,
+            charge_code=EXCLUDED.charge_code,
+            label=EXCLUDED.label,
+            sequence=EXCLUDED.sequence,
+            basis=EXCLUDED.basis,
+            rate_bps=EXCLUDED.rate_bps,
+            fixed_amount_minor=EXCLUDED.fixed_amount_minor,
+            effective_from=EXCLUDED.effective_from,
+            effective_to=EXCLUDED.effective_to,
+            eligible_origins=EXCLUDED.eligible_origins,
+            excluded_origins=EXCLUDED.excluded_origins,
+            required_concession_code=EXCLUDED.required_concession_code,
+            authority=EXCLUDED.authority,
+            source_url=EXCLUDED.source_url,
+            verified_at=EXCLUDED.verified_at,
+            active=EXCLUDED.active`,
+          [
+            rule.id,
+            rule.destinationCountry.toUpperCase(),
+            rule.hsCodePrefix,
+            rule.chargeCode,
+            rule.label,
+            rule.sequence,
+            rule.basis,
+            rule.rateBps ?? null,
+            rule.fixedAmountMinor ?? null,
+            rule.effectiveFrom,
+            rule.effectiveTo || null,
+            JSON.stringify(rule.eligibleOrigins || null),
+            JSON.stringify(rule.excludedOrigins || null),
+            rule.requiredConcessionCode || null,
+            rule.source.authority,
+            rule.source.sourceUrl,
+            rule.source.verifiedAt,
+            rule.active !== false,
+          ],
+        );
+      }
+      await client.query('COMMIT');
+      return { imported: rules.length };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  for (const rule of rules) {
+    const index = memCustomsRules.findIndex((entry) => entry.id === rule.id);
+    const next = { ...rule, destinationCountry: rule.destinationCountry.toUpperCase(), active: rule.active !== false };
+    if (index >= 0) memCustomsRules[index] = next;
+    else memCustomsRules.push(next);
+  }
+  return { imported: rules.length };
+}
+
+export async function listAllSwimCustomsRules(
+  destinationCountry?: string,
+): Promise<Array<CustomsChargeRule & { active: boolean }>> {
+  if (usePostgres) {
+    const params: any[] = [];
+    let sql = 'SELECT * FROM swim_customs_rules';
+    if (destinationCountry) {
+      params.push(destinationCountry.toUpperCase());
+      sql += ' WHERE destination_country=$1';
+    }
+    sql += ' ORDER BY destination_country, hs_code_prefix, sequence, effective_from DESC';
+    const result = await pool.query(sql, params);
+    return result.rows.map((row: any) => ({
+      id: row.id,
+      destinationCountry: row.destination_country,
+      hsCodePrefix: row.hs_code_prefix,
+      chargeCode: row.charge_code,
+      label: row.label,
+      sequence: row.sequence,
+      basis: row.basis,
+      rateBps: row.rate_bps ?? undefined,
+      fixedAmountMinor: row.fixed_amount_minor == null ? undefined : Number(row.fixed_amount_minor),
+      effectiveFrom: row.effective_from.toISOString?.().slice(0,10) || String(row.effective_from),
+      effectiveTo: row.effective_to ? (row.effective_to.toISOString?.().slice(0,10) || String(row.effective_to)) : undefined,
+      eligibleOrigins: row.eligible_origins || undefined,
+      excludedOrigins: row.excluded_origins || undefined,
+      requiredConcessionCode: row.required_concession_code || undefined,
+      source: {
+        authority: row.authority,
+        sourceUrl: row.source_url,
+        verifiedAt: new Date(row.verified_at).toISOString(),
+      },
+      active: row.active !== false,
+    }));
+  }
+
+  return memCustomsRules
+    .filter((rule) => !destinationCountry || rule.destinationCountry === destinationCountry.toUpperCase())
+    .map((rule) => ({ ...rule, active: rule.active !== false }));
+}
+
 export async function getSwimCustomsRules(destinationCountry: string, valuationDate: string): Promise<CustomsChargeRule[]> {
   if (usePostgres) {
     const result = await pool.query(
