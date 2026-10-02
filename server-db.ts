@@ -9,7 +9,7 @@ import {
   INITIAL_TRANSACTIONS 
 } from './src/mockData.js';
 import { sealEvent, verifyEventChain, type SwimBusinessEvent } from './src/domain/events.js';
-import type { ShipmentRecord, LogisticsUnit } from './src/domain/shipping.js';
+import { canConsolidateShipment, validateShipmentLegSequence, type ShipmentRecord, type LogisticsUnit, type ShipmentLeg } from './src/domain/shipping.js';
 import type { TrackingCheckpoint } from './src/domain/tracking.js';
 import type { CustomsChargeRule, CustomsEstimate, CustomsEstimateInput } from './src/domain/customs.js';
 import { normalizeRole } from './src/domain/permissions.js';
@@ -178,6 +178,7 @@ let memAuditLogs: any[] = [];
 
 let memDispatchRecords: any[] = [];
 let memShipments: any[] = [];
+let memShipmentLegs: any[] = [];
 let memTrackingEvents: any[] = [];
 let memLogisticsUnits: any[] = [];
 let memCustomsRules: any[] = [];
@@ -461,6 +462,32 @@ async function runMigrations() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_warehouse_status ON swim_shipments(warehouse_id, status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_tracking ON swim_shipments(warehouse_id, tracking_number)`);
+  await pool.query(`ALTER TABLE swim_shipments ADD COLUMN IF NOT EXISTS parent_shipment_id VARCHAR(80) REFERENCES swim_shipments(id) ON DELETE SET NULL`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_parent ON swim_shipments(warehouse_id, parent_shipment_id)`);
+
+  // Multi-leg journey model: supplier -> forwarder -> air/ocean -> customs -> final warehouse.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_shipment_legs (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      shipment_id VARCHAR(80) NOT NULL REFERENCES swim_shipments(id) ON DELETE CASCADE,
+      sequence INTEGER NOT NULL CHECK (sequence > 0),
+      mode VARCHAR(30) NOT NULL,
+      carrier VARCHAR(100),
+      service VARCHAR(120),
+      origin TEXT NOT NULL,
+      destination TEXT NOT NULL,
+      tracking_number VARCHAR(220),
+      planned_departure_at TIMESTAMPTZ,
+      planned_arrival_at TIMESTAMPTZ,
+      actual_departure_at TIMESTAMPTZ,
+      actual_arrival_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (warehouse_id, shipment_id, sequence)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_legs_shipment ON swim_shipment_legs(warehouse_id, shipment_id, sequence)`);
 
   // 14. Normalized carrier checkpoints. Raw provider payloads are not retained by default.
   await pool.query(`
@@ -2966,6 +2993,7 @@ function mapShipmentRow(row: any): ShipmentRecord {
     purchaseOrderId: row.purchase_order_id || row.purchaseOrderId || undefined,
     supplierId: row.supplier_id || row.supplierId || undefined,
     customerOrderReference: row.customer_order_reference || row.customerOrderReference || undefined,
+    parentShipmentId: row.parent_shipment_id || row.parentShipmentId || undefined,
     origin: row.origin || undefined,
     destination: row.destination || undefined,
     estimatedArrivalAt: row.estimated_arrival_at ? new Date(row.estimated_arrival_at).toISOString() : row.estimatedArrivalAt,
@@ -3020,14 +3048,14 @@ export async function createSwimShipment(
     const result = await pool.query(
       `INSERT INTO swim_shipments (
         id, warehouse_id, reference, mode, status, carrier, tracking_number, tracking_provider,
-        purchase_order_id, supplier_id, customer_order_reference, origin, destination,
+        purchase_order_id, supplier_id, customer_order_reference, parent_shipment_id, origin, destination,
         estimated_arrival_at, latest_location, latest_tracking_status, created_at, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$18)
       RETURNING *`,
       [shipment.id, warehouseId, shipment.reference, shipment.mode, shipment.status,
        shipment.carrier || null, shipment.trackingNumber || null, shipment.trackingProvider || null,
        shipment.purchaseOrderId || null, shipment.supplierId || null, shipment.customerOrderReference || null,
-       shipment.origin || null, shipment.destination || null, shipment.estimatedArrivalAt || null,
+       shipment.parentShipmentId || null, shipment.origin || null, shipment.destination || null, shipment.estimatedArrivalAt || null,
        shipment.latestLocation || null, shipment.latestTrackingStatus || null, now],
     );
     return mapShipmentRow(result.rows[0]);
@@ -3059,6 +3087,133 @@ export async function getSwimShipment(warehouseId: string, shipmentId: string): 
     return result.rows[0] ? mapShipmentRow(result.rows[0]) : null;
   }
   return memShipments.find((shipment) => shipment.warehouseId === warehouseId && shipment.id === shipmentId) || null;
+}
+
+export async function listSwimShipmentLegs(warehouseId: string, shipmentId: string): Promise<ShipmentLeg[]> {
+  if (!await getSwimShipment(warehouseId, shipmentId)) throw new Error('Shipment not found in this workspace.');
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT id, sequence, mode, carrier, service, origin, destination, tracking_number,
+              planned_departure_at, planned_arrival_at, actual_departure_at, actual_arrival_at
+       FROM swim_shipment_legs
+       WHERE warehouse_id=$1 AND shipment_id=$2
+       ORDER BY sequence ASC`,
+      [warehouseId, shipmentId],
+    );
+    return result.rows.map((row: any) => ({
+      id: row.id,
+      sequence: row.sequence,
+      mode: row.mode,
+      carrier: row.carrier || undefined,
+      service: row.service || undefined,
+      origin: row.origin,
+      destination: row.destination,
+      trackingNumber: row.tracking_number || undefined,
+      plannedDepartureAt: row.planned_departure_at ? new Date(row.planned_departure_at).toISOString() : undefined,
+      plannedArrivalAt: row.planned_arrival_at ? new Date(row.planned_arrival_at).toISOString() : undefined,
+      actualDepartureAt: row.actual_departure_at ? new Date(row.actual_departure_at).toISOString() : undefined,
+      actualArrivalAt: row.actual_arrival_at ? new Date(row.actual_arrival_at).toISOString() : undefined,
+    }));
+  }
+  return memShipmentLegs
+    .filter((leg) => leg.warehouseId === warehouseId && leg.shipmentId === shipmentId)
+    .sort((a, b) => a.sequence - b.sequence)
+    .map(({ warehouseId: _warehouseId, shipmentId: _shipmentId, ...leg }) => leg);
+}
+
+export async function saveSwimShipmentLeg(
+  warehouseId: string,
+  shipmentId: string,
+  leg: ShipmentLeg,
+): Promise<ShipmentLeg> {
+  const shipment = await getSwimShipment(warehouseId, shipmentId);
+  if (!shipment) throw new Error('Shipment not found in this workspace.');
+  const existing = await listSwimShipmentLegs(warehouseId, shipmentId);
+  const validation = validateShipmentLegSequence([...existing, leg]);
+  if (!validation.valid) throw new Error(validation.reason);
+
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO swim_shipment_legs (
+        id, warehouse_id, shipment_id, sequence, mode, carrier, service, origin, destination,
+        tracking_number, planned_departure_at, planned_arrival_at, actual_departure_at, actual_arrival_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)`,
+      [leg.id, warehouseId, shipmentId, leg.sequence, leg.mode, leg.carrier || null, leg.service || null,
+       leg.origin, leg.destination, leg.trackingNumber || null, leg.plannedDepartureAt || null,
+       leg.plannedArrivalAt || null, leg.actualDepartureAt || null, leg.actualArrivalAt || null],
+    );
+  } else {
+    memShipmentLegs.push({ ...leg, warehouseId, shipmentId });
+  }
+  return leg;
+}
+
+export async function consolidateSwimShipments(
+  warehouseId: string,
+  masterShipmentId: string,
+  childShipmentIds: string[],
+): Promise<{ master: ShipmentRecord; children: ShipmentRecord[] }> {
+  const uniqueChildIds = [...new Set(childShipmentIds)].filter(Boolean);
+  if (!uniqueChildIds.length) throw new Error('At least one child shipment is required.');
+  if (uniqueChildIds.includes(masterShipmentId)) throw new Error('A shipment cannot contain itself.');
+
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const ids = [masterShipmentId, ...uniqueChildIds];
+      const result = await client.query(
+        `SELECT * FROM swim_shipments
+         WHERE warehouse_id=$1 AND id = ANY($2::varchar[])
+         FOR UPDATE`,
+        [warehouseId, ids],
+      );
+      const records = result.rows.map(mapShipmentRow);
+      const master = records.find((record) => record.id === masterShipmentId);
+      if (!master) throw new Error('Master shipment was not found in this workspace.');
+      if (master.parentShipmentId) throw new Error('A shipment already inside another consolidation cannot become a master shipment.');
+      const children = uniqueChildIds.map((id) => {
+        const child = records.find((record) => record.id === id);
+        if (!child) throw new Error('One or more child shipments were not found in this workspace.');
+        const decision = canConsolidateShipment(master, child);
+        if (!decision.allowed) throw new Error(decision.reason);
+        return child;
+      });
+      await client.query(
+        `UPDATE swim_shipments
+         SET parent_shipment_id=$1, updated_at=CURRENT_TIMESTAMP
+         WHERE warehouse_id=$2 AND id = ANY($3::varchar[])`,
+        [masterShipmentId, warehouseId, uniqueChildIds],
+      );
+      await client.query('COMMIT');
+      return {
+        master,
+        children: children.map((child) => ({ ...child, parentShipmentId: masterShipmentId })),
+      };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+
+  const master = memShipments.find((entry) => entry.warehouseId === warehouseId && entry.id === masterShipmentId);
+  if (!master) throw new Error('Master shipment was not found in this workspace.');
+  if (master.parentShipmentId) throw new Error('A shipment already inside another consolidation cannot become a master shipment.');
+  const children = uniqueChildIds.map((id) => {
+    const child = memShipments.find((entry) => entry.warehouseId === warehouseId && entry.id === id);
+    if (!child) throw new Error('One or more child shipments were not found in this workspace.');
+    const decision = canConsolidateShipment(master, child);
+    if (!decision.allowed) throw new Error(decision.reason);
+    return child;
+  });
+  memShipments = memShipments.map((entry) =>
+    entry.warehouseId === warehouseId && uniqueChildIds.includes(entry.id)
+      ? { ...entry, parentShipmentId: masterShipmentId, updatedAt: new Date().toISOString() }
+      : entry,
+  );
+  return { master, children: children.map((child) => ({ ...child, parentShipmentId: masterShipmentId })) };
 }
 
 function trackingToShipmentStatus(status: TrackingCheckpoint['status']): ShipmentRecord['status'] {
