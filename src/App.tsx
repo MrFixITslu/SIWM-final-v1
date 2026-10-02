@@ -37,6 +37,7 @@ import {
   Layers,
   Tag,
   Truck,
+  Landmark,
   Activity
 } from 'lucide-react';
 import { 
@@ -61,6 +62,7 @@ import { AuditLedgerView } from './components/AuditLedgerView';
 import { PersonnelDispatchesView } from './components/PersonnelDispatchesView';
 import { PurchaseOrdersManager } from './components/PurchaseOrdersManager';
 import { ShippingControlTower } from './components/ShippingControlTower';
+import { CustomsLandedCost } from './components/CustomsLandedCost';
 
 import { 
   InventoryItem, 
@@ -451,7 +453,7 @@ export default function App() {
   };
 
   // --- UI Navigation ---
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'shipping' | 'inventory' | 'map' | 'history' | 'suppliers' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'shipping' | 'customs' | 'inventory' | 'map' | 'history' | 'suppliers' | 'settings'>('dashboard');
   const [historySubTab, setHistorySubTab] = useState<'movements' | 'dispatches' | 'audit'>('movements');
 
   // --- Search & Filter States ---
@@ -1889,6 +1891,22 @@ export default function App() {
                 <ChevronRight className="h-4 w-4 opacity-40 group-hover:opacity-100 transition-opacity" />
               </button>
 
+              <button
+                id="btn_nav_customs"
+                onClick={() => setActiveTab('customs')}
+                className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-semibold transition-all duration-200 group ${
+                  activeTab === 'customs'
+                    ? 'bg-gradient-to-r from-[#14B8A6]/20 to-[#0A86FF]/12 text-white border border-[#14B8A6]/30'
+                    : 'text-slate-400 hover:bg-white/[0.045] hover:text-white border border-transparent'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <Landmark className={`h-4.5 w-4.5 ${activeTab === 'customs' ? 'text-[#68e6d4]' : 'text-slate-400 group-hover:text-[#68e6d4]'}`} />
+                  <span>Duties & Landed Cost</span>
+                </div>
+                <ChevronRight className="h-4 w-4 opacity-40 group-hover:opacity-100 transition-opacity" />
+              </button>
+
               <button 
                 id="btn_nav_inventory"
                 onClick={() => setActiveTab('inventory')}
@@ -2038,6 +2056,7 @@ export default function App() {
               <h2 className="text-xl font-bold tracking-tight text-white flex items-center gap-3">
                 {activeTab === 'dashboard' && 'Warehouse Operations Overview'}
                 {activeTab === 'shipping' && 'Shipping Control Tower'}
+                {activeTab === 'customs' && 'Caribbean Duties & Landed Cost'}
                 {activeTab === 'inventory' && 'Stock Directory & Inventory Control'}
                 {activeTab === 'map' && 'Location Mapping & Bay Allocation'}
                 {activeTab === 'history' && 'Stock Movement & Audit History'}
@@ -2047,6 +2066,7 @@ export default function App() {
               <p className="text-sm text-slate-400 mt-1">
                 {activeTab === 'dashboard' && 'Real-time telemetry, stock valuations, low stock alerts, and zone utilization ratios.'}
                 {activeTab === 'shipping' && 'Track inbound and outbound shipments, carrier events, ETAs, customs stages and exceptions in one view.'}
+                {activeTab === 'customs' && 'Estimate import duties, taxes, clearance costs and true landed cost using verified effective-dated rules.'}
                 {activeTab === 'inventory' && 'Browse, search, edit, and quickly log inbound shipments or outbound customer orders.'}
                 {activeTab === 'map' && 'Interactive rack layout of specific aisles, shelves and bin allocations. Occupancy heatmap.'}
                 {activeTab === 'history' && 'Comprehensive historical audit logs of item receipts, shipments, safety dispenses, and disposals.'}
@@ -2094,6 +2114,10 @@ export default function App() {
             
             {activeTab === 'shipping' && token && (
               <ShippingControlTower token={token} />
+            )}
+
+            {activeTab === 'customs' && token && (
+              <CustomsLandedCost token={token} />
             )}
 
             {/* 1. DASHBOARD VIEW PANEL */}
