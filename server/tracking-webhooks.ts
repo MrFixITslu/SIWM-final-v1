@@ -1,6 +1,6 @@
 import express, { Router } from 'express';
 import rateLimit from 'express-rate-limit';
-import { addSwimTrackingCheckpoint, appendSwimBusinessEvent, getSwimShipment, reserveSwimWebhookReceipt } from '../server-db.js';
+import { addSwimTrackingCheckpoint, appendSwimBusinessEvent, getSwimShipment, releaseSwimWebhookReceipt, reserveSwimWebhookReceipt } from '../server-db.js';
 import { newId } from './security.js';
 import { parseTrackingGatewayEnvelope } from '../src/domain/tracking-gateway.js';
 import { normalizeProviderKey, verifyHmacWebhook, webhookReplayKey } from '../src/domain/webhooks.js';
@@ -142,6 +142,15 @@ export function createTrackingWebhookRouter() {
 
         res.status(202).json({ accepted: true, duplicate: false });
       } catch (error) {
+        try {
+          await releaseSwimWebhookReceipt(replayKey);
+        } catch (releaseError) {
+          console.error('Unable to release failed tracking webhook reservation:', {
+            provider,
+            eventId: payload.eventId,
+            error: releaseError instanceof Error ? releaseError.message : 'Unknown error',
+          });
+        }
         console.error('Tracking webhook ingestion failed:', {
           provider,
           eventId: payload.eventId,
