@@ -1,4 +1,5 @@
 import express, { Router } from 'express';
+import rateLimit from 'express-rate-limit';
 import { addSwimTrackingCheckpoint, appendSwimBusinessEvent, getSwimShipment, reserveSwimWebhookReceipt } from '../server-db.js';
 import { newId } from './security.js';
 import { parseTrackingGatewayEnvelope } from '../src/domain/tracking-gateway.js';
@@ -6,6 +7,14 @@ import { normalizeProviderKey, verifyHmacWebhook, webhookReplayKey } from '../sr
 
 const MAX_WEBHOOK_BYTES = 256 * 1024;
 const RECEIPT_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+
+const trackingWebhookRateLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 1200,
+  standardHeaders: 'draft-7',
+  legacyHeaders: false,
+  message: { error: 'Tracking webhook rate limit exceeded.' },
+});
 
 function providerSecret(provider: string): string {
   const envKey = `SWIM_TRACKING_WEBHOOK_SECRET_${provider.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
@@ -21,6 +30,7 @@ export function createTrackingWebhookRouter() {
 
   router.post(
     '/:provider/webhook',
+    trackingWebhookRateLimiter,
     express.raw({ type: 'application/json', limit: MAX_WEBHOOK_BYTES }),
     async (req: any, res) => {
       let provider: string;
