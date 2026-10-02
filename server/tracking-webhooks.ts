@@ -121,22 +121,24 @@ export function createTrackingWebhookRouter() {
           payloadHash: verified.bodyHash,
         };
 
-        await addSwimTrackingCheckpoint(payload.warehouseId, payload.shipmentId, checkpoint);
-        await appendSwimBusinessEvent({
-          eventId: newId('evt'),
-          warehouseId: payload.warehouseId,
-          eventType: payload.status === 'EXCEPTION' ? 'SHIPMENT_DELAYED' : 'SHIPMENT_CHECKPOINT_RECORDED',
-          aggregateType: 'shipment',
-          aggregateId: payload.shipmentId,
-          occurredAt: payload.occurredAt,
-          payload: {
-            provider,
-            providerEventId: payload.eventId,
-            status: payload.status,
-            location: payload.location || null,
-            source: checkpoint.source,
-          },
-        });
+        const stored = await addSwimTrackingCheckpoint(payload.warehouseId, payload.shipmentId, checkpoint);
+        if (stored.inserted) {
+          await appendSwimBusinessEvent({
+            eventId: newId('evt'),
+            warehouseId: payload.warehouseId,
+            eventType: payload.status === 'EXCEPTION' ? 'SHIPMENT_DELAYED' : 'SHIPMENT_CHECKPOINT_RECORDED',
+            aggregateType: 'shipment',
+            aggregateId: payload.shipmentId,
+            occurredAt: payload.occurredAt,
+            payload: {
+              provider,
+              providerEventId: payload.eventId,
+              status: payload.status,
+              location: payload.location || null,
+              source: checkpoint.source,
+            },
+          });
+        }
 
         res.status(202).json({ accepted: true, duplicate: false });
       } catch (error) {
