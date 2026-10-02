@@ -724,7 +724,7 @@ export async function changeUserPassword(userId: string, currentPass: string, ne
     throw new Error('New password must be at least 6 characters long.');
   }
 
-  const newHash = await bcrypt.hash(newPass, 10);
+  const newHash = await bcrypt.hash(newPass, 12);
   const nextTokenVersion = (user.tokenVersion || 1) + 1;
 
   if (usePostgres) {
@@ -2550,7 +2550,7 @@ export async function inviteUserToWarehouse(warehouseId: string, email: string, 
     // Each invited account gets its own random temporary password rather than
     // a single fixed password shared by every new operator account system-wide.
     tempPassword = crypto.randomBytes(9).toString('base64url');
-    const passwordHash = await bcrypt.hash(tempPassword, 10);
+    const passwordHash = await bcrypt.hash(tempPassword, 12);
     user = {
       id: userId,
       email: normEmail,
