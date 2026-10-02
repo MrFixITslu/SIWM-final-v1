@@ -3333,6 +3333,25 @@ export async function getSwimTrackingSubscription(
   return record ? mapTrackingSubscription(record) : null;
 }
 
+export async function findSwimTrackingSubscriptionByProviderTracker(
+  providerKey: string,
+  externalTrackerId: string,
+): Promise<SwimTrackingSubscription | null> {
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT * FROM swim_tracking_subscriptions
+       WHERE provider_key=$1 AND external_tracker_id=$2
+       LIMIT 1`,
+      [providerKey, externalTrackerId],
+    );
+    return result.rows[0] ? mapTrackingSubscription(result.rows[0]) : null;
+  }
+  const record = memTrackingSubscriptions.find((entry) =>
+    entry.providerKey === providerKey && entry.externalTrackerId === externalTrackerId,
+  );
+  return record ? mapTrackingSubscription(record) : null;
+}
+
 export async function saveSwimTrackingSubscription(input: {
   id: string;
   warehouseId: string;
