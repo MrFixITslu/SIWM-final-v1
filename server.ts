@@ -1868,7 +1868,7 @@ async function startServer() {
   app.post(
     '/api/swim/customs/estimate',
     authenticateToken,
-    requireRoles('admin', 'manager'),
+    requireRoles('admin', 'manager', 'operator'),
     async (req: any, res) => {
       try {
         const jurisdictionCode = String(req.body?.jurisdictionCode || '').trim().toUpperCase();
