@@ -65,7 +65,8 @@ import {
   listShipments,
   addTrackingCheckpoint,
   listTrackingCheckpoints,
-  listCustomsRules
+  listCustomsRules,
+  getShipment
 } from './swim/platform-store.js';
 import {
   newSwimId,
@@ -73,10 +74,25 @@ import {
   normalizeHsCode,
   normalizeTrackingNumber,
   requireNonNegativeMoney,
-  requireSafeId
+  requireSafeId,
+  newWarehouseJoinCode,
+  validatePasswordPolicy,
+  verifyHmacSha256Base64,
+  requireWebhookSecret
 } from './swim/security.js';
 import { calculateLandedCost, findApplicableCustomsRule } from './swim/customs.js';
-import { listCarrierAdapters, normalizeProviderStatus } from './swim/tracking.js';
+import {
+  listCarrierAdapters,
+  normalizeProviderStatus,
+  registerCarrierAdapter,
+  getCarrierAdapter
+} from './swim/tracking.js';
+import { createAfterShipAdapter } from './swim/providers/aftership.js';
+import {
+  ingestProviderTrackingUpdate,
+  refreshShipmentTracking,
+  registerShipmentTracking
+} from './swim/tracking-service.js';
 import type { ShipmentRecord, TrackingCheckpoint } from './swim/domain.js';
 
 
@@ -172,8 +188,14 @@ async function startServer() {
   // Configure the port: runs on PORT (3000) inside AI Studio
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
-  // Middleware for parsing JSON requests
-  app.use(express.json());
+  // Middleware for parsing JSON requests. Keep an exact raw copy so signed
+  // carrier webhooks can be verified before their payload is trusted.
+  app.use(express.json({
+    limit: '1mb',
+    verify: (req: any, _res, buf) => {
+      req.rawBody = Buffer.from(buf);
+    }
+  }));
 
   // Initialize PostgreSQL database connection and migrations
   await initDb();
@@ -183,11 +205,62 @@ async function startServer() {
     console.warn('SWIM enterprise modules are disabled because persistent PostgreSQL storage is unavailable.');
   }
 
+  if (process.env.AFTERSHIP_API_KEY) {
+    registerCarrierAdapter(
+      createAfterShipAdapter(
+        process.env.AFTERSHIP_API_KEY,
+        process.env.AFTERSHIP_API_BASE || undefined
+      )
+    );
+    console.log('SWIM tracking provider enabled: AFTERSHIP');
+  } else {
+    console.warn('AFTERSHIP_API_KEY is not configured; live carrier tracking remains disabled.');
+  }
+
   // --- Public API Endpoints ---
   
   // Health check endpoint
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date() });
+  });
+
+  // AfterShip carrier update webhook. This endpoint is intentionally public,
+  // but every request must pass HMAC verification before payload processing.
+  app.post('/api/swim/webhooks/aftership', async (req: any, res) => {
+    try {
+      const secret = requireWebhookSecret(
+        process.env.AFTERSHIP_WEBHOOK_SECRET,
+        'AFTERSHIP'
+      );
+      const signature = String(req.headers['aftership-hmac-sha256'] || '');
+      if (!signature || !req.rawBody || !verifyHmacSha256Base64(req.rawBody, signature, secret)) {
+        res.status(401).json({ error: 'Invalid webhook signature.' });
+        return;
+      }
+
+      const adapter = getCarrierAdapter('AFTERSHIP');
+      if (!adapter.parseWebhook) {
+        res.status(503).json({ error: 'AfterShip webhook parser is unavailable.' });
+        return;
+      }
+
+      const updates = await adapter.parseWebhook(req.body, req.headers);
+      let matched = 0;
+      for (const update of updates) {
+        const result = await ingestProviderTrackingUpdate({
+          providerCode: 'AFTERSHIP',
+          providerTrackingId: update.providerTrackingId,
+          snapshot: update.snapshot,
+          providerEventId: String(req.body?.event_id || '').trim() || undefined
+        });
+        if (result.matched) matched += 1;
+      }
+
+      res.status(202).json({ accepted: true, matched });
+    } catch (err: any) {
+      console.error('AfterShip webhook processing error:', err);
+      res.status(503).json({ error: 'Unable to process carrier update.' });
+    }
   });
 
   // --- Authentication & Multi-Tenant Registry Endpoints ---
@@ -197,8 +270,13 @@ async function startServer() {
     try {
       const { email, password, name, warehouseOption, warehouseName, warehouseAddress, warehouseCode } = req.body;
       
-      if (!email || !name) {
-        res.status(400).json({ error: 'Email and Name are required.' });
+      if (!email || !name || !password) {
+        res.status(400).json({ error: 'Email, Name and Password are required.' });
+        return;
+      }
+      const passwordPolicyError = validatePasswordPolicy(password);
+      if (passwordPolicyError) {
+        res.status(400).json({ error: passwordPolicyError });
         return;
       }
 
@@ -220,9 +298,9 @@ async function startServer() {
           res.status(400).json({ error: 'Warehouse name is required to create a new warehouse.' });
           return;
         }
-        warehouseId = `wh-${Date.now()}`;
-        // Generate code: e.g. WH-123456
-        const code = `WH-${Math.floor(100000 + Math.random() * 900000)}`;
+        warehouseId = newSwimId('wh');
+        // Cryptographically random, human-friendly warehouse join code.
+        const code = newWarehouseJoinCode();
         warehouseDetails = await createWarehouse({
           id: warehouseId,
           name: warehouseName,
@@ -248,9 +326,9 @@ async function startServer() {
         return;
       }
 
-      const passwordHash = password ? await bcrypt.hash(password, 10) : undefined;
+      const passwordHash = await bcrypt.hash(password, 12);
       const newUser = {
-        id: `usr-${Date.now()}`,
+        id: newSwimId('usr'),
         email: normEmail,
         passwordHash,
         name,
@@ -372,8 +450,9 @@ async function startServer() {
         return;
       }
 
-      if (newPassword.length < 6) {
-        res.status(400).json({ error: 'New password must be at least 6 characters long.' });
+      const passwordPolicyError = validatePasswordPolicy(newPassword);
+      if (passwordPolicyError) {
+        res.status(400).json({ error: passwordPolicyError });
         return;
       }
 
@@ -1702,6 +1781,67 @@ async function startServer() {
       } catch (err: any) {
         console.error('SWIM tracking checkpoint error:', err);
         res.status(400).json({ error: err.message || 'Unable to record tracking checkpoint.' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/swim/shipments/:shipmentId/tracking/register',
+    authenticateToken,
+    requireRoles('admin', 'manager', 'operator'),
+    async (req: any, res) => {
+      try {
+        const warehouseId = requireSafeId(req.user.warehouseId, 'warehouseId');
+        const shipmentId = requireSafeId(req.params.shipmentId, 'shipmentId');
+        const shipment = await getShipment(warehouseId, shipmentId);
+        if (!shipment) {
+          res.status(404).json({ error: 'Shipment was not found in this workspace.' });
+          return;
+        }
+
+        const result = await registerShipmentTracking({
+          warehouseId,
+          shipmentId,
+          trackingNumber: req.body?.trackingNumber,
+          carrierCode: req.body?.carrierCode
+            ? String(req.body.carrierCode).trim().toLowerCase()
+            : undefined,
+          providerCode: req.body?.providerCode || 'AFTERSHIP',
+          actor: {
+            actorId: req.user.id,
+            actorName: req.user.name || req.user.email
+          }
+        });
+        res.status(201).json(result);
+      } catch (err: any) {
+        console.error('SWIM carrier registration error:', err);
+        const message = String(err?.message || 'Unable to register carrier tracking.');
+        const unavailable = /not configured|not support|API key|provider/i.test(message);
+        res.status(unavailable ? 503 : 400).json({ error: message });
+      }
+    }
+  );
+
+  app.post(
+    '/api/swim/shipments/:shipmentId/tracking/refresh',
+    authenticateToken,
+    requireRoles('admin', 'manager', 'operator'),
+    async (req: any, res) => {
+      try {
+        const result = await refreshShipmentTracking({
+          warehouseId: requireSafeId(req.user.warehouseId, 'warehouseId'),
+          shipmentId: requireSafeId(req.params.shipmentId, 'shipmentId'),
+          providerCode: req.body?.providerCode || 'AFTERSHIP',
+          actor: {
+            actorId: req.user.id,
+            actorName: req.user.name || req.user.email
+          }
+        });
+        res.json(result);
+      } catch (err: any) {
+        console.error('SWIM tracking refresh error:', err);
+        const message = String(err?.message || 'Unable to refresh carrier tracking.');
+        res.status(/not found|No tracking provider/i.test(message) ? 404 : 503).json({ error: message });
       }
     }
   );
