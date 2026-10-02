@@ -3379,6 +3379,38 @@ export async function listSwimLogisticsUnits(warehouseId: string, shipmentId: st
   return memLogisticsUnits.filter((unit) => unit.warehouseId === warehouseId && unit.shipmentId === shipmentId);
 }
 
+export async function getSwimOutboundDemandSummary(
+  warehouseId: string,
+  sinceIso: string,
+): Promise<Record<string, number>> {
+  const since = new Date(sinceIso);
+  if (Number.isNaN(since.getTime())) throw new Error('Demand history start date is invalid.');
+
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT item_id, COALESCE(SUM(quantity), 0)::float8 AS total_quantity
+       FROM transactions
+       WHERE warehouse_id=$1 AND type='OUTBOUND' AND timestamp >= $2
+       GROUP BY item_id`,
+      [warehouseId, since.toISOString()],
+    );
+    return Object.fromEntries(
+      result.rows.map((row: any) => [row.item_id, Number(row.total_quantity || 0)]),
+    );
+  }
+
+  const start = since.getTime();
+  const summary: Record<string, number> = {};
+  for (const transaction of memTransactions) {
+    if (transaction.warehouse_id !== warehouseId || transaction.type !== 'OUTBOUND') continue;
+    if (Date.parse(transaction.timestamp) < start) continue;
+    const itemId = transaction.itemId || transaction.item_id;
+    if (!itemId) continue;
+    summary[itemId] = (summary[itemId] || 0) + Number(transaction.quantity || 0);
+  }
+  return summary;
+}
+
 export interface StoredReplenishmentPolicy extends LeadTimePolicy {
   id: string;
   warehouseId: string;
