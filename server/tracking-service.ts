@@ -20,7 +20,7 @@ function carrierHint(carrier?: string): string | undefined {
   return undefined;
 }
 
-async function applyProviderCheckpoints(params: {
+export async function applyProviderCheckpoints(params: {
   warehouseId: string;
   shipmentId: string;
   actorId?: string;
