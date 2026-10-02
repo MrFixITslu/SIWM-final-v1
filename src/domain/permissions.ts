@@ -12,6 +12,8 @@ export type SwimPermission =
   | 'procurement.write'
   | 'shipments.read'
   | 'shipments.write'
+  | 'forwarders.read'
+  | 'forwarders.manage'
   | 'tracking.read'
   | 'tracking.write'
   | 'customs.read'
@@ -31,9 +33,9 @@ const ROLE_PERMISSIONS: Record<SwimRole, ReadonlySet<SwimPermission>> = {
     'suppliers.read', 'suppliers.manage',
     'procurement.read', 'procurement.write',
     'shipments.read', 'shipments.write',
+    'forwarders.read', 'forwarders.manage',
     'tracking.read', 'tracking.write',
     'customs.read', 'customs.calculate',
-    'replenishment.read',
     'replenishment.read', 'replenishment.manage',
     'operations.read',
     'audit.read', 'team.manage', 'settings.manage', 'destructive.manage',
@@ -44,9 +46,11 @@ const ROLE_PERMISSIONS: Record<SwimRole, ReadonlySet<SwimPermission>> = {
     'suppliers.read', 'suppliers.manage',
     'procurement.read', 'procurement.write',
     'shipments.read', 'shipments.write',
+    'forwarders.read', 'forwarders.manage',
     'tracking.read', 'tracking.write',
     'customs.read', 'customs.calculate',
     'replenishment.read', 'replenishment.manage',
+    'operations.read',
     'audit.read',
   ]),
   operator: new Set<SwimPermission>([
@@ -55,12 +59,15 @@ const ROLE_PERMISSIONS: Record<SwimRole, ReadonlySet<SwimPermission>> = {
     'suppliers.read',
     'procurement.read',
     'shipments.read', 'shipments.write',
+    'forwarders.read',
     'tracking.read', 'tracking.write',
     'customs.read', 'customs.calculate',
+    'replenishment.read',
+    'operations.read',
   ]),
   viewer: new Set<SwimPermission>([
     'inventory.read', 'warehouse.read', 'suppliers.read', 'procurement.read',
-    'shipments.read', 'tracking.read', 'customs.read', 'replenishment.read',
+    'shipments.read', 'forwarders.read', 'tracking.read', 'customs.read', 'replenishment.read',
     'operations.read',
   ]),
 };
