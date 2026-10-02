@@ -40,6 +40,7 @@ export interface ShipmentRecord {
   trackingProvider?: string;
   purchaseOrderId?: string;
   supplierId?: string;
+  freightForwarderId?: string;
   customerOrderReference?: string;
   parentShipmentId?: string;
   origin?: string;
