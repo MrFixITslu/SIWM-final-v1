@@ -1,0 +1,63 @@
+name: SWIM Development CI
+
+on:
+  push:
+    branches:
+      - swim-enterprise-rebuild
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'server/**'
+      - 'src/**'
+      - 'tests/**'
+      - 'server.ts'
+      - 'server-db.ts'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'tsconfig.json'
+      - 'vite.config.*'
+      - '.github/workflows/swim-ci.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: swim-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Lint, test, build, audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      NODE_ENV: test
+      JWT_SECRET: test-only-jwt-secret-0123456789abcdef0123456789abcdef
+      DATA_ENCRYPTION_SECRET: test-only-data-secret-0123456789abcdef0123456789abcdef
+      EVENT_LEDGER_SECRET: test-only-ledger-secret-0123456789abcdef0123456789abcdef
+      SEED_DEMO_DATA: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Use Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install locked dependencies
+        run: npm ci
+
+      - name: TypeScript
+        run: npm run lint
+
+      - name: Unit and domain tests
+        run: npm test
+
+      - name: Production build
+        run: npm run build
+
+      - name: Production dependency audit
+        run: npm audit --omit=dev --audit-level=high
