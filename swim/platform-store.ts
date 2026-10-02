@@ -454,6 +454,83 @@ export async function getTrackingRegistrationByProviderId(
   return result.rows[0] ? mapTrackingRegistration(result.rows[0]) : undefined;
 }
 
+export async function upsertCustomsRules(
+  rules: CustomsRule[]
+): Promise<number> {
+  let changed = 0;
+  for (const rule of rules) {
+    await swimDbQuery(
+      `INSERT INTO swim_customs_rules (
+        id, jurisdiction_code, hs_code_prefix, description,
+        import_duty_rate, vat_rate, customs_service_rate, excise_rate,
+        environmental_levy_rate, other_rate, effective_from, effective_to,
+        official_source_url, source_title, verified_at, version
+      ) VALUES (
+        $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16
+      )
+      ON CONFLICT (id) DO UPDATE SET
+        jurisdiction_code = EXCLUDED.jurisdiction_code,
+        hs_code_prefix = EXCLUDED.hs_code_prefix,
+        description = EXCLUDED.description,
+        import_duty_rate = EXCLUDED.import_duty_rate,
+        vat_rate = EXCLUDED.vat_rate,
+        customs_service_rate = EXCLUDED.customs_service_rate,
+        excise_rate = EXCLUDED.excise_rate,
+        environmental_levy_rate = EXCLUDED.environmental_levy_rate,
+        other_rate = EXCLUDED.other_rate,
+        effective_from = EXCLUDED.effective_from,
+        effective_to = EXCLUDED.effective_to,
+        official_source_url = EXCLUDED.official_source_url,
+        source_title = EXCLUDED.source_title,
+        verified_at = EXCLUDED.verified_at,
+        version = EXCLUDED.version`,
+      [
+        rule.id,
+        rule.jurisdictionCode.toUpperCase(),
+        rule.hsCodePrefix,
+        rule.description || null,
+        rule.importDutyRate ?? null,
+        rule.vatRate ?? null,
+        rule.customsServiceRate ?? null,
+        rule.exciseRate ?? null,
+        rule.environmentalLevyRate ?? null,
+        rule.otherRate ?? null,
+        rule.effectiveFrom,
+        rule.effectiveTo || null,
+        rule.officialSourceUrl,
+        rule.sourceTitle,
+        rule.verifiedAt,
+        rule.version
+      ]
+    );
+    changed += 1;
+  }
+  return changed;
+}
+
+export async function getCustomsRuleCoverage(): Promise<Array<{
+  jurisdictionCode: string;
+  ruleCount: number;
+  latestVerifiedAt?: string;
+  versions: string[];
+}>> {
+  const result = await swimDbQuery<any>(
+    `SELECT jurisdiction_code,
+            COUNT(*)::int AS rule_count,
+            MAX(verified_at) AS latest_verified_at,
+            ARRAY_AGG(DISTINCT version ORDER BY version) AS versions
+       FROM swim_customs_rules
+      GROUP BY jurisdiction_code
+      ORDER BY jurisdiction_code`
+  );
+  return result.rows.map((row) => ({
+    jurisdictionCode: row.jurisdiction_code,
+    ruleCount: Number(row.rule_count || 0),
+    latestVerifiedAt: row.latest_verified_at || undefined,
+    versions: row.versions || []
+  }));
+}
+
 export async function listCustomsRules(
   jurisdictionCode: string
 ): Promise<CustomsRule[]> {
