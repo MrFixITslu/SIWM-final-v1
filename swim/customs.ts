@@ -4,6 +4,24 @@ import { normalizeHsCode, requireNonNegativeMoney } from './security.js';
 const rate = (value: number | undefined) => Math.max(0, Number(value || 0));
 const money = (value: number) => Math.round((value + Number.EPSILON) * 100) / 100;
 
+type ChargeValues = {
+  CUSTOMS_VALUE: number;
+  IMPORT_DUTY: number;
+  CUSTOMS_SERVICE_CHARGE: number;
+  EXCISE: number;
+  ENVIRONMENTAL_LEVY: number;
+  OTHER_TAXES: number;
+};
+
+function baseAmount(
+  components: Array<keyof ChargeValues> | undefined,
+  values: ChargeValues,
+  fallback: Array<keyof ChargeValues>
+): number {
+  const selected = components?.length ? components : fallback;
+  return money(selected.reduce((sum, key) => sum + Number(values[key] || 0), 0));
+}
+
 export function findApplicableCustomsRule(
   rules: CustomsRule[],
   jurisdictionCode: string,
@@ -40,16 +58,58 @@ export function calculateLandedCost(
   const concession = Math.min(100, Math.max(0, Number(input.concessionPercent || 0))) / 100;
 
   const customsValue = money(goodsValue + freight + insurance + otherDutiable);
-  const importDuty = money(customsValue * rate(rule.importDutyRate) * (1 - concession));
-  const customsServiceCharge = money(customsValue * rate(rule.customsServiceRate));
-  const excise = money(customsValue * rate(rule.exciseRate));
-  const environmentalLevy = money(customsValue * rate(rule.environmentalLevyRate));
-  const otherTaxes = money(customsValue * rate(rule.otherRate));
+  const values: ChargeValues = {
+    CUSTOMS_VALUE: customsValue,
+    IMPORT_DUTY: 0,
+    CUSTOMS_SERVICE_CHARGE: 0,
+    EXCISE: 0,
+    ENVIRONMENTAL_LEVY: 0,
+    OTHER_TAXES: 0
+  };
+  const policy = rule.calculationPolicy || {};
 
-  const vatBase = customsValue + importDuty + customsServiceCharge + excise + environmentalLevy + otherTaxes;
+  values.IMPORT_DUTY = money(
+    baseAmount(policy.importDutyBase, values, ['CUSTOMS_VALUE']) *
+    rate(rule.importDutyRate) *
+    (1 - concession)
+  );
+  values.CUSTOMS_SERVICE_CHARGE = money(
+    baseAmount(policy.customsServiceBase, values, ['CUSTOMS_VALUE']) *
+    rate(rule.customsServiceRate)
+  );
+  values.EXCISE = money(
+    baseAmount(policy.exciseBase, values, ['CUSTOMS_VALUE']) *
+    rate(rule.exciseRate)
+  );
+  values.ENVIRONMENTAL_LEVY = money(
+    baseAmount(policy.environmentalLevyBase, values, ['CUSTOMS_VALUE']) *
+    rate(rule.environmentalLevyRate)
+  );
+  values.OTHER_TAXES = money(
+    baseAmount(policy.otherTaxBase, values, ['CUSTOMS_VALUE']) *
+    rate(rule.otherRate)
+  );
+
+  const vatBase = baseAmount(
+    policy.vatBase,
+    values,
+    [
+      'CUSTOMS_VALUE',
+      'IMPORT_DUTY',
+      'CUSTOMS_SERVICE_CHARGE',
+      'EXCISE',
+      'ENVIRONMENTAL_LEVY',
+      'OTHER_TAXES'
+    ]
+  );
   const vat = money(vatBase * rate(rule.vatRate));
   const totalBorderCharges = money(
-    importDuty + customsServiceCharge + excise + environmentalLevy + otherTaxes + vat
+    values.IMPORT_DUTY +
+    values.CUSTOMS_SERVICE_CHARGE +
+    values.EXCISE +
+    values.ENVIRONMENTAL_LEVY +
+    values.OTHER_TAXES +
+    vat
   );
   const totalLandedCost = money(
     customsValue + totalBorderCharges + brokerage + portFees + localDelivery
@@ -57,11 +117,11 @@ export function calculateLandedCost(
 
   return {
     customsValue,
-    importDuty,
-    customsServiceCharge,
-    excise,
-    environmentalLevy,
-    otherTaxes,
+    importDuty: values.IMPORT_DUTY,
+    customsServiceCharge: values.CUSTOMS_SERVICE_CHARGE,
+    excise: values.EXCISE,
+    environmentalLevy: values.ENVIRONMENTAL_LEVY,
+    otherTaxes: values.OTHER_TAXES,
     vat,
     brokerage,
     portFees,
@@ -71,6 +131,6 @@ export function calculateLandedCost(
     ruleId: rule.id,
     ruleVersion: rule.version,
     officialSourceUrl: rule.officialSourceUrl,
-    confidence
+    confidence: rule.calculationPolicy ? confidence : 'REVIEW_REQUIRED'
   };
 }
