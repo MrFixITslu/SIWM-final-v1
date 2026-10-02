@@ -66,7 +66,9 @@ import {
   addTrackingCheckpoint,
   listTrackingCheckpoints,
   listCustomsRules,
-  getShipment
+  getShipment,
+  upsertCustomsRules,
+  getCustomsRuleCoverage
 } from './swim/platform-store.js';
 import {
   newSwimId,
@@ -165,6 +167,23 @@ function requireRoles(...allowedRoles: string[]) {
     }
     next();
   };
+}
+
+function requirePlatformAdmin(req: any, res: any, next: any) {
+  const configured = String(process.env.SWIM_PLATFORM_ADMIN_EMAILS || '')
+    .split(',')
+    .map((email) => email.trim().toLowerCase())
+    .filter(Boolean);
+  const email = String(req.user?.email || '').trim().toLowerCase();
+
+  if (configured.length === 0 || !email || !configured.includes(email)) {
+    res.status(403).json({
+      error: 'Platform administrator permission is required.',
+      code: 'PLATFORM_ADMIN_REQUIRED'
+    });
+    return;
+  }
+  next();
 }
 
 // Rate limiter for authentication routes
@@ -1915,6 +1934,113 @@ async function startServer() {
       } catch (err: any) {
         console.error('SWIM customs estimate error:', err);
         res.status(400).json({ error: err.message || 'Unable to calculate customs estimate.' });
+      }
+    }
+  );
+
+  app.get('/api/swim/customs/coverage', authenticateToken, async (_req: any, res) => {
+    try {
+      const coverage = await getCustomsRuleCoverage();
+      res.json({ coverage });
+    } catch (err) {
+      console.error('SWIM customs coverage error:', err);
+      res.status(500).json({ error: 'Unable to load customs rule coverage.' });
+    }
+  });
+
+  app.post(
+    '/api/swim/customs/rules/import',
+    authenticateToken,
+    requirePlatformAdmin,
+    async (req: any, res) => {
+      try {
+        const inputRules = Array.isArray(req.body?.rules) ? req.body.rules : [];
+        if (inputRules.length < 1 || inputRules.length > 1000) {
+          res.status(400).json({ error: 'Import must contain between 1 and 1000 customs rules.' });
+          return;
+        }
+
+        const parsedRules = inputRules.map((raw: any, index: number) => {
+          const jurisdictionCode = String(raw?.jurisdictionCode || '').trim().toUpperCase();
+          const hsCodePrefix = String(raw?.hsCodePrefix || '').replace(/[^0-9]/g, '');
+          const version = String(raw?.version || '').trim();
+          const sourceTitle = String(raw?.sourceTitle || '').trim();
+          const officialSourceUrl = String(raw?.officialSourceUrl || '').trim();
+          const effectiveFrom = new Date(raw?.effectiveFrom);
+          const effectiveTo = raw?.effectiveTo ? new Date(raw.effectiveTo) : undefined;
+          const verifiedAt = new Date(raw?.verifiedAt);
+
+          if (!/^[A-Z]{2,8}$/.test(jurisdictionCode)) {
+            throw new Error(`Rule ${index + 1}: jurisdictionCode is invalid.`);
+          }
+          if (!/^[0-9]{2,12}$/.test(hsCodePrefix)) {
+            throw new Error(`Rule ${index + 1}: hsCodePrefix must contain 2 to 12 digits.`);
+          }
+          if (!version || version.length > 80 || !sourceTitle || sourceTitle.length > 240) {
+            throw new Error(`Rule ${index + 1}: version and sourceTitle are required.`);
+          }
+          let sourceUrl: URL;
+          try {
+            sourceUrl = new URL(officialSourceUrl);
+          } catch {
+            throw new Error(`Rule ${index + 1}: officialSourceUrl is invalid.`);
+          }
+          if (sourceUrl.protocol !== 'https:') {
+            throw new Error(`Rule ${index + 1}: officialSourceUrl must use HTTPS.`);
+          }
+          if (Number.isNaN(effectiveFrom.getTime()) || Number.isNaN(verifiedAt.getTime())) {
+            throw new Error(`Rule ${index + 1}: effectiveFrom and verifiedAt must be valid dates.`);
+          }
+          if (effectiveTo && Number.isNaN(effectiveTo.getTime())) {
+            throw new Error(`Rule ${index + 1}: effectiveTo is invalid.`);
+          }
+
+          const parseRate = (value: unknown, label: string) => {
+            if (value === undefined || value === null || value === '') return undefined;
+            const rate = Number(value);
+            if (!Number.isFinite(rate) || rate < 0 || rate > 1) {
+              throw new Error(`Rule ${index + 1}: ${label} must be a decimal between 0 and 1.`);
+            }
+            return rate;
+          };
+
+          const safeVersion = version.replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 40);
+          const id = String(raw?.id || `customs-${jurisdictionCode}-${hsCodePrefix}-${safeVersion}`).slice(0, 100);
+
+          return {
+            id: requireSafeId(id, `rule ${index + 1} id`),
+            jurisdictionCode,
+            hsCodePrefix,
+            description: raw?.description ? String(raw.description).slice(0, 2000) : undefined,
+            importDutyRate: parseRate(raw?.importDutyRate, 'importDutyRate'),
+            vatRate: parseRate(raw?.vatRate, 'vatRate'),
+            customsServiceRate: parseRate(raw?.customsServiceRate, 'customsServiceRate'),
+            exciseRate: parseRate(raw?.exciseRate, 'exciseRate'),
+            environmentalLevyRate: parseRate(raw?.environmentalLevyRate, 'environmentalLevyRate'),
+            otherRate: parseRate(raw?.otherRate, 'otherRate'),
+            effectiveFrom: effectiveFrom.toISOString(),
+            effectiveTo: effectiveTo?.toISOString(),
+            officialSourceUrl: sourceUrl.toString(),
+            sourceTitle,
+            verifiedAt: verifiedAt.toISOString(),
+            version
+          };
+        });
+
+        const imported = await upsertCustomsRules(parsedRules);
+        await logSystemAudit({
+          warehouseId: req.user.warehouseId,
+          action: 'CUSTOMS_RULES_IMPORTED',
+          category: 'PROCUREMENT',
+          details: `Platform tariff rule import completed: ${imported} rule(s).`,
+          operator: req.user.name || req.user.email,
+          operatorId: req.user.id,
+          status: 'SUCCESS'
+        });
+        res.status(201).json({ imported });
+      } catch (err: any) {
+        console.error('SWIM customs rule import error:', err);
+        res.status(400).json({ error: err.message || 'Unable to import customs rules.' });
       }
     }
   );
