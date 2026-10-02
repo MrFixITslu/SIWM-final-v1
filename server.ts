@@ -105,8 +105,12 @@ function authenticateToken(req: any, res: any, next: any) {
       };
       next();
     } catch (checkErr) {
-      req.user = decoded;
-      next();
+      console.error('Live authorization verification failed:', checkErr);
+      res.status(503).json({
+        error: 'Authorization service temporarily unavailable. Access was not granted.',
+        code: 'AUTHORIZATION_CHECK_FAILED'
+      });
+      return;
     }
   });
 }
