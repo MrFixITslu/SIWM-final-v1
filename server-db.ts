@@ -3090,6 +3090,15 @@ export async function reserveSwimWebhookReceipt(input: {
   return true;
 }
 
+export async function releaseSwimWebhookReceipt(replayKey: string): Promise<void> {
+  if (!/^[a-f0-9]{64}$/i.test(replayKey)) throw new Error('Webhook replay key is invalid.');
+  if (usePostgres) {
+    await pool.query('DELETE FROM swim_webhook_receipts WHERE replay_key=$1', [replayKey]);
+    return;
+  }
+  memWebhookReceipts = memWebhookReceipts.filter((entry) => entry.replayKey !== replayKey);
+}
+
 export async function createSwimShipment(
   warehouseId: string,
   shipment: Omit<ShipmentRecord, 'warehouseId' | 'createdAt' | 'updatedAt'>,
