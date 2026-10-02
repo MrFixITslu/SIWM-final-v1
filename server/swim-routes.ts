@@ -1,7 +1,7 @@
 import crypto from 'crypto';
 import { Router } from 'express';
 import { z } from 'zod';
-import { authenticateToken, newId, requirePermission } from './security.js';
+import { authenticateToken, newId, requirePermission, requirePlatformAdmin } from './security.js';
 import {
   addSwimTrackingCheckpoint,
   appendSwimBusinessEvent,
@@ -9,6 +9,8 @@ import {
   consolidateSwimShipments,
   getSuppliers,
   getSwimCustomsRules,
+  listAllSwimCustomsRules,
+  logSystemAudit,
   getSwimShipment,
   getSwimReplenishmentPolicy,
   listSwimChildShipments,
@@ -22,9 +24,11 @@ import {
   saveSwimLogisticsUnit,
   saveSwimShipmentLeg,
   upsertSwimReplenishmentPolicy,
+  upsertSwimCustomsRules,
   verifySwimBusinessEventLedger,
 } from '../server-db.js';
 import { calculateCustomsEstimate } from '../src/domain/customs.js';
+import { customsRuleId, normalizeHsCodePrefix, validateCustomsRuleDates, validateOfficialSourceUrl } from '../src/domain/customs-rules.js';
 import { canContain, type LogisticsUnitType } from '../src/domain/shipping.js';
 import { detectCarrier, summarizeTracking } from '../src/domain/tracking.js';
 import { buildReplenishmentForecast } from './replenishment-service.js';
@@ -102,6 +106,32 @@ const replenishmentPolicySchema = z.object({
   safetyStockDays: leadTimeDays,
   targetCoverageDays: leadTimeDays,
   demandWindowDays: z.number().int().min(1).max(3650).default(90),
+}).strict();
+
+const customsRuleImportSchema = z.object({
+  destinationCountry: z.string().trim().min(2).max(3).transform((value) => value.toUpperCase()),
+  hsCodePrefix: z.string().trim().min(1).max(24),
+  chargeCode: z.string().trim().min(1).max(60).transform((value) => value.toUpperCase()),
+  label: z.string().trim().min(1).max(160),
+  sequence: z.number().int().min(1).max(1000),
+  basis: z.enum(['CUSTOMS_VALUE','CUSTOMS_VALUE_PLUS_DUTY','RUNNING_SUBTOTAL']),
+  rateBps: z.number().int().min(0).max(100_000).optional(),
+  fixedAmountMinor: z.number().int().nonnegative().safe().optional(),
+  effectiveFrom: z.string().date(),
+  effectiveTo: z.string().date().optional(),
+  eligibleOrigins: z.array(z.string().trim().min(2).max(3).transform((value) => value.toUpperCase())).max(100).optional(),
+  excludedOrigins: z.array(z.string().trim().min(2).max(3).transform((value) => value.toUpperCase())).max(100).optional(),
+  requiredConcessionCode: z.string().trim().max(100).optional(),
+  source: z.object({
+    authority: z.string().trim().min(2).max(200),
+    sourceUrl: z.string().url().max(2000),
+    verifiedAt: z.string().datetime({ offset:true }),
+  }).strict(),
+  active: z.boolean().default(true),
+}).strict();
+
+const customsRuleBatchSchema = z.object({
+  rules: z.array(customsRuleImportSchema).min(1).max(500),
 }).strict();
 
 const customsEstimateSchema = z.object({
@@ -376,6 +406,75 @@ export function createSwimRouter() {
     } catch (error) {
       console.error('SWIM replenishment forecast error:', error);
       res.status(500).json({ error: 'Unable to calculate replenishment forecasts.' });
+    }
+  });
+
+  router.get('/platform/customs/rules', requirePlatformAdmin, async (req: any, res) => {
+    try {
+      const destination = typeof req.query.destinationCountry === 'string'
+        ? req.query.destinationCountry.trim().toUpperCase()
+        : undefined;
+      if (destination && !/^[A-Z]{2,3}$/.test(destination)) {
+        res.status(400).json({ error: 'destinationCountry must be a 2 or 3 letter country code.' });
+        return;
+      }
+      res.json({ rules: await listAllSwimCustomsRules(destination) });
+    } catch (error) {
+      console.error('SWIM customs rule list error:', error);
+      res.status(500).json({ error: 'Unable to retrieve customs rules.' });
+    }
+  });
+
+  router.post('/platform/customs/rules/import', requirePlatformAdmin, async (req: any, res) => {
+    const parsed = customsRuleBatchSchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+
+    try {
+      const seen = new Set<string>();
+      const rules = parsed.data.rules.map((input, index) => {
+        try {
+          const hsCodePrefix = normalizeHsCodePrefix(input.hsCodePrefix);
+          const sourceUrl = validateOfficialSourceUrl(input.source.sourceUrl);
+          validateCustomsRuleDates({
+            effectiveFrom: input.effectiveFrom,
+            effectiveTo: input.effectiveTo,
+            verifiedAt: input.source.verifiedAt,
+          });
+          const id = customsRuleId({
+            destinationCountry: input.destinationCountry,
+            hsCodePrefix,
+            chargeCode: input.chargeCode,
+            effectiveFrom: input.effectiveFrom,
+            requiredConcessionCode: input.requiredConcessionCode,
+          });
+          if (seen.has(id)) throw new Error('Duplicate rule in this import batch.');
+          seen.add(id);
+          return {
+            ...input,
+            id,
+            hsCodePrefix,
+            source: { ...input.source, sourceUrl },
+          };
+        } catch (error: any) {
+          throw new Error(`Rule ${index + 1}: ${error?.message || 'Invalid customs rule.'}`);
+        }
+      });
+
+      const result = await upsertSwimCustomsRules(rules);
+      await logSystemAudit({
+        warehouseId: req.user.warehouseId,
+        action: 'CUSTOMS_RULES_IMPORTED',
+        category: 'SECURITY',
+        details: `Platform administrator imported or updated ${result.imported} verified customs rule(s).`,
+        operator: req.user.name || req.user.email,
+        operatorId: req.user.id,
+        ipAddress: req.ip,
+        status: 'SUCCESS',
+      });
+      res.status(201).json({ ...result, ruleIds: rules.map((rule) => rule.id) });
+    } catch (error: any) {
+      console.error('SWIM customs rule import error:', error);
+      res.status(400).json({ error: error?.message || 'Unable to import customs rules.' });
     }
   });
 
