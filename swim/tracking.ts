@@ -5,11 +5,26 @@ import {
 } from './domain.js';
 import { normalizeTrackingNumber } from './security.js';
 
+export interface TrackingRegistrationResult {
+  providerTrackingId: string;
+  snapshot: CarrierTrackingSnapshot;
+}
+
 export interface CarrierAdapter {
   readonly code: string;
   canHandle(trackingNumber: string): boolean;
-  fetchTracking(trackingNumber: string): Promise<CarrierTrackingSnapshot>;
-  parseWebhook?(payload: unknown, headers: Record<string, string | string[] | undefined>): Promise<CarrierTrackingSnapshot[]>;
+  registerTracking?(
+    trackingNumber: string,
+    options?: { carrierCode?: string; shipmentId?: string; warehouseId?: string }
+  ): Promise<TrackingRegistrationResult>;
+  fetchTracking(
+    trackingNumber: string,
+    providerTrackingId?: string
+  ): Promise<CarrierTrackingSnapshot>;
+  parseWebhook?(
+    payload: unknown,
+    headers: Record<string, string | string[] | undefined>
+  ): Promise<TrackingRegistrationResult[]>;
 }
 
 const adapters = new Map<string, CarrierAdapter>();
