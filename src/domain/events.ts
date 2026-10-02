@@ -18,7 +18,8 @@ export type SwimEventType =
   | 'ORDER_DISPATCHED'
   | 'DELIVERY_CONFIRMED'
   | 'INVENTORY_ADJUSTED'
-  | 'STOCKOUT_RISK_CHANGED';
+  | 'STOCKOUT_RISK_CHANGED'
+  | 'REPLENISHMENT_POLICY_CHANGED';
 
 export interface SwimBusinessEvent<T = Record<string, unknown>> {
   eventId: string;
