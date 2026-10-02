@@ -30,3 +30,21 @@
 .v79-siwm-app ::-webkit-scrollbar-thumb{background:#1d3d59;border-radius:999px;border:2px solid #06101d}
 .v79-siwm-app ::-webkit-scrollbar-thumb:hover{background:#2c5677}
 .v79-siwm-app :where(button,a,input,select,textarea,[tabindex]):focus-visible{outline-color:#14b8a6}
+
+/* Shared SWIM form control for enterprise workspaces */
+.swim-input {
+  width: 100%;
+  border: 1px solid #244560;
+  border-radius: 0.75rem;
+  background: #07121f;
+  padding: 0.65rem 0.75rem;
+  font-size: 0.75rem;
+  color: #e8eef7;
+  outline: none;
+  transition: border-color 160ms ease, box-shadow 160ms ease;
+}
+.swim-input::placeholder { color: #526276; }
+.swim-input:focus {
+  border-color: rgba(20,184,166,.7);
+  box-shadow: 0 0 0 3px rgba(20,184,166,.10);
+}
