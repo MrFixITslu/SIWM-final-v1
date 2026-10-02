@@ -182,6 +182,7 @@ let memTrackingEvents: any[] = [];
 let memLogisticsUnits: any[] = [];
 let memCustomsRules: any[] = [];
 let memCustomsEstimates: any[] = [];
+let memWebhookReceipts: any[] = [];
 let memBusinessEvents: SwimBusinessEvent[] = [];
 let memWorkspaceInvitations: any[] = [];
 
@@ -480,6 +481,22 @@ async function runMigrations() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_tracking_shipment_time ON swim_tracking_events(warehouse_id, shipment_id, occurred_at DESC)`);
+
+  // Secure webhook replay ledger. Receipt reservation happens before any provider event is applied.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_webhook_receipts (
+      replay_key VARCHAR(64) PRIMARY KEY,
+      provider_key VARCHAR(40) NOT NULL,
+      provider_event_id VARCHAR(180) NOT NULL,
+      body_hash VARCHAR(64) NOT NULL,
+      warehouse_id VARCHAR(50),
+      shipment_id VARCHAR(80),
+      received_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      expires_at TIMESTAMPTZ NOT NULL,
+      UNIQUE (provider_key, provider_event_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_webhook_expiry ON swim_webhook_receipts(expires_at)`);
 
   // 15. Item/carton/package/pallet/container hierarchy for consolidation and 3PL workflows.
   await pool.query(`
@@ -2959,6 +2976,41 @@ function mapShipmentRow(row: any): ShipmentRecord {
   };
 }
 
+export async function reserveSwimWebhookReceipt(input: {
+  replayKey: string;
+  providerKey: string;
+  providerEventId: string;
+  bodyHash: string;
+  warehouseId?: string;
+  shipmentId?: string;
+  expiresAt: string;
+}): Promise<boolean> {
+  if (usePostgres) {
+    await pool.query('DELETE FROM swim_webhook_receipts WHERE expires_at < CURRENT_TIMESTAMP');
+    const result = await pool.query(
+      `INSERT INTO swim_webhook_receipts (
+        replay_key, provider_key, provider_event_id, body_hash, warehouse_id, shipment_id, expires_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+      ON CONFLICT DO NOTHING
+      RETURNING replay_key`,
+      [input.replayKey, input.providerKey, input.providerEventId, input.bodyHash,
+       input.warehouseId || null, input.shipmentId || null, input.expiresAt],
+    );
+    return result.rowCount === 1;
+  }
+
+  const now = Date.now();
+  memWebhookReceipts = memWebhookReceipts.filter((entry) => Date.parse(entry.expiresAt) > now);
+  const duplicate = memWebhookReceipts.some((entry) =>
+    entry.replayKey === input.replayKey ||
+    (entry.providerKey === input.providerKey && entry.providerEventId === input.providerEventId),
+  );
+  if (duplicate) return false;
+  memWebhookReceipts.push({ ...input, receivedAt: new Date().toISOString() });
+  if (memWebhookReceipts.length > 10_000) memWebhookReceipts.splice(0, memWebhookReceipts.length - 10_000);
+  return true;
+}
+
 export async function createSwimShipment(
   warehouseId: string,
   shipment: Omit<ShipmentRecord, 'warehouseId' | 'createdAt' | 'updatedAt'>,
@@ -3029,22 +3081,25 @@ export async function addSwimTrackingCheckpoint(
     const client = await pool.connect();
     try {
       await client.query('BEGIN');
-      await client.query(
+      const inserted = await client.query(
         `INSERT INTO swim_tracking_events (
           id, warehouse_id, shipment_id, carrier_event_id, status, description, location,
           occurred_at, estimated_delivery_at, source, payload_hash
         ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-        ON CONFLICT (shipment_id, carrier_event_id) DO NOTHING`,
+        ON CONFLICT (shipment_id, carrier_event_id) DO NOTHING
+        RETURNING id`,
         [checkpoint.id, warehouseId, shipmentId, checkpoint.carrierEventId || null, checkpoint.status,
          checkpoint.description, checkpoint.location || null, checkpoint.occurredAt,
          checkpoint.estimatedDeliveryAt || null, checkpoint.source, checkpoint.payloadHash || null],
       );
-      await client.query(
-        `UPDATE swim_shipments SET status=$1, latest_tracking_status=$2, latest_location=COALESCE($3, latest_location),
-         estimated_arrival_at=COALESCE($4, estimated_arrival_at), updated_at=CURRENT_TIMESTAMP
-         WHERE id=$5 AND warehouse_id=$6`,
-        [nextShipmentStatus, checkpoint.status, checkpoint.location || null, checkpoint.estimatedDeliveryAt || null, shipmentId, warehouseId],
-      );
+      if (inserted.rowCount === 1) {
+        await client.query(
+          `UPDATE swim_shipments SET status=$1, latest_tracking_status=$2, latest_location=COALESCE($3, latest_location),
+           estimated_arrival_at=COALESCE($4, estimated_arrival_at), updated_at=CURRENT_TIMESTAMP
+           WHERE id=$5 AND warehouse_id=$6`,
+          [nextShipmentStatus, checkpoint.status, checkpoint.location || null, checkpoint.estimatedDeliveryAt || null, shipmentId, warehouseId],
+        );
+      }
       await client.query('COMMIT');
     } catch (error) {
       await client.query('ROLLBACK');
@@ -3056,15 +3111,17 @@ export async function addSwimTrackingCheckpoint(
     const duplicate = checkpoint.carrierEventId && memTrackingEvents.some((event) =>
       event.shipmentId === shipmentId && event.carrierEventId === checkpoint.carrierEventId,
     );
-    if (!duplicate) memTrackingEvents.push({ ...checkpoint, warehouseId, shipmentId });
-    memShipments = memShipments.map((entry) => entry.warehouseId === warehouseId && entry.id === shipmentId ? {
-      ...entry,
-      status: nextShipmentStatus,
-      latestTrackingStatus: checkpoint.status,
-      latestLocation: checkpoint.location || entry.latestLocation,
-      estimatedArrivalAt: checkpoint.estimatedDeliveryAt || entry.estimatedArrivalAt,
-      updatedAt: new Date().toISOString(),
-    } : entry);
+    if (!duplicate) {
+      memTrackingEvents.push({ ...checkpoint, warehouseId, shipmentId });
+      memShipments = memShipments.map((entry) => entry.warehouseId === warehouseId && entry.id === shipmentId ? {
+        ...entry,
+        status: nextShipmentStatus,
+        latestTrackingStatus: checkpoint.status,
+        latestLocation: checkpoint.location || entry.latestLocation,
+        estimatedArrivalAt: checkpoint.estimatedDeliveryAt || entry.estimatedArrivalAt,
+        updatedAt: new Date().toISOString(),
+      } : entry);
+    }
   }
   return checkpoint;
 }
