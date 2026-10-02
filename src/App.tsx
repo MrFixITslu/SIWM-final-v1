@@ -60,6 +60,7 @@ import { PasswordChangeCard } from './components/PasswordChangeCard';
 import { AuditLedgerView } from './components/AuditLedgerView';
 import { PersonnelDispatchesView } from './components/PersonnelDispatchesView';
 import { PurchaseOrdersManager } from './components/PurchaseOrdersManager';
+import { ShippingControlTower } from './components/ShippingControlTower';
 
 import { 
   InventoryItem, 
@@ -414,7 +415,7 @@ export default function App() {
   };
 
   // --- UI Navigation ---
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'inventory' | 'map' | 'history' | 'suppliers' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'shipping' | 'inventory' | 'map' | 'history' | 'suppliers' | 'settings'>('dashboard');
   const [historySubTab, setHistorySubTab] = useState<'movements' | 'dispatches' | 'audit'>('movements');
 
   // --- Search & Filter States ---
@@ -1860,6 +1861,22 @@ export default function App() {
                 <ChevronRight className="h-4 w-4 opacity-40 group-hover:opacity-100 transition-opacity" />
               </button>
 
+              <button
+                id="btn_nav_shipping"
+                onClick={() => setActiveTab('shipping')}
+                className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-semibold transition-all duration-200 group ${
+                  activeTab === 'shipping'
+                    ? 'bg-gradient-to-r from-[#0A86FF]/25 to-[#14B8A6]/15 text-white border border-[#0A86FF]/35'
+                    : 'text-slate-400 hover:bg-white/[0.045] hover:text-white border border-transparent'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <Truck className={`h-4.5 w-4.5 ${activeTab === 'shipping' ? 'text-white' : 'text-slate-400 group-hover:text-[#68e6d4]'}`} />
+                  <span>Shipping Control Tower</span>
+                </div>
+                <ChevronRight className="h-4 w-4 opacity-40 group-hover:opacity-100 transition-opacity" />
+              </button>
+
               <button 
                 id="btn_nav_inventory"
                 onClick={() => setActiveTab('inventory')}
@@ -2008,6 +2025,7 @@ export default function App() {
             <div>
               <h2 className="text-xl font-bold tracking-tight text-white flex items-center gap-3">
                 {activeTab === 'dashboard' && 'Warehouse Operations Overview'}
+                {activeTab === 'shipping' && 'Shipping Control Tower'}
                 {activeTab === 'inventory' && 'Stock Directory & Inventory Control'}
                 {activeTab === 'map' && 'Location Mapping & Bay Allocation'}
                 {activeTab === 'history' && 'Stock Movement & Audit History'}
@@ -2016,6 +2034,7 @@ export default function App() {
               </h2>
               <p className="text-sm text-slate-400 mt-1">
                 {activeTab === 'dashboard' && 'Real-time telemetry, stock valuations, low stock alerts, and zone utilization ratios.'}
+                {activeTab === 'shipping' && 'Track inbound and outbound shipments, carrier events, ETAs, customs stages and exceptions in one view.'}
                 {activeTab === 'inventory' && 'Browse, search, edit, and quickly log inbound shipments or outbound customer orders.'}
                 {activeTab === 'map' && 'Interactive rack layout of specific aisles, shelves and bin allocations. Occupancy heatmap.'}
                 {activeTab === 'history' && 'Comprehensive historical audit logs of item receipts, shipments, safety dispenses, and disposals.'}
@@ -2061,6 +2080,10 @@ export default function App() {
           {/* VIEW RENDER CONTROLLERS */}
           <div className="p-4 sm:p-5 xl:p-7 flex-1" id="siwm_view_container">
             
+            {activeTab === 'shipping' && token && (
+              <ShippingControlTower token={token} />
+            )}
+
             {/* 1. DASHBOARD VIEW PANEL */}
             {activeTab === 'dashboard' && (
               <div className="space-y-4 animate-fade-in" id="panel_dashboard">
