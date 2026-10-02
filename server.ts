@@ -12,6 +12,7 @@ import {
   validatePassword,
   writeRateLimiter,
 } from './server/security.js';
+import { createSwimRouter } from './server/swim-routes.js';
 import { 
   initDb, 
   getItems, 
@@ -105,6 +106,9 @@ async function startServer() {
   app.get('/api/health', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date() });
   });
+
+  // Versioned SWIM enterprise logistics API. All routes enforce live tenant membership and RBAC.
+  app.use('/api/v1', createSwimRouter());
 
   // --- Authentication & Multi-Tenant Registry Endpoints ---
 
