@@ -7,22 +7,30 @@ import {
   appendSwimBusinessEvent,
   createSwimShipment,
   consolidateSwimShipments,
+  getItems,
+  getPurchaseOrders,
+  getSuppliers,
   getSwimCustomsRules,
+  getSwimOutboundDemandSummary,
   getSwimShipment,
+  getSwimReplenishmentPolicy,
   listSwimChildShipments,
   listSwimBusinessEvents,
   listSwimLogisticsUnits,
   listSwimShipments,
   listSwimTrackingCheckpoints,
   listSwimShipmentLegs,
+  listSwimReplenishmentPolicies,
   saveSwimCustomsEstimate,
   saveSwimLogisticsUnit,
   saveSwimShipmentLeg,
+  upsertSwimReplenishmentPolicy,
   verifySwimBusinessEventLedger,
 } from '../server-db.js';
 import { calculateCustomsEstimate } from '../src/domain/customs.js';
 import { canContain, type LogisticsUnitType } from '../src/domain/shipping.js';
 import { detectCarrier, summarizeTracking } from '../src/domain/tracking.js';
+import { forecastReplenishment } from '../src/domain/replenishment.js';
 
 const shipmentStatus = z.enum(['PLANNED','BOOKED','IN_TRANSIT','CUSTOMS','RECEIVED','DELIVERED','EXCEPTION','CANCELLED']);
 const shipmentMode = z.enum(['PARCEL','AIR','OCEAN','GROUND','COURIER','INTER_ISLAND']);
@@ -80,6 +88,22 @@ const shipmentLegSchema = z.object({
 
 const consolidationSchema = z.object({
   childShipmentIds: z.array(z.string().trim().min(1).max(80)).min(1).max(500),
+}).strict();
+
+const leadTimeDays = z.number().int().min(0).max(3650);
+
+const replenishmentPolicySchema = z.object({
+  supplierId: z.string().trim().min(1).max(80).optional(),
+  name: z.string().trim().min(1).max(160),
+  supplierProcessingDays: leadTimeDays,
+  originTransportDays: leadTimeDays,
+  forwarderHandlingDays: leadTimeDays,
+  internationalTransitDays: leadTimeDays,
+  customsClearanceDays: leadTimeDays,
+  localDeliveryDays: leadTimeDays,
+  safetyStockDays: leadTimeDays,
+  targetCoverageDays: leadTimeDays,
+  demandWindowDays: z.number().int().min(1).max(3650).default(90),
 }).strict();
 
 const customsEstimateSchema = z.object({
@@ -271,6 +295,179 @@ export function createSwimRouter() {
       res.status(201).json({ unit });
     } catch (error: any) {
       res.status(400).json({ error: error?.message || 'Unable to create logistics unit.' });
+    }
+  });
+
+  router.get('/replenishment/policies', requirePermission('replenishment.read'), async (req: any, res) => {
+    try {
+      res.json({ policies: await listSwimReplenishmentPolicies(req.user.warehouseId) });
+    } catch (error) {
+      res.status(500).json({ error: 'Unable to retrieve replenishment policies.' });
+    }
+  });
+
+  router.post('/replenishment/policies', requirePermission('replenishment.manage'), async (req: any, res) => {
+    const parsed = replenishmentPolicySchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+    try {
+      const input = parsed.data;
+      if (input.supplierId) {
+        const suppliers = await getSuppliers(req.user.warehouseId);
+        if (!suppliers.some((supplier: any) => supplier.id === input.supplierId)) {
+          res.status(400).json({ error: 'Supplier does not exist in this workspace.' });
+          return;
+        }
+      }
+      const policy = await upsertSwimReplenishmentPolicy({
+        id: newId('policy'),
+        warehouseId: req.user.warehouseId,
+        supplierId: input.supplierId,
+        name: input.name,
+        demandWindowDays: input.demandWindowDays,
+        actorId: req.user.id,
+        policy: {
+          supplierProcessingDays: input.supplierProcessingDays,
+          originTransportDays: input.originTransportDays,
+          forwarderHandlingDays: input.forwarderHandlingDays,
+          internationalTransitDays: input.internationalTransitDays,
+          customsClearanceDays: input.customsClearanceDays,
+          localDeliveryDays: input.localDeliveryDays,
+          safetyStockDays: input.safetyStockDays,
+          targetCoverageDays: input.targetCoverageDays,
+        },
+      });
+      await appendSwimBusinessEvent({
+        eventId: newId('evt'),
+        warehouseId: req.user.warehouseId,
+        eventType: 'REPLENISHMENT_POLICY_CHANGED',
+        aggregateType: 'inventory',
+        aggregateId: policy.id,
+        actorId: req.user.id,
+        occurredAt: new Date().toISOString(),
+        payload: {
+          scopeKey: policy.scopeKey,
+          supplierId: policy.supplierId || null,
+          demandWindowDays: policy.demandWindowDays,
+          totalLeadTimeDays:
+            policy.supplierProcessingDays +
+            policy.originTransportDays +
+            policy.forwarderHandlingDays +
+            policy.internationalTransitDays +
+            policy.customsClearanceDays +
+            policy.localDeliveryDays,
+        },
+      });
+      res.status(201).json({ policy });
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Unable to save replenishment policy.' });
+    }
+  });
+
+  router.get('/replenishment/forecast', requirePermission('replenishment.read'), async (req: any, res) => {
+    try {
+      const [items, purchaseOrders, policies] = await Promise.all([
+        getItems(req.user.warehouseId),
+        getPurchaseOrders(req.user.warehouseId),
+        listSwimReplenishmentPolicies(req.user.warehouseId),
+      ]);
+
+      const now = new Date();
+      const windows = [...new Set(policies.map((policy) => policy.demandWindowDays))];
+      const demandByWindow = new Map<number, Record<string, number>>();
+      await Promise.all(windows.map(async (windowDays) => {
+        const since = new Date(now.getTime() - windowDays * 86_400_000).toISOString();
+        demandByWindow.set(
+          windowDays,
+          await getSwimOutboundDemandSummary(req.user.warehouseId, since),
+        );
+      }));
+
+      const defaultPolicy = policies.find((policy) => !policy.supplierId);
+      const policyBySupplier = new Map(
+        policies.filter((policy) => policy.supplierId).map((policy) => [policy.supplierId as string, policy]),
+      );
+
+      const inboundByItemId = new Map<string, number>();
+      const inboundBySku = new Map<string, number>();
+      const openStatuses = new Set(['ORDERED', 'IN_TRANSIT', 'PARTIALLY_RECEIVED']);
+      for (const po of purchaseOrders) {
+        if (!openStatuses.has(po.status)) continue;
+        for (const line of po.items || []) {
+          const remaining = Math.max(0, Number(line.quantity || 0) - Number(line.quantityReceived || 0));
+          if (!remaining) continue;
+          if (line.itemId) inboundByItemId.set(line.itemId, (inboundByItemId.get(line.itemId) || 0) + remaining);
+          if (line.sku) {
+            const key = String(line.sku).trim().toUpperCase();
+            inboundBySku.set(key, (inboundBySku.get(key) || 0) + remaining);
+          }
+        }
+      }
+
+      const riskOrder: Record<string, number> = {
+        CRITICAL: 0,
+        AT_RISK: 1,
+        WATCH: 2,
+        HEALTHY: 3,
+        NO_DEMAND: 4,
+        UNCONFIGURED: 5,
+      };
+
+      const forecasts = items.map((item: any) => {
+        const policy = (item.supplierId && policyBySupplier.get(item.supplierId)) || defaultPolicy;
+        const inbound = inboundByItemId.get(item.id) || inboundBySku.get(String(item.sku || '').toUpperCase()) || 0;
+        if (!policy) {
+          return {
+            itemId: item.id,
+            sku: item.sku,
+            name: item.name,
+            supplierId: item.supplierId || null,
+            onHand: item.quantity,
+            inboundConfirmed: inbound,
+            policyConfigured: false,
+            risk: 'UNCONFIGURED',
+          };
+        }
+        const demandTotal = demandByWindow.get(policy.demandWindowDays)?.[item.id] || 0;
+        const averageDailyDemand = demandTotal / policy.demandWindowDays;
+        const forecast = forecastReplenishment({
+          onHand: Number(item.quantity || 0),
+          inboundConfirmed: inbound,
+          averageDailyDemand,
+          policy,
+          asOf: now.toISOString(),
+        });
+        return {
+          itemId: item.id,
+          sku: item.sku,
+          name: item.name,
+          supplierId: item.supplierId || null,
+          onHand: item.quantity,
+          policyConfigured: true,
+          policy: {
+            id: policy.id,
+            name: policy.name,
+            scopeKey: policy.scopeKey,
+            demandWindowDays: policy.demandWindowDays,
+          },
+          ...forecast,
+        };
+      }).sort((a: any, b: any) =>
+        (riskOrder[a.risk] ?? 99) - (riskOrder[b.risk] ?? 99) ||
+        (a.stockoutInDays ?? Number.POSITIVE_INFINITY) - (b.stockoutInDays ?? Number.POSITIVE_INFINITY)
+      );
+
+      res.json({
+        generatedAt: now.toISOString(),
+        forecasts,
+        notes: [
+          'Demand uses actual OUTBOUND stock movements within each configured policy window.',
+          'Confirmed inbound includes remaining quantities on ORDERED, IN_TRANSIT and PARTIALLY_RECEIVED purchase orders.',
+          'Customer-order allocations are not subtracted until SWIM order allocation is enabled.',
+        ],
+      });
+    } catch (error) {
+      console.error('SWIM replenishment forecast error:', error);
+      res.status(500).json({ error: 'Unable to calculate replenishment forecasts.' });
     }
   });
 
