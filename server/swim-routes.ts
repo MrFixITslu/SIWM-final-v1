@@ -194,7 +194,15 @@ export function createSwimRouter() {
   router.get('/freight-forwarders', requirePermission('forwarders.read'), async (req: any, res) => {
     try {
       const includeInactive = req.query.includeInactive === 'true' && req.user.role === 'admin';
-      res.json({ forwarders: await listSwimFreightForwarders(req.user.warehouseId, includeInactive) });
+      const forwarders = await listSwimFreightForwarders(req.user.warehouseId, includeInactive);
+      const canManage = req.user.role === 'admin' || req.user.role === 'manager';
+      res.json({
+        forwarders: forwarders.map((forwarder) => {
+          if (canManage) return forwarder;
+          const { accountReference: _accountReference, ...operationalView } = forwarder;
+          return operationalView;
+        }),
+      });
     } catch (error) {
       console.error('SWIM freight-forwarder list error:', error);
       res.status(500).json({ error: 'Unable to retrieve freight forwarders.' });
