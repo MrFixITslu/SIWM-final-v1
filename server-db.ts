@@ -30,10 +30,19 @@ let usePostgres = false;
 // data already encrypted with it keeps decrypting after this upgrade. Set
 // DATA_ENCRYPTION_SECRET explicitly for new deployments; rotating it on an
 // existing deployment requires re-encrypting stored data first.
-const DATA_ENCRYPTION_SECRET = process.env.DATA_ENCRYPTION_SECRET || 'siwm-production-secure-key-2026';
-if (!process.env.DATA_ENCRYPTION_SECRET && process.env.NODE_ENV === 'production') {
-  console.warn('⚠️  DATA_ENCRYPTION_SECRET not set - falling back to the default key baked into this repo. Set DATA_ENCRYPTION_SECRET in your .env for a real deployment.');
+function resolveDataEncryptionSecret(): string {
+  if (process.env.DATA_ENCRYPTION_SECRET) return process.env.DATA_ENCRYPTION_SECRET;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error(
+      'FATAL: DATA_ENCRYPTION_SECRET is required in production. ' +
+      'SWIM refuses to start with a built-in encryption key.'
+    );
+  }
+  console.warn('DATA_ENCRYPTION_SECRET not set - using a development-only fallback.');
+  return 'dev-only-swim-encryption-key-never-use-in-production';
 }
+
+const DATA_ENCRYPTION_SECRET = resolveDataEncryptionSecret();
 
 // Whether to auto-create the built-in demo account/warehouse on every boot.
 // Defaults OFF so a fresh/wiped database actually stays fresh across restarts.
