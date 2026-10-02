@@ -12,6 +12,16 @@ import { sealEvent, verifyEventChain, type SwimBusinessEvent } from './src/domai
 import type { ShipmentRecord, LogisticsUnit } from './src/domain/shipping.js';
 import type { TrackingCheckpoint } from './src/domain/tracking.js';
 import type { CustomsChargeRule, CustomsEstimate, CustomsEstimateInput } from './src/domain/customs.js';
+import { normalizeRole } from './src/domain/permissions.js';
+import {
+  WORKSPACE_INVITE_TTL_HOURS,
+  hashWorkspaceInvitationToken,
+  invitationIsActive,
+  invitedEmailMatches,
+  isAssignableWorkspaceRole,
+  maskInvitationEmail,
+  normalizeInvitationEmail,
+} from './src/domain/invitations.js';
 
 const { Pool } = pg;
 
@@ -173,6 +183,7 @@ let memLogisticsUnits: any[] = [];
 let memCustomsRules: any[] = [];
 let memCustomsEstimates: any[] = [];
 let memBusinessEvents: SwimBusinessEvent[] = [];
+let memWorkspaceInvitations: any[] = [];
 
 export async function initDb() {
   console.log('Initializing database connectivity...');
@@ -542,6 +553,29 @@ async function runMigrations() {
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_events_aggregate ON swim_business_events(warehouse_id, aggregate_type, aggregate_id, sequence_id)`);
 
+
+  // 19. Expiring, single-use workspace invitations. Only the token hash is stored.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_workspace_invitations (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      email VARCHAR(150) NOT NULL,
+      display_name VARCHAR(120),
+      role VARCHAR(50) NOT NULL,
+      token_hash VARCHAR(64) NOT NULL UNIQUE,
+      created_by VARCHAR(50) NOT NULL,
+      expires_at TIMESTAMPTZ NOT NULL,
+      accepted_at TIMESTAMPTZ,
+      revoked_at TIMESTAMPTZ,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_invites_workspace_email ON swim_workspace_invitations(warehouse_id, lower(email), created_at DESC)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_invites_token_hash ON swim_workspace_invitations(token_hash)`);
+
+  // Unknown/legacy authorization roles are intentionally reduced to viewer.
+  await pool.query(`UPDATE user_warehouses SET role='viewer' WHERE role NOT IN ('admin','manager','operator','viewer')`);
+
   // Demo account/warehouse seeding is opt-in only (SEED_DEMO_DATA=true). It used
   // to run unconditionally on every boot, which meant a well-known credential
   // (demo@siwm.org) was always publicly guessable and re-appeared even after an
@@ -782,7 +816,7 @@ export async function createUser(user: { id: string, email: string, passwordHash
 }
 
 export async function findUserByEmail(email: string) {
-  const normEmail = email.toLowerCase().trim();
+  const normEmail = normalizeInvitationEmail(email);
   if (usePostgres) {
     const res = await pool.query('SELECT * FROM users WHERE LOWER(email) = $1', [normEmail]);
     if (res.rows.length === 0) return null;
@@ -798,7 +832,7 @@ export async function findUserByEmail(email: string) {
       tokenVersion: row.token_version || 1
     };
   } else {
-    const matched = memUsers.find(u => u.email.toLowerCase().trim() === normEmail);
+    const matched = memUsers.find(u => u.normalizeInvitationEmail(email) === normEmail);
     return matched ? { ...matched, tokenVersion: matched.tokenVersion || 1 } : null;
   }
 }
@@ -2518,19 +2552,20 @@ export async function resetDb(warehouseId: string) {
 // --- User Warehouses Mapping Helpers ---
 
 export async function associateUserWithWarehouse(userId: string, warehouseId: string, role: string = 'admin') {
+  const safeRole = normalizeRole(role);
   if (usePostgres) {
     await pool.query(
       `INSERT INTO user_warehouses (user_id, warehouse_id, role) 
        VALUES ($1, $2, $3) 
        ON CONFLICT (user_id, warehouse_id) DO UPDATE SET role = EXCLUDED.role`,
-      [userId, warehouseId, role]
+      [userId, warehouseId, safeRole]
     );
   } else {
     const existingIndex = memUserWarehouses.findIndex(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
     if (existingIndex !== -1) {
-      memUserWarehouses[existingIndex].role = role;
+      memUserWarehouses[existingIndex].role = safeRole;
     } else {
-      memUserWarehouses.push({ user_id: userId, warehouse_id: warehouseId, role });
+      memUserWarehouses.push({ user_id: userId, warehouse_id: warehouseId, role: safeRole });
     }
   }
 }
@@ -2579,11 +2614,10 @@ export async function updateUserActiveWarehouse(userId: string, warehouseId: str
 export async function getUserRoleInWarehouse(userId: string, warehouseId: string): Promise<string> {
   if (usePostgres) {
     const res = await pool.query('SELECT role FROM user_warehouses WHERE user_id = $1 AND warehouse_id = $2', [userId, warehouseId]);
-    return res.rows[0]?.role || 'operator';
-  } else {
-    const found = memUserWarehouses.find(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
-    return found?.role || 'operator';
+    return res.rows[0] ? normalizeRole(res.rows[0].role) : 'viewer';
   }
+  const found = memUserWarehouses.find(uw => uw.user_id === userId && uw.warehouse_id === warehouseId);
+  return found ? normalizeRole(found.role) : 'viewer';
 }
 
 export async function updateWarehouse(id: string, updates: { 
@@ -2648,15 +2682,16 @@ export async function getWarehouseUsers(warehouseId: string) {
 }
 
 export async function updateWarehouseUserRole(warehouseId: string, userId: string, role: string) {
+  const safeRole = normalizeRole(role);
   if (usePostgres) {
     await pool.query(
       `UPDATE user_warehouses SET role = $1 WHERE warehouse_id = $2 AND user_id = $3`,
-      [role, warehouseId, userId]
+      [safeRole, warehouseId, userId]
     );
   } else {
     memUserWarehouses = memUserWarehouses.map(uw => {
       if (uw.warehouse_id === warehouseId && uw.user_id === userId) {
-        return { ...uw, role };
+        return { ...uw, role: safeRole };
       }
       return uw;
     });
@@ -2686,32 +2721,215 @@ export async function removeUserFromWarehouse(warehouseId: string, userId: strin
   }
 }
 
-export async function inviteUserToWarehouse(warehouseId: string, email: string, name: string, role: string) {
-  const normEmail = email.toLowerCase().trim();
-  let user = await findUserByEmail(normEmail);
-  let isNewUser = false;
-  let tempPassword: string | undefined;
+export interface WorkspaceInvitationPreview {
+  id: string;
+  warehouseId: string;
+  warehouseName: string;
+  maskedEmail: string;
+  role: string;
+  expiresAt: string;
+}
 
-  if (!user) {
-    isNewUser = true;
-    const userId = `usr-${Date.now()}`;
-    // Each invited account gets its own random temporary password rather than
-    // a single fixed password shared by every new operator account system-wide.
-    tempPassword = crypto.randomBytes(9).toString('base64url');
-    const passwordHash = await bcrypt.hash(tempPassword, 10);
-    user = {
-      id: userId,
-      email: normEmail,
-      passwordHash,
-      name: name || email.split('@')[0],
-      warehouseId,
-      provider: 'email'
-    };
-    await createUser(user);
+function validateInviteRole(role: string): string {
+  if (!isAssignableWorkspaceRole(role)) throw new Error('Invalid workspace role.');
+  return role;
+}
+
+export async function createWorkspaceInvitation(params: {
+  warehouseId: string;
+  email: string;
+  name?: string;
+  role: string;
+  createdBy: string;
+  ttlHours?: number;
+}) {
+  const email = normalizeInvitationEmail(params.email);
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) throw new Error('A valid email address is required.');
+  const role = validateInviteRole(params.role);
+  const ttlHours = Math.min(Math.max(Math.trunc(params.ttlHours || WORKSPACE_INVITE_TTL_HOURS), 1), 168);
+  const rawToken = crypto.randomBytes(32).toString('base64url');
+  const tokenHash = hashWorkspaceInvitationToken(rawToken);
+  const id = `invite-${crypto.randomUUID()}`;
+  const expiresAt = new Date(Date.now() + ttlHours * 60 * 60 * 1000).toISOString();
+  const createdAt = new Date().toISOString();
+
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const warehouse = await client.query('SELECT id FROM warehouses WHERE id=$1 FOR SHARE', [params.warehouseId]);
+      if (!warehouse.rows[0]) throw new Error('Workspace not found.');
+      await client.query(
+        `UPDATE swim_workspace_invitations SET revoked_at=CURRENT_TIMESTAMP
+         WHERE warehouse_id=$1 AND lower(email)=lower($2) AND accepted_at IS NULL AND revoked_at IS NULL`,
+        [params.warehouseId, email],
+      );
+      await client.query(
+        `INSERT INTO swim_workspace_invitations
+         (id, warehouse_id, email, display_name, role, token_hash, created_by, expires_at, created_at)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [id, params.warehouseId, email, params.name?.trim() || null, role, tokenHash, params.createdBy, expiresAt, createdAt],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  } else {
+    memWorkspaceInvitations = memWorkspaceInvitations.map((invite) =>
+      invite.warehouseId === params.warehouseId && invite.email === email && !invite.acceptedAt && !invite.revokedAt
+        ? { ...invite, revokedAt: createdAt }
+        : invite,
+    );
+    memWorkspaceInvitations.push({ id, warehouseId: params.warehouseId, email, displayName: params.name?.trim() || '', role, tokenHash, createdBy: params.createdBy, expiresAt, createdAt });
   }
 
-  await associateUserWithWarehouse(user.id, warehouseId, role);
-  return { user, isNewUser, tempPassword };
+  return { id, warehouseId: params.warehouseId, email, name: params.name?.trim() || '', role, expiresAt, token: rawToken };
+}
+
+export async function listWorkspaceInvitations(warehouseId: string) {
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT id, email, display_name, role, expires_at, accepted_at, revoked_at, created_at
+       FROM swim_workspace_invitations WHERE warehouse_id=$1 ORDER BY created_at DESC LIMIT 200`,
+      [warehouseId],
+    );
+    return result.rows.map((row: any) => ({
+      id: row.id, email: row.email, name: row.display_name || '', role: normalizeRole(row.role),
+      expiresAt: new Date(row.expires_at).toISOString(), acceptedAt: row.accepted_at ? new Date(row.accepted_at).toISOString() : undefined,
+      revokedAt: row.revoked_at ? new Date(row.revoked_at).toISOString() : undefined, createdAt: new Date(row.created_at).toISOString(),
+    }));
+  }
+  return memWorkspaceInvitations.filter((invite) => invite.warehouseId === warehouseId).map(({ tokenHash, ...invite }) => invite);
+}
+
+async function loadValidInvitation(token: string, client?: any) {
+  if (typeof token !== 'string' || token.length < 32 || token.length > 256) throw new Error('Invitation is invalid or expired.');
+  const tokenHash = hashWorkspaceInvitationToken(token);
+  if (usePostgres) {
+    const db = client || pool;
+    const result = await db.query(
+      `SELECT i.*, w.name AS warehouse_name FROM swim_workspace_invitations i
+       JOIN warehouses w ON w.id=i.warehouse_id
+       WHERE i.token_hash=$1`,
+      [tokenHash],
+    );
+    const invite = result.rows[0];
+    if (!invite || invite.accepted_at || invite.revoked_at || Date.parse(invite.expires_at) <= Date.now()) {
+      throw new Error('Invitation is invalid or expired.');
+    }
+    return invite;
+  }
+  const invite = memWorkspaceInvitations.find((item) => item.tokenHash === tokenHash);
+  if (!invite || invite.acceptedAt || invite.revokedAt || Date.parse(invite.expiresAt) <= Date.now()) throw new Error('Invitation is invalid or expired.');
+  const warehouse = memWarehouses.find((item) => item.id === invite.warehouseId);
+  return { ...invite, warehouse_id: invite.warehouseId, display_name: invite.displayName, expires_at: invite.expiresAt, warehouse_name: warehouse?.name || 'SWIM workspace' };
+}
+
+export async function getWorkspaceInvitationPreview(token: string): Promise<WorkspaceInvitationPreview> {
+  const invite = await loadValidInvitation(token);
+  return {
+    id: invite.id,
+    warehouseId: invite.warehouse_id || invite.warehouseId,
+    warehouseName: invite.warehouse_name || 'SWIM workspace',
+    maskedEmail: maskInvitationEmail(invite.email),
+    role: normalizeRole(invite.role),
+    expiresAt: new Date(invite.expires_at || invite.expiresAt).toISOString(),
+  };
+}
+
+export async function acceptWorkspaceInvitationForExistingUser(token: string, userId: string, userEmail: string) {
+  const normalizedEmail = userEmail.toLowerCase().trim();
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const tokenHash = hashWorkspaceInvitationToken(token);
+      const result = await client.query(
+        `SELECT i.*, w.name AS warehouse_name FROM swim_workspace_invitations i JOIN warehouses w ON w.id=i.warehouse_id
+         WHERE i.token_hash=$1 FOR UPDATE OF i`,
+        [tokenHash],
+      );
+      const invite = result.rows[0];
+      if (!invite || invite.accepted_at || invite.revoked_at || Date.parse(invite.expires_at) <= Date.now()) throw new Error('Invitation is invalid or expired.');
+      if (!invitedEmailMatches(invite.email, normalizedEmail)) throw new Error('This invitation was issued to a different email address.');
+      await client.query(
+        `INSERT INTO user_warehouses(user_id, warehouse_id, role) VALUES($1,$2,$3)
+         ON CONFLICT(user_id,warehouse_id) DO UPDATE SET role=EXCLUDED.role`,
+        [userId, invite.warehouse_id, normalizeRole(invite.role)],
+      );
+      await client.query('UPDATE users SET warehouse_id=$1 WHERE id=$2', [invite.warehouse_id, userId]);
+      await client.query('UPDATE swim_workspace_invitations SET accepted_at=CURRENT_TIMESTAMP WHERE id=$1', [invite.id]);
+      await client.query('COMMIT');
+      return { warehouseId: invite.warehouse_id, warehouseName: invite.warehouse_name, role: normalizeRole(invite.role) };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  const invite = await loadValidInvitation(token);
+  if (!invitedEmailMatches(invite.email, normalizedEmail)) throw new Error('This invitation was issued to a different email address.');
+  await associateUserWithWarehouse(userId, invite.warehouseId, invite.role);
+  await updateUserActiveWarehouse(userId, invite.warehouseId);
+  memWorkspaceInvitations = memWorkspaceInvitations.map((item) => item.id === invite.id ? { ...item, acceptedAt: new Date().toISOString() } : item);
+  return { warehouseId: invite.warehouseId, warehouseName: invite.warehouse_name, role: normalizeRole(invite.role) };
+}
+
+export async function registerWithWorkspaceInvitation(params: {
+  token: string;
+  email: string;
+  name: string;
+  passwordHash: string;
+}) {
+  const email = normalizeInvitationEmail(params.email);
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      const tokenHash = hashWorkspaceInvitationToken(params.token);
+      const result = await client.query(
+        `SELECT i.*, w.name AS warehouse_name, w.code, w.address FROM swim_workspace_invitations i JOIN warehouses w ON w.id=i.warehouse_id
+         WHERE i.token_hash=$1 FOR UPDATE OF i`,
+        [tokenHash],
+      );
+      const invite = result.rows[0];
+      if (!invite || invite.accepted_at || invite.revoked_at || Date.parse(invite.expires_at) <= Date.now()) throw new Error('Invitation is invalid or expired.');
+      if (!invitedEmailMatches(invite.email, email)) throw new Error('This invitation was issued to a different email address.');
+      const existing = await client.query('SELECT id FROM users WHERE lower(email)=lower($1)', [email]);
+      if (existing.rows[0]) throw new Error('An account already exists for this email. Sign in and accept the invitation instead.');
+      const userId = `usr-${crypto.randomUUID()}`;
+      const displayName = params.name.trim() || invite.display_name || email.split('@')[0];
+      await client.query(
+        `INSERT INTO users(id,email,password_hash,name,warehouse_id,provider,token_version) VALUES($1,$2,$3,$4,$5,'email',1)`,
+        [userId, email, params.passwordHash, displayName, invite.warehouse_id],
+      );
+      await client.query('INSERT INTO user_warehouses(user_id,warehouse_id,role) VALUES($1,$2,$3)', [userId, invite.warehouse_id, normalizeRole(invite.role)]);
+      await client.query('UPDATE swim_workspace_invitations SET accepted_at=CURRENT_TIMESTAMP WHERE id=$1', [invite.id]);
+      await client.query('COMMIT');
+      return {
+        user: { id: userId, email, name: displayName, tokenVersion: 1 },
+        warehouse: { id: invite.warehouse_id, name: invite.warehouse_name, code: invite.code, address: invite.address || '' },
+        role: normalizeRole(invite.role),
+      };
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  const invite = await loadValidInvitation(params.token);
+  if (!invitedEmailMatches(invite.email, email)) throw new Error('This invitation was issued to a different email address.');
+  if (memUsers.some((user) => user.email?.toLowerCase() === email)) throw new Error('An account already exists for this email. Sign in and accept the invitation instead.');
+  const user = { id: `usr-${crypto.randomUUID()}`, email, passwordHash: params.passwordHash, name: params.name.trim() || invite.displayName || email.split('@')[0], warehouseId: invite.warehouseId, provider: 'email', tokenVersion: 1 };
+  memUsers.push(user);
+  await associateUserWithWarehouse(user.id, invite.warehouseId, invite.role);
+  memWorkspaceInvitations = memWorkspaceInvitations.map((item) => item.id === invite.id ? { ...item, acceptedAt: new Date().toISOString() } : item);
+  return { user, warehouse: memWarehouses.find((item) => item.id === invite.warehouseId), role: normalizeRole(invite.role) };
 }
 
 // ---------------------------------------------------------------------------
