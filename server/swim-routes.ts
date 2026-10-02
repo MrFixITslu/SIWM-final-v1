@@ -14,7 +14,9 @@ import {
   getSwimShipment,
   getSwimReplenishmentPolicy,
   getSwimTrackingSubscription,
+  getSwimFreightForwarder,
   listSwimChildShipments,
+  listSwimFreightForwarders,
   listSwimBusinessEvents,
   listSwimLogisticsUnits,
   listSwimShipments,
@@ -24,6 +26,7 @@ import {
   saveSwimCustomsEstimate,
   saveSwimLogisticsUnit,
   saveSwimShipmentLeg,
+  saveSwimFreightForwarder,
   upsertSwimReplenishmentPolicy,
   upsertSwimCustomsRules,
   verifySwimBusinessEventLedger,
@@ -51,11 +54,26 @@ const createShipmentSchema = z.object({
   trackingProvider: z.string().trim().max(80).optional(),
   purchaseOrderId: z.string().trim().max(80).optional(),
   supplierId: z.string().trim().max(80).optional(),
+  freightForwarderId: z.string().trim().max(80).optional(),
   customerOrderReference: z.string().trim().max(120).optional(),
   origin: z.string().trim().max(500).optional(),
   destination: z.string().trim().max(500).optional(),
   estimatedArrivalAt: isoDateTime.optional(),
 });
+
+const forwarderSchema = z.object({
+  name: z.string().trim().min(1).max(160),
+  countryCode: z.string().trim().min(2).max(3).transform((value) => value.toUpperCase()),
+  facilityCode: z.string().trim().max(80).optional(),
+  address: z.string().trim().max(1000).optional(),
+  contactName: z.string().trim().max(160).optional(),
+  email: z.string().trim().email().max(254).optional(),
+  phone: z.string().trim().max(80).optional(),
+  accountReference: z.string().trim().max(160).optional(),
+  receivingInstructions: z.string().trim().max(3000).optional(),
+  serviceModes: z.array(shipmentMode).max(6).default([]),
+  active: z.boolean().default(true),
+}).strict();
 
 const trackingCheckpointSchema = z.object({
   carrierEventId: z.string().trim().max(180).optional(),
@@ -170,6 +188,80 @@ export function createSwimRouter() {
     } catch (error) {
       console.error('SWIM operations inbox error:', error);
       res.status(500).json({ error: 'Unable to build the operations inbox.' });
+    }
+  });
+
+  router.get('/freight-forwarders', requirePermission('forwarders.read'), async (req: any, res) => {
+    try {
+      const includeInactive = req.query.includeInactive === 'true' && req.user.role === 'admin';
+      res.json({ forwarders: await listSwimFreightForwarders(req.user.warehouseId, includeInactive) });
+    } catch (error) {
+      console.error('SWIM freight-forwarder list error:', error);
+      res.status(500).json({ error: 'Unable to retrieve freight forwarders.' });
+    }
+  });
+
+  router.post('/freight-forwarders', requirePermission('forwarders.manage'), async (req: any, res) => {
+    const parsed = forwarderSchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+    try {
+      const forwarder = await saveSwimFreightForwarder({
+        id: newId('fwd'),
+        warehouseId: req.user.warehouseId,
+        ...parsed.data,
+      });
+      await appendSwimBusinessEvent({
+        eventId: newId('evt'),
+        warehouseId: req.user.warehouseId,
+        eventType: 'FREIGHT_FORWARDER_CREATED',
+        aggregateType: 'shipment',
+        aggregateId: forwarder.id,
+        actorId: req.user.id,
+        occurredAt: new Date().toISOString(),
+        payload: {
+          forwarderId: forwarder.id,
+          countryCode: forwarder.countryCode,
+          serviceModes: forwarder.serviceModes,
+        },
+      });
+      res.status(201).json({ forwarder });
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Unable to create freight forwarder.' });
+    }
+  });
+
+  router.put('/freight-forwarders/:id', requirePermission('forwarders.manage'), async (req: any, res) => {
+    const parsed = forwarderSchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+    try {
+      const existing = await getSwimFreightForwarder(req.user.warehouseId, req.params.id);
+      if (!existing) {
+        res.status(404).json({ error: 'Freight forwarder not found.' });
+        return;
+      }
+      const forwarder = await saveSwimFreightForwarder({
+        id: existing.id,
+        warehouseId: req.user.warehouseId,
+        ...parsed.data,
+      });
+      await appendSwimBusinessEvent({
+        eventId: newId('evt'),
+        warehouseId: req.user.warehouseId,
+        eventType: 'FREIGHT_FORWARDER_UPDATED',
+        aggregateType: 'shipment',
+        aggregateId: forwarder.id,
+        actorId: req.user.id,
+        occurredAt: new Date().toISOString(),
+        payload: {
+          forwarderId: forwarder.id,
+          active: forwarder.active,
+          countryCode: forwarder.countryCode,
+          serviceModes: forwarder.serviceModes,
+        },
+      });
+      res.json({ forwarder });
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Unable to update freight forwarder.' });
     }
   });
 
