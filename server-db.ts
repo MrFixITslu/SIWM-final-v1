@@ -24,24 +24,39 @@ let pool: any = null;
 let usePostgres = false;
 
 // --- Multi-Tenant Symmetric Encryption Setup ---
-// Kept as its own secret, separate from JWT_SECRET, so rotating login sessions
-// never silently breaks decryption of already-stored data. The historical
-// default is preserved here (rather than failing fast like JWT_SECRET) so any
-// data already encrypted with it keeps decrypting after this upgrade. Set
-// DATA_ENCRYPTION_SECRET explicitly for new deployments; rotating it on an
-// existing deployment requires re-encrypting stored data first.
-const DATA_ENCRYPTION_SECRET = process.env.DATA_ENCRYPTION_SECRET || 'siwm-production-secure-key-2026';
-if (!process.env.DATA_ENCRYPTION_SECRET && process.env.NODE_ENV === 'production') {
-  console.warn('⚠️  DATA_ENCRYPTION_SECRET not set - falling back to the default key baked into this repo. Set DATA_ENCRYPTION_SECRET in your .env for a real deployment.');
+// Encryption keys are deliberately separate from JWT/session secrets. Production
+// must provide an external secret; SWIM never ships a usable production key.
+function resolveDataEncryptionSecret(): string {
+  const configured = process.env.DATA_ENCRYPTION_SECRET?.trim();
+  if (configured && Buffer.byteLength(configured, 'utf8') >= 32) return configured;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('FATAL: DATA_ENCRYPTION_SECRET must be configured with at least 32 bytes in production.');
+  }
+  console.warn('WARNING: DATA_ENCRYPTION_SECRET is using a development-only fallback.');
+  return 'swim-development-only-data-encryption-secret-change-before-production';
+}
+
+const DATA_ENCRYPTION_SECRET = resolveDataEncryptionSecret();
+
+// Historical key derivation retained only for decrypting encv2 records created
+// before SWIM introduced HKDF-separated tenant encryption keys.
+function getLegacyWarehouseKey(warehouseId: string): Buffer {
+  return crypto.createHash('sha256').update(warehouseId + DATA_ENCRYPTION_SECRET).digest();
+}
+
+function getWarehouseKey(warehouseId: string): Buffer {
+  return Buffer.from(crypto.hkdfSync(
+    'sha256',
+    Buffer.from(DATA_ENCRYPTION_SECRET, 'utf8'),
+    Buffer.from(warehouseId, 'utf8'),
+    Buffer.from('swim-tenant-field-encryption-v3', 'utf8'),
+    32,
+  ));
 }
 
 // Whether to auto-create the built-in demo account/warehouse on every boot.
 // Defaults OFF so a fresh/wiped database actually stays fresh across restarts.
 const SEED_DEMO_DATA = (process.env.SEED_DEMO_DATA || 'false').toLowerCase() === 'true';
-
-function getWarehouseKey(warehouseId: string): Buffer {
-  return crypto.createHash('sha256').update(warehouseId + DATA_ENCRYPTION_SECRET).digest();
-}
 
 export function encryptText(text: string | null | undefined, warehouseId: string): string {
   if (!text) return '';
@@ -52,7 +67,7 @@ export function encryptText(text: string | null | undefined, warehouseId: string
     let encrypted = cipher.update(text, 'utf8', 'hex');
     encrypted += cipher.final('hex');
     const authTag = cipher.getAuthTag().toString('hex');
-    return `encv2_${iv.toString('hex')}:${authTag}:${encrypted}`;
+    return `encv3_${iv.toString('hex')}:${authTag}:${encrypted}`;
   } catch (err) {
     console.error('Encryption error:', err);
     return text || '';
@@ -63,12 +78,28 @@ export function decryptText(encryptedText: string | null | undefined, warehouseI
   if (!encryptedText) return '';
   const key = getWarehouseKey(warehouseId);
 
-  if (encryptedText.startsWith('encv2_')) {
+  if (encryptedText.startsWith('encv3_')) {
     try {
       const [ivHex, authTagHex, cipherHex] = encryptedText.substring(6).split(':');
       const iv = Buffer.from(ivHex, 'hex');
       const authTag = Buffer.from(authTagHex, 'hex');
       const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+      decipher.setAuthTag(authTag);
+      let decrypted = decipher.update(cipherHex, 'hex', 'utf8');
+      decrypted += decipher.final('utf8');
+      return decrypted;
+    } catch (err) {
+      console.error('Decryption error:', err);
+      return encryptedText;
+    }
+  }
+
+  if (encryptedText.startsWith('encv2_')) {
+    try {
+      const [ivHex, authTagHex, cipherHex] = encryptedText.substring(6).split(':');
+      const iv = Buffer.from(ivHex, 'hex');
+      const authTag = Buffer.from(authTagHex, 'hex');
+      const decipher = crypto.createDecipheriv('aes-256-gcm', getLegacyWarehouseKey(warehouseId), iv);
       decipher.setAuthTag(authTag);
       let decrypted = decipher.update(cipherHex, 'hex', 'utf8');
       decrypted += decipher.final('utf8');
@@ -86,7 +117,7 @@ export function decryptText(encryptedText: string | null | undefined, warehouseI
     try {
       const ciphertext = encryptedText.substring(4);
       const legacyIv = crypto.createHash('md5').update(warehouseId).digest();
-      const decipher = crypto.createDecipheriv('aes-256-cbc', key, legacyIv);
+      const decipher = crypto.createDecipheriv('aes-256-cbc', getLegacyWarehouseKey(warehouseId), legacyIv);
       let decrypted = decipher.update(ciphertext, 'hex', 'utf8');
       decrypted += decipher.final('utf8');
       return decrypted;
