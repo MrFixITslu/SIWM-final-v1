@@ -6,14 +6,18 @@ import {
   addSwimTrackingCheckpoint,
   appendSwimBusinessEvent,
   createSwimShipment,
+  consolidateSwimShipments,
   getSwimCustomsRules,
   getSwimShipment,
+  listSwimChildShipments,
   listSwimBusinessEvents,
   listSwimLogisticsUnits,
   listSwimShipments,
   listSwimTrackingCheckpoints,
+  listSwimShipmentLegs,
   saveSwimCustomsEstimate,
   saveSwimLogisticsUnit,
+  saveSwimShipmentLeg,
   verifySwimBusinessEventLedger,
 } from '../server-db.js';
 import { calculateCustomsEstimate } from '../src/domain/customs.js';
@@ -59,6 +63,24 @@ const logisticsUnitSchema = z.object({
   quantity: z.number().int().positive().max(10_000_000).optional(),
   weightGrams: z.number().int().nonnegative().max(10_000_000_000).optional(),
 });
+
+const shipmentLegSchema = z.object({
+  sequence: z.number().int().positive().max(1000),
+  mode: shipmentMode,
+  carrier: z.string().trim().max(100).optional(),
+  service: z.string().trim().max(120).optional(),
+  origin: z.string().trim().min(1).max(500),
+  destination: z.string().trim().min(1).max(500),
+  trackingNumber: z.string().trim().max(220).optional(),
+  plannedDepartureAt: isoDateTime.optional(),
+  plannedArrivalAt: isoDateTime.optional(),
+  actualDepartureAt: isoDateTime.optional(),
+  actualArrivalAt: isoDateTime.optional(),
+}).strict();
+
+const consolidationSchema = z.object({
+  childShipmentIds: z.array(z.string().trim().min(1).max(80)).min(1).max(500),
+}).strict();
 
 const customsEstimateSchema = z.object({
   shipmentId: z.string().max(100).optional(),
@@ -128,14 +150,70 @@ export function createSwimRouter() {
     try {
       const shipment = await getSwimShipment(req.user.warehouseId, req.params.id);
       if (!shipment) { res.status(404).json({ error: 'Shipment not found.' }); return; }
-      const [tracking, units] = await Promise.all([
+      const [tracking, units, legs, childShipments] = await Promise.all([
         listSwimTrackingCheckpoints(req.user.warehouseId, shipment.id),
         listSwimLogisticsUnits(req.user.warehouseId, shipment.id),
+        listSwimShipmentLegs(req.user.warehouseId, shipment.id),
+        listSwimChildShipments(req.user.warehouseId, shipment.id),
       ]);
-      res.json({ shipment, tracking, trackingSummary: summarizeTracking(tracking), logisticsUnits: units });
+      res.json({
+        shipment,
+        tracking,
+        trackingSummary: summarizeTracking(tracking),
+        logisticsUnits: units,
+        legs,
+        childShipments,
+      });
     } catch (error) {
       console.error('SWIM shipment detail error:', error);
       res.status(500).json({ error: 'Unable to retrieve shipment details.' });
+    }
+  });
+
+  router.get('/shipments/:id/legs', requirePermission('shipments.read'), async (req: any, res) => {
+    try {
+      res.json({ legs: await listSwimShipmentLegs(req.user.warehouseId, req.params.id) });
+    } catch (error: any) {
+      res.status(404).json({ error: error?.message || 'Shipment not found.' });
+    }
+  });
+
+  router.post('/shipments/:id/legs', requirePermission('shipments.write'), async (req: any, res) => {
+    const parsed = shipmentLegSchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+    try {
+      const leg = await saveSwimShipmentLeg(req.user.warehouseId, req.params.id, {
+        id: newId('leg'),
+        ...parsed.data,
+      });
+      res.status(201).json({ leg });
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Unable to add shipment leg.' });
+    }
+  });
+
+  router.post('/shipments/:id/consolidate', requirePermission('shipments.write'), async (req: any, res) => {
+    const parsed = consolidationSchema.safeParse(req.body);
+    if (!parsed.success) return invalid(res, parsed.error);
+    try {
+      const result = await consolidateSwimShipments(
+        req.user.warehouseId,
+        req.params.id,
+        parsed.data.childShipmentIds,
+      );
+      await appendSwimBusinessEvent({
+        eventId: newId('evt'),
+        warehouseId: req.user.warehouseId,
+        eventType: 'SHIPMENT_CONSOLIDATED',
+        aggregateType: 'shipment',
+        aggregateId: req.params.id,
+        actorId: req.user.id,
+        occurredAt: new Date().toISOString(),
+        payload: { childShipmentIds: result.children.map((child) => child.id) },
+      });
+      res.status(201).json(result);
+    } catch (error: any) {
+      res.status(400).json({ error: error?.message || 'Unable to consolidate shipments.' });
     }
   });
 
