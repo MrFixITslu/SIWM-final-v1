@@ -47,10 +47,12 @@ export type ShipmentStatus =
   | 'AT_FORWARDER'
   | 'CONSOLIDATED'
   | 'AT_PORT'
+  | 'CUSTOMS_PROCESSING'
   | 'CUSTOMS_HOLD'
   | 'CUSTOMS_CLEARED'
   | 'OUT_FOR_DELIVERY'
   | 'DELIVERED'
+  | 'RETURNED'
   | 'EXCEPTION'
   | 'CANCELLED';
 
