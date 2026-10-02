@@ -2,6 +2,7 @@ import express, { Router } from 'express';
 import rateLimit from 'express-rate-limit';
 import {
   findSwimTrackingSubscriptionByProviderTracker,
+  releaseSwimWebhookReceipt,
   reserveSwimWebhookReceipt,
   updateSwimTrackingSubscriptionSync,
 } from '../server-db.js';
@@ -106,6 +107,14 @@ export function createAfterShipWebhookRouter() {
           newCheckpointCount,
         });
       } catch (error) {
+        try {
+          await releaseSwimWebhookReceipt(replayKey);
+        } catch (releaseError) {
+          console.error('Unable to release failed AfterShip replay reservation:', {
+            eventId: verified.eventId,
+            reason: releaseError instanceof Error ? releaseError.message : 'Unknown error',
+          });
+        }
         console.error('AfterShip webhook processing failed:', {
           eventId: verified.eventId,
           shipmentId: subscription.shipmentId,
