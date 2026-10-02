@@ -65,6 +65,7 @@ import { ShippingControlTower } from './components/ShippingControlTower';
 import { CustomsLandedCost } from './components/CustomsLandedCost';
 import { ReplenishmentIntelligence } from './components/ReplenishmentIntelligence';
 import { OperationsInbox } from './components/OperationsInbox';
+import { FreightForwarders } from './components/FreightForwarders';
 
 import { 
   InventoryItem, 
@@ -455,7 +456,7 @@ export default function App() {
   };
 
   // --- UI Navigation ---
-  const [activeTab, setActiveTab] = useState<'operations' | 'dashboard' | 'shipping' | 'customs' | 'inventory' | 'replenishment' | 'map' | 'history' | 'suppliers' | 'settings'>('operations');
+  const [activeTab, setActiveTab] = useState<'operations' | 'dashboard' | 'shipping' | 'forwarders' | 'customs' | 'inventory' | 'replenishment' | 'map' | 'history' | 'suppliers' | 'settings'>('operations');
   const [historySubTab, setHistorySubTab] = useState<'movements' | 'dispatches' | 'audit'>('movements');
 
   // --- Search & Filter States ---
@@ -1910,6 +1911,22 @@ export default function App() {
               </button>
 
               <button
+                id="btn_nav_forwarders"
+                onClick={() => setActiveTab('forwarders')}
+                className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-semibold transition-all duration-200 group ${
+                  activeTab === 'forwarders'
+                    ? 'bg-gradient-to-r from-[#14B8A6]/20 to-[#0A86FF]/12 text-white border border-[#14B8A6]/30'
+                    : 'text-slate-400 hover:bg-white/[0.045] hover:text-white border border-transparent'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <Building2 className={`h-4.5 w-4.5 ${activeTab === 'forwarders' ? 'text-[#68e6d4]' : 'text-slate-400 group-hover:text-[#68e6d4]'}`} />
+                  <span>Freight Forwarders</span>
+                </div>
+                <ChevronRight className="h-4 w-4 opacity-40 group-hover:opacity-100 transition-opacity" />
+              </button>
+
+              <button
                 id="btn_nav_customs"
                 onClick={() => setActiveTab('customs')}
                 className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-semibold transition-all duration-200 group ${
@@ -2091,6 +2108,7 @@ export default function App() {
                 {activeTab === 'operations' && 'Operations Inbox'}
                 {activeTab === 'dashboard' && 'Warehouse Operations Overview'}
                 {activeTab === 'shipping' && 'Shipping Control Tower'}
+                {activeTab === 'forwarders' && 'Freight Forwarders'}
                 {activeTab === 'customs' && 'Caribbean Duties & Landed Cost'}
                 {activeTab === 'inventory' && 'Stock Directory & Inventory Control'}
                 {activeTab === 'replenishment' && 'Replenishment Intelligence'}
@@ -2103,6 +2121,7 @@ export default function App() {
                 {activeTab === 'operations' && 'Prioritized shipping, customs, inventory and procurement exceptions that need action.'}
                 {activeTab === 'dashboard' && 'Real-time telemetry, stock valuations, low stock alerts, and zone utilization ratios.'}
                 {activeTab === 'shipping' && 'Track inbound and outbound shipments, carrier events, ETAs, customs stages and exceptions in one view.'}
+                {activeTab === 'forwarders' && 'Manage forwarding facilities, receiving instructions and logistics partner routes across your workspace.'}
                 {activeTab === 'customs' && 'Estimate import duties, taxes, clearance costs and true landed cost using verified effective-dated rules.'}
                 {activeTab === 'inventory' && 'Browse, search, edit, and quickly log inbound shipments or outbound customer orders.'}
                 {activeTab === 'replenishment' && 'Forecast stockouts using actual demand, inbound stock, supplier lead time, freight, customs and safety stock.'}
@@ -2156,6 +2175,13 @@ export default function App() {
 
             {activeTab === 'shipping' && token && (
               <ShippingControlTower token={token} />
+            )}
+
+            {activeTab === 'forwarders' && token && (
+              <FreightForwarders
+                token={token}
+                canManage={userRole === 'admin' || userRole === 'manager'}
+              />
             )}
 
             {activeTab === 'customs' && token && (
