@@ -876,7 +876,7 @@ export async function findUserByEmail(email: string) {
       tokenVersion: row.token_version || 1
     };
   } else {
-    const matched = memUsers.find(u => u.normalizeInvitationEmail(email) === normEmail);
+    const matched = memUsers.find(u => normalizeInvitationEmail(u.email) === normEmail);
     return matched ? { ...matched, tokenVersion: matched.tokenVersion || 1 } : null;
   }
 }
@@ -946,11 +946,11 @@ export async function changeUserPassword(userId: string, currentPass: string, ne
     }
   }
 
-  if (!newPass || newPass.length < 6) {
-    throw new Error('New password must be at least 6 characters long.');
+  if (!newPass || newPass.length < 12 || newPass.length > 128) {
+    throw new Error('New password must be between 12 and 128 characters long.');
   }
 
-  const newHash = await bcrypt.hash(newPass, 10);
+  const newHash = await bcrypt.hash(newPass, 12);
   const nextTokenVersion = (user.tokenVersion || 1) + 1;
 
   if (usePostgres) {
