@@ -64,6 +64,7 @@ import { PurchaseOrdersManager } from './components/PurchaseOrdersManager';
 import { ShippingControlTower } from './components/ShippingControlTower';
 import { CustomsLandedCost } from './components/CustomsLandedCost';
 import { ReplenishmentIntelligence } from './components/ReplenishmentIntelligence';
+import { OperationsInbox } from './components/OperationsInbox';
 
 import { 
   InventoryItem, 
@@ -454,7 +455,7 @@ export default function App() {
   };
 
   // --- UI Navigation ---
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'shipping' | 'customs' | 'inventory' | 'replenishment' | 'map' | 'history' | 'suppliers' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'operations' | 'dashboard' | 'shipping' | 'customs' | 'inventory' | 'replenishment' | 'map' | 'history' | 'suppliers' | 'settings'>('operations');
   const [historySubTab, setHistorySubTab] = useState<'movements' | 'dispatches' | 'audit'>('movements');
 
   // --- Search & Filter States ---
@@ -1860,6 +1861,22 @@ export default function App() {
 
             {/* Navigation Options */}
             <nav className="px-3 py-4 space-y-1.5" id="siwm_nav_list">
+              <button
+                id="btn_nav_operations"
+                onClick={() => setActiveTab('operations')}
+                className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-semibold transition-all duration-200 group ${
+                  activeTab === 'operations'
+                    ? 'bg-gradient-to-r from-rose-500/18 to-[#0A86FF]/10 text-white border border-rose-500/25'
+                    : 'text-slate-400 hover:bg-white/[0.045] hover:text-white border border-transparent'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <AlertTriangle className={`h-4.5 w-4.5 ${activeTab === 'operations' ? 'text-rose-300' : 'text-slate-400 group-hover:text-rose-300'}`} />
+                  <span>Operations Inbox</span>
+                </div>
+                <ChevronRight className="h-4 w-4 opacity-40 group-hover:opacity-100 transition-opacity" />
+              </button>
+
               <button 
                 id="btn_nav_dashboard"
                 onClick={() => setActiveTab('dashboard')}
@@ -2071,6 +2088,7 @@ export default function App() {
           <header id="siwm_header" className="px-5 xl:px-7 py-4 border-b border-[#17324d]/80 flex items-center justify-between bg-[#07111f]/95 backdrop-blur-xl sticky top-0 z-20">
             <div>
               <h2 className="text-xl font-bold tracking-tight text-white flex items-center gap-3">
+                {activeTab === 'operations' && 'Operations Inbox'}
                 {activeTab === 'dashboard' && 'Warehouse Operations Overview'}
                 {activeTab === 'shipping' && 'Shipping Control Tower'}
                 {activeTab === 'customs' && 'Caribbean Duties & Landed Cost'}
@@ -2082,6 +2100,7 @@ export default function App() {
                 {activeTab === 'settings' && 'Workspace Configuration & Permissions'}
               </h2>
               <p className="text-sm text-slate-400 mt-1">
+                {activeTab === 'operations' && 'Prioritized shipping, customs, inventory and procurement exceptions that need action.'}
                 {activeTab === 'dashboard' && 'Real-time telemetry, stock valuations, low stock alerts, and zone utilization ratios.'}
                 {activeTab === 'shipping' && 'Track inbound and outbound shipments, carrier events, ETAs, customs stages and exceptions in one view.'}
                 {activeTab === 'customs' && 'Estimate import duties, taxes, clearance costs and true landed cost using verified effective-dated rules.'}
@@ -2131,6 +2150,10 @@ export default function App() {
           {/* VIEW RENDER CONTROLLERS */}
           <div className="p-4 sm:p-5 xl:p-7 flex-1" id="siwm_view_container">
             
+            {activeTab === 'operations' && token && (
+              <OperationsInbox token={token} onNavigate={(view) => setActiveTab(view)} />
+            )}
+
             {activeTab === 'shipping' && token && (
               <ShippingControlTower token={token} />
             )}
