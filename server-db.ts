@@ -2865,7 +2865,6 @@ export async function createWorkspaceInvitation(params: {
         [id, params.warehouseId, email, params.name?.trim() || null, role, tokenHash, params.createdBy, expiresAt, createdAt],
       );
       await client.query('COMMIT');
-      return { checkpoint, inserted: inserted.rowCount === 1 };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -3243,12 +3242,12 @@ export async function consolidateSwimShipments(
          FOR UPDATE`,
         [warehouseId, ids],
       );
-      const records = result.rows.map(mapShipmentRow);
-      const master = records.find((record) => record.id === masterShipmentId);
+      const records: ShipmentRecord[] = result.rows.map((row: any) => mapShipmentRow(row));
+      const master = records.find((record: ShipmentRecord) => record.id === masterShipmentId);
       if (!master) throw new Error('Master shipment was not found in this workspace.');
       if (master.parentShipmentId) throw new Error('A shipment already inside another consolidation cannot become a master shipment.');
       const children = uniqueChildIds.map((id) => {
-        const child = records.find((record) => record.id === id);
+        const child = records.find((record: ShipmentRecord) => record.id === id);
         if (!child) throw new Error('One or more child shipments were not found in this workspace.');
         const decision = canConsolidateShipment(master, child);
         if (!decision.allowed) throw new Error(decision.reason);
@@ -3476,6 +3475,7 @@ export async function addSwimTrackingCheckpoint(
         );
       }
       await client.query('COMMIT');
+      return { checkpoint, inserted: inserted.rowCount === 1 };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
