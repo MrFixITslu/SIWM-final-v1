@@ -74,3 +74,19 @@ export function sortCheckpoints(
     (a, b) => new Date(a.eventTime).getTime() - new Date(b.eventTime).getTime()
   );
 }
+
+export function mapTrackingStatusToShipmentStatus(status: TrackingStatus) {
+  switch (status) {
+    case 'LABEL_CREATED': return 'BOOKED' as const;
+    case 'PICKED_UP': return 'PICKED_UP' as const;
+    case 'IN_TRANSIT': return 'IN_TRANSIT' as const;
+    case 'AT_FORWARDER': return 'AT_FORWARDER' as const;
+    case 'AT_PORT': return 'AT_PORT' as const;
+    case 'CUSTOMS': return 'CUSTOMS_PROCESSING' as const;
+    case 'OUT_FOR_DELIVERY': return 'OUT_FOR_DELIVERY' as const;
+    case 'DELIVERED': return 'DELIVERED' as const;
+    case 'RETURNED': return 'RETURNED' as const;
+    case 'EXCEPTION': return 'EXCEPTION' as const;
+    default: return undefined;
+  }
+}
