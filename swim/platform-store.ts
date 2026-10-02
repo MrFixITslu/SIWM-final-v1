@@ -5,7 +5,8 @@ import {
   ShipmentRecord,
   SwimEvent,
   SwimEventInput,
-  TrackingCheckpoint
+  TrackingCheckpoint,
+  TrackingProviderRegistration
 } from './domain.js';
 import { newSwimId, requireSafeId } from './security.js';
 
@@ -102,6 +103,22 @@ export async function initSwimPlatformStore(): Promise<void> {
     )
   `);
   await swimDbQuery(`CREATE INDEX IF NOT EXISTS idx_swim_tracking_shipment_time ON swim_tracking_checkpoints(warehouse_id, shipment_id, event_time DESC)`);
+
+  await swimDbQuery(`
+    CREATE TABLE IF NOT EXISTS swim_tracking_registrations (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      shipment_id VARCHAR(80) NOT NULL REFERENCES swim_shipments(id) ON DELETE CASCADE,
+      provider_code VARCHAR(40) NOT NULL,
+      provider_tracking_id VARCHAR(160) NOT NULL,
+      tracking_number VARCHAR(120) NOT NULL,
+      carrier_code VARCHAR(40),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE(provider_code, provider_tracking_id),
+      UNIQUE(warehouse_id, shipment_id, provider_code, tracking_number)
+    )
+  `);
+  await swimDbQuery(`CREATE INDEX IF NOT EXISTS idx_swim_tracking_registration_shipment ON swim_tracking_registrations(warehouse_id, shipment_id)`);
 
   await swimDbQuery(`
     CREATE TABLE IF NOT EXISTS swim_customs_rules (
@@ -317,6 +334,63 @@ export async function listTrackingCheckpoints(
   return result.rows.map(mapCheckpoint);
 }
 
+export async function registerTrackingProvider(
+  registration: Omit<TrackingProviderRegistration, 'createdAt'>
+): Promise<TrackingProviderRegistration> {
+  const result = await swimDbQuery<any>(
+    `INSERT INTO swim_tracking_registrations (
+      id, warehouse_id, shipment_id, provider_code, provider_tracking_id,
+      tracking_number, carrier_code
+    ) VALUES ($1,$2,$3,$4,$5,$6,$7)
+    ON CONFLICT (provider_code, provider_tracking_id)
+    DO UPDATE SET carrier_code = EXCLUDED.carrier_code
+    RETURNING *`,
+    [
+      registration.id,
+      requireSafeId(registration.warehouseId, 'warehouseId'),
+      requireSafeId(registration.shipmentId, 'shipmentId'),
+      registration.providerCode,
+      registration.providerTrackingId,
+      registration.trackingNumber,
+      registration.carrierCode || null
+    ]
+  );
+  return mapTrackingRegistration(result.rows[0]);
+}
+
+export async function getTrackingRegistration(
+  warehouseId: string,
+  shipmentId: string,
+  providerCode?: string
+): Promise<TrackingProviderRegistration | undefined> {
+  const params: any[] = [
+    requireSafeId(warehouseId, 'warehouseId'),
+    requireSafeId(shipmentId, 'shipmentId')
+  ];
+  let sql = `SELECT * FROM swim_tracking_registrations
+             WHERE warehouse_id = $1 AND shipment_id = $2`;
+  if (providerCode) {
+    params.push(providerCode.trim().toUpperCase());
+    sql += ` AND provider_code = $3`;
+  }
+  sql += ` ORDER BY created_at DESC LIMIT 1`;
+  const result = await swimDbQuery<any>(sql, params);
+  return result.rows[0] ? mapTrackingRegistration(result.rows[0]) : undefined;
+}
+
+export async function getTrackingRegistrationByProviderId(
+  providerCode: string,
+  providerTrackingId: string
+): Promise<TrackingProviderRegistration | undefined> {
+  const result = await swimDbQuery<any>(
+    `SELECT * FROM swim_tracking_registrations
+     WHERE provider_code = $1 AND provider_tracking_id = $2
+     LIMIT 1`,
+    [providerCode.trim().toUpperCase(), providerTrackingId]
+  );
+  return result.rows[0] ? mapTrackingRegistration(result.rows[0]) : undefined;
+}
+
 export async function listCustomsRules(
   jurisdictionCode: string
 ): Promise<CustomsRule[]> {
@@ -432,5 +506,18 @@ function mapCheckpoint(row: any): TrackingCheckpoint {
     source: row.source,
     rawProviderStatus: row.raw_provider_status || undefined,
     providerEventId: row.provider_event_id || undefined
+  };
+}
+
+function mapTrackingRegistration(row: any): TrackingProviderRegistration {
+  return {
+    id: row.id,
+    warehouseId: row.warehouse_id,
+    shipmentId: row.shipment_id,
+    providerCode: row.provider_code,
+    providerTrackingId: row.provider_tracking_id,
+    trackingNumber: row.tracking_number,
+    carrierCode: row.carrier_code || undefined,
+    createdAt: row.created_at
   };
 }
