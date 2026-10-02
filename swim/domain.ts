@@ -24,6 +24,7 @@ export interface SwimEventInput {
   actorId?: string;
   actorName?: string;
   source?: string;
+  dedupeKey?: string;
   correlationId?: string;
   causationId?: string;
   metadata?: Record<string, unknown>;
