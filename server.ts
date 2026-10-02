@@ -8,6 +8,7 @@ import {
   authRateLimiter,
   newId,
   newWarehouseCode,
+  requirePermission,
   signSessionToken,
   validatePassword,
   writeRateLimiter,
@@ -62,7 +63,11 @@ import {
   getWarehouseUsers,
   updateWarehouseUserRole,
   removeUserFromWarehouse,
-  inviteUserToWarehouse
+  createWorkspaceInvitation,
+  listWorkspaceInvitations,
+  getWorkspaceInvitationPreview,
+  acceptWorkspaceInvitationForExistingUser,
+  registerWithWorkspaceInvitation
 } from './server-db.js';
 
 async function startServer() {
@@ -318,6 +323,100 @@ async function startServer() {
     } catch (err: any) {
       console.error('Password change error:', err);
       res.status(400).json({ error: err.message || 'Failed to change password.', details: err.message });
+    }
+  });
+
+  // Secure, single-use workspace invitation preview. The token itself is never stored in plaintext.
+  app.get('/api/auth/invitations/:token', authRateLimiter, async (req, res) => {
+    try {
+      const inviteToken = Array.isArray(req.params.token) ? req.params.token[0] : String(req.params.token || '');
+      const preview = await getWorkspaceInvitationPreview(inviteToken);
+      res.json({ invitation: preview });
+    } catch {
+      res.status(404).json({ error: 'Invitation is invalid or expired.' });
+    }
+  });
+
+  // New users register through an invitation. The invited email must match exactly.
+  app.post('/api/auth/invitations/register', authRateLimiter, async (req, res) => {
+    try {
+      const { token, email, name, password } = req.body || {};
+      if (!token || !email || !name || !password) {
+        res.status(400).json({ error: 'Invitation token, email, name, and password are required.' });
+        return;
+      }
+      const passwordCheck = validatePassword(password);
+      if (!passwordCheck.ok) {
+        res.status(400).json({ error: passwordCheck.error });
+        return;
+      }
+      const passwordHash = await bcrypt.hash(password, 12);
+      const result = await registerWithWorkspaceInvitation({ token, email, name, passwordHash });
+      const sessionToken = signSessionToken({
+        id: result.user.id,
+        email: result.user.email,
+        name: result.user.name,
+        warehouseId: result.warehouse.id,
+        tokenVersion: 1,
+      });
+      await logSystemAudit({
+        warehouseId: result.warehouse.id,
+        action: 'WORKSPACE_INVITATION_ACCEPTED',
+        category: 'USER',
+        details: `Workspace invitation accepted by ${result.user.email}.`,
+        operator: result.user.name,
+        operatorId: result.user.id,
+        status: 'SUCCESS',
+      });
+      res.status(201).json({
+        token: sessionToken,
+        user: { id: result.user.id, email: result.user.email, name: result.user.name },
+        warehouse: result.warehouse,
+        warehouses: [result.warehouse],
+        role: result.role,
+      });
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || 'Unable to accept invitation.' });
+    }
+  });
+
+  // Existing users accept the invite after authenticating. This prevents one account
+  // from claiming a link issued to another email address.
+  app.post('/api/auth/invitations/accept', authenticateToken, async (req: any, res) => {
+    try {
+      const token = typeof req.body?.token === 'string' ? req.body.token : '';
+      if (!token) {
+        res.status(400).json({ error: 'Invitation token is required.' });
+        return;
+      }
+      const accepted = await acceptWorkspaceInvitationForExistingUser(token, req.user.id, req.user.email);
+      const warehouse = await findWarehouseById(accepted.warehouseId);
+      if (!warehouse) throw new Error('Workspace no longer exists.');
+      const sessionToken = signSessionToken({
+        id: req.user.id,
+        email: req.user.email,
+        name: req.user.name,
+        warehouseId: accepted.warehouseId,
+        tokenVersion: req.user.tokenVersion,
+      });
+      await logSystemAudit({
+        warehouseId: accepted.warehouseId,
+        action: 'WORKSPACE_INVITATION_ACCEPTED',
+        category: 'USER',
+        details: `Existing account ${req.user.email} accepted a workspace invitation.`,
+        operator: req.user.name || req.user.email,
+        operatorId: req.user.id,
+        status: 'SUCCESS',
+      });
+      res.json({
+        status: 'success',
+        token: sessionToken,
+        warehouse,
+        warehouses: await getUserWarehouses(req.user.id),
+        role: accepted.role,
+      });
+    } catch (err: any) {
+      res.status(400).json({ error: err?.message || 'Unable to accept invitation.' });
     }
   });
 
@@ -1223,39 +1322,71 @@ async function startServer() {
     }
   });
 
-  // --- Invite/Add User to Warehouse Endpoint ---
-  app.post('/api/warehouse/users', authenticateToken, async (req: any, res) => {
+  // --- Secure Workspace Invitations ---
+  app.get('/api/warehouse/invitations', authenticateToken, requirePermission('team.manage'), async (req: any, res) => {
     try {
-      const warehouseId = req.user.warehouseId;
+      res.json({ invitations: await listWorkspaceInvitations(req.user.warehouseId) });
+    } catch (err) {
+      console.error('Error listing workspace invitations:', err);
+      res.status(500).json({ error: 'Unable to list workspace invitations.' });
+    }
+  });
 
-      // Permission check: admin only
-      const role = await getUserRoleInWarehouse(req.user.id, warehouseId);
-      if (role !== 'admin') {
-        res.status(403).json({ error: 'Access denied: Only Administrators can manage warehouse operator accounts.' });
-        return;
-      }
-
-      const { email, name, role: targetRole } = req.body;
+  app.post('/api/warehouse/invitations', authenticateToken, requirePermission('team.manage'), async (req: any, res) => {
+    try {
+      const email = typeof req.body?.email === 'string' ? req.body.email.trim() : '';
+      const name = typeof req.body?.name === 'string' ? req.body.name.trim() : '';
+      const targetRole = typeof req.body?.role === 'string' ? req.body.role : 'operator';
       if (!email) {
         res.status(400).json({ error: 'Operator email is required.' });
         return;
       }
-
-      const { user, isNewUser, tempPassword } = await inviteUserToWarehouse(warehouseId, email, name, targetRole || 'operator');
-      const updatedUsersList = await getWarehouseUsers(warehouseId);
-
+      if (!['admin','manager','operator','viewer'].includes(targetRole)) {
+        res.status(400).json({ error: 'Invalid workspace role.' });
+        return;
+      }
+      if (email.toLowerCase() === String(req.user.email || '').toLowerCase()) {
+        res.status(400).json({ error: 'You cannot invite your own active account.' });
+        return;
+      }
+      const invitation = await createWorkspaceInvitation({
+        warehouseId: req.user.warehouseId,
+        email,
+        name,
+        role: targetRole,
+        createdBy: req.user.id,
+        ttlHours: 72,
+      });
+      await logSystemAudit({
+        warehouseId: req.user.warehouseId,
+        action: 'WORKSPACE_INVITATION_CREATED',
+        category: 'USER',
+        details: `Invitation created for ${invitation.email} with role ${invitation.role}.`,
+        operator: req.user.name || req.user.email,
+        operatorId: req.user.id,
+        status: 'SUCCESS',
+      });
       res.status(201).json({
         status: 'success',
-        message: isNewUser
-          ? `Account created for new operator ${email}. Temporary password: ${tempPassword} (share this securely - it won't be shown again).`
-          : `Existing account for ${email} has been associated with your warehouse.`,
-        tempPassword: isNewUser ? tempPassword : undefined,
-        users: updatedUsersList
+        message: `Secure invitation created for ${invitation.email}. It expires in 72 hours and can be used once.`,
+        invitation: {
+          id: invitation.id,
+          email: invitation.email,
+          name: invitation.name,
+          role: invitation.role,
+          expiresAt: invitation.expiresAt,
+          token: invitation.token,
+        },
       });
     } catch (err: any) {
-      console.error('Error adding user:', err);
-      res.status(500).json({ error: 'Failed to add operator account to warehouse.', details: err.message });
+      console.error('Error creating workspace invitation:', err);
+      res.status(400).json({ error: err?.message || 'Unable to create workspace invitation.' });
     }
+  });
+
+  // Legacy temp-password onboarding is deliberately retired.
+  app.post('/api/warehouse/users', authenticateToken, (_req, res) => {
+    res.status(410).json({ error: 'Temporary-password onboarding has been retired. Use /api/warehouse/invitations.' });
   });
 
   // --- Edit Member User Role Endpoint ---
@@ -1276,8 +1407,12 @@ async function startServer() {
         res.status(400).json({ error: 'You cannot change your own Administrator permissions.' });
         return;
       }
+      if (!['admin','manager','operator','viewer'].includes(targetRole)) {
+        res.status(400).json({ error: 'Invalid workspace role.' });
+        return;
+      }
 
-      await updateWarehouseUserRole(warehouseId, userId, targetRole || 'operator');
+      await updateWarehouseUserRole(warehouseId, userId, targetRole);
       const updatedUsersList = await getWarehouseUsers(warehouseId);
 
       res.json({
