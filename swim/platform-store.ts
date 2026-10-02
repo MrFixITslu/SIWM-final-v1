@@ -24,6 +24,7 @@ export async function initSwimPlatformStore(): Promise<void> {
       actor_id VARCHAR(80),
       actor_name VARCHAR(200),
       source VARCHAR(120) NOT NULL DEFAULT 'SWIM',
+      dedupe_key VARCHAR(240),
       correlation_id VARCHAR(80),
       causation_id VARCHAR(80),
       metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
@@ -34,6 +35,7 @@ export async function initSwimPlatformStore(): Promise<void> {
   `);
   await swimDbQuery(`CREATE INDEX IF NOT EXISTS idx_swim_events_tenant_time ON swim_events(warehouse_id, recorded_at DESC)`);
   await swimDbQuery(`CREATE INDEX IF NOT EXISTS idx_swim_events_aggregate ON swim_events(warehouse_id, aggregate_type, aggregate_id, sequence)`);
+  await swimDbQuery(`CREATE UNIQUE INDEX IF NOT EXISTS idx_swim_events_dedupe ON swim_events(source, dedupe_key) WHERE dedupe_key IS NOT NULL`);
 
   await swimDbQuery(`
     CREATE OR REPLACE FUNCTION prevent_swim_event_mutation()
@@ -175,11 +177,13 @@ export async function appendSwimEvent(input: SwimEventInput): Promise<SwimEvent>
   const result = await swimDbQuery<any>(
     `INSERT INTO swim_events (
       id, warehouse_id, organization_id, event_type, category, aggregate_type,
-      aggregate_id, severity, actor_id, actor_name, source, correlation_id,
+      aggregate_id, severity, actor_id, actor_name, source, dedupe_key, correlation_id,
       causation_id, metadata, occurred_at
     ) VALUES (
-      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14::jsonb,$15
+      $1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15::jsonb,$16
     )
+    ON CONFLICT (source, dedupe_key) WHERE dedupe_key IS NOT NULL
+    DO NOTHING
     RETURNING *, recorded_at AS "recordedAt", occurred_at AS "occurredAt"`,
     [
       id,
@@ -193,13 +197,25 @@ export async function appendSwimEvent(input: SwimEventInput): Promise<SwimEvent>
       input.actorId || null,
       input.actorName || null,
       input.source || 'SWIM',
+      input.dedupeKey || null,
       input.correlationId || null,
       input.causationId || null,
       JSON.stringify(input.metadata || {}),
       occurredAt
     ]
   );
+  if (result.rows.length === 0 && input.dedupeKey) {
+    const existing = await swimDbQuery<any>(
+      `SELECT * FROM swim_events WHERE source = $1 AND dedupe_key = $2 LIMIT 1`,
+      [input.source || 'SWIM', input.dedupeKey]
+    );
+    if (existing.rows[0]) return mapSwimEvent(existing.rows[0]);
+  }
   const row = result.rows[0];
+  return mapSwimEvent(row);
+}
+
+function mapSwimEvent(row: any): SwimEvent {
   return {
     id: row.id,
     warehouseId: row.warehouse_id,
@@ -212,6 +228,7 @@ export async function appendSwimEvent(input: SwimEventInput): Promise<SwimEvent>
     actorId: row.actor_id || undefined,
     actorName: row.actor_name || undefined,
     source: row.source,
+    dedupeKey: row.dedupe_key || undefined,
     correlationId: row.correlation_id || undefined,
     causationId: row.causation_id || undefined,
     metadata: row.metadata || {},
