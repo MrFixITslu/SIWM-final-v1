@@ -131,6 +131,20 @@ let memAuditLogs: any[] = [];
 
 let memDispatchRecords: any[] = [];
 
+export function isPersistentDatabaseAvailable(): boolean {
+  return Boolean(usePostgres && pool);
+}
+
+export async function swimDbQuery<T = any>(
+  text: string,
+  params: any[] = []
+): Promise<{ rows: T[]; rowCount: number }> {
+  if (!usePostgres || !pool) {
+    throw new Error('Persistent PostgreSQL storage is required for this SWIM operation.');
+  }
+  return pool.query(text, params);
+}
+
 export async function initDb() {
   console.log('Initializing database connectivity...');
   
