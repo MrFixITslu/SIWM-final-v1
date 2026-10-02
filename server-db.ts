@@ -180,6 +180,7 @@ let memAuditLogs: any[] = [];
 let memDispatchRecords: any[] = [];
 let memShipments: any[] = [];
 let memShipmentLegs: any[] = [];
+let memTrackingSubscriptions: any[] = [];
 let memTrackingEvents: any[] = [];
 let memLogisticsUnits: any[] = [];
 let memCustomsRules: any[] = [];
@@ -510,6 +511,27 @@ async function runMigrations() {
     )
   `);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_tracking_shipment_time ON swim_tracking_events(warehouse_id, shipment_id, occurred_at DESC)`);
+
+  // Provider subscriptions are tenant-scoped and store provider IDs only, never API credentials.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_tracking_subscriptions (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      shipment_id VARCHAR(80) NOT NULL REFERENCES swim_shipments(id) ON DELETE CASCADE,
+      provider_key VARCHAR(40) NOT NULL,
+      external_tracker_id VARCHAR(128) NOT NULL,
+      tracking_number VARCHAR(220) NOT NULL,
+      carrier VARCHAR(100),
+      status VARCHAR(30) NOT NULL DEFAULT 'ACTIVE',
+      last_sync_at TIMESTAMPTZ,
+      last_error TEXT,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (warehouse_id, shipment_id, provider_key),
+      UNIQUE (provider_key, external_tracker_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_tracking_subscription_shipment ON swim_tracking_subscriptions(warehouse_id, shipment_id)`);
 
   // Secure webhook replay ledger. Receipt reservation happens before any provider event is applied.
   await pool.query(`
@@ -2843,6 +2865,7 @@ export async function createWorkspaceInvitation(params: {
         [id, params.warehouseId, email, params.name?.trim() || null, role, tokenHash, params.createdBy, expiresAt, createdAt],
       );
       await client.query('COMMIT');
+      return { checkpoint, inserted: inserted.rowCount === 1 };
     } catch (error) {
       await client.query('ROLLBACK');
       throw error;
@@ -3259,6 +3282,132 @@ export async function consolidateSwimShipments(
   return { master, children: children.map((child) => ({ ...child, parentShipmentId: masterShipmentId })) };
 }
 
+export interface SwimTrackingSubscription {
+  id: string;
+  warehouseId: string;
+  shipmentId: string;
+  providerKey: string;
+  externalTrackerId: string;
+  trackingNumber: string;
+  carrier?: string;
+  status: 'ACTIVE' | 'PAUSED' | 'ERROR';
+  lastSyncAt?: string;
+  lastError?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+function mapTrackingSubscription(row: any): SwimTrackingSubscription {
+  return {
+    id: row.id,
+    warehouseId: row.warehouse_id || row.warehouseId,
+    shipmentId: row.shipment_id || row.shipmentId,
+    providerKey: row.provider_key || row.providerKey,
+    externalTrackerId: row.external_tracker_id || row.externalTrackerId,
+    trackingNumber: row.tracking_number || row.trackingNumber,
+    carrier: row.carrier || undefined,
+    status: row.status || 'ACTIVE',
+    lastSyncAt: row.last_sync_at ? new Date(row.last_sync_at).toISOString() : row.lastSyncAt,
+    lastError: row.last_error || row.lastError || undefined,
+    createdAt: new Date(row.created_at || row.createdAt).toISOString(),
+    updatedAt: new Date(row.updated_at || row.updatedAt).toISOString(),
+  };
+}
+
+export async function getSwimTrackingSubscription(
+  warehouseId: string,
+  shipmentId: string,
+): Promise<SwimTrackingSubscription | null> {
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT * FROM swim_tracking_subscriptions
+       WHERE warehouse_id=$1 AND shipment_id=$2
+       ORDER BY updated_at DESC LIMIT 1`,
+      [warehouseId, shipmentId],
+    );
+    return result.rows[0] ? mapTrackingSubscription(result.rows[0]) : null;
+  }
+  const record = memTrackingSubscriptions.find((entry) =>
+    entry.warehouseId === warehouseId && entry.shipmentId === shipmentId,
+  );
+  return record ? mapTrackingSubscription(record) : null;
+}
+
+export async function saveSwimTrackingSubscription(input: {
+  id: string;
+  warehouseId: string;
+  shipmentId: string;
+  providerKey: string;
+  externalTrackerId: string;
+  trackingNumber: string;
+  carrier?: string;
+}): Promise<SwimTrackingSubscription> {
+  if (!await getSwimShipment(input.warehouseId, input.shipmentId)) {
+    throw new Error('Shipment not found in this workspace.');
+  }
+  if (usePostgres) {
+    const result = await pool.query(
+      `INSERT INTO swim_tracking_subscriptions (
+        id, warehouse_id, shipment_id, provider_key, external_tracker_id, tracking_number,
+        carrier, status, last_sync_at, last_error
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,'ACTIVE',CURRENT_TIMESTAMP,NULL)
+      ON CONFLICT (warehouse_id, shipment_id, provider_key) DO UPDATE SET
+        external_tracker_id=EXCLUDED.external_tracker_id,
+        tracking_number=EXCLUDED.tracking_number,
+        carrier=EXCLUDED.carrier,
+        status='ACTIVE',
+        last_sync_at=CURRENT_TIMESTAMP,
+        last_error=NULL,
+        updated_at=CURRENT_TIMESTAMP
+      RETURNING *`,
+      [input.id, input.warehouseId, input.shipmentId, input.providerKey, input.externalTrackerId,
+       input.trackingNumber, input.carrier || null],
+    );
+    return mapTrackingSubscription(result.rows[0]);
+  }
+
+  const now = new Date().toISOString();
+  const existingIndex = memTrackingSubscriptions.findIndex((entry) =>
+    entry.warehouseId === input.warehouseId &&
+    entry.shipmentId === input.shipmentId &&
+    entry.providerKey === input.providerKey,
+  );
+  const record = {
+    ...input,
+    status: 'ACTIVE',
+    lastSyncAt: now,
+    lastError: undefined,
+    createdAt: existingIndex >= 0 ? memTrackingSubscriptions[existingIndex].createdAt : now,
+    updatedAt: now,
+  };
+  if (existingIndex >= 0) memTrackingSubscriptions[existingIndex] = record;
+  else memTrackingSubscriptions.push(record);
+  return mapTrackingSubscription(record);
+}
+
+export async function updateSwimTrackingSubscriptionSync(input: {
+  warehouseId: string;
+  shipmentId: string;
+  status: 'ACTIVE' | 'PAUSED' | 'ERROR';
+  lastError?: string;
+}): Promise<void> {
+  const lastError = input.lastError?.slice(0, 1000);
+  if (usePostgres) {
+    await pool.query(
+      `UPDATE swim_tracking_subscriptions
+       SET status=$1, last_sync_at=CURRENT_TIMESTAMP, last_error=$2, updated_at=CURRENT_TIMESTAMP
+       WHERE warehouse_id=$3 AND shipment_id=$4`,
+      [input.status, lastError || null, input.warehouseId, input.shipmentId],
+    );
+    return;
+  }
+  memTrackingSubscriptions = memTrackingSubscriptions.map((entry) =>
+    entry.warehouseId === input.warehouseId && entry.shipmentId === input.shipmentId
+      ? { ...entry, status: input.status, lastSyncAt: new Date().toISOString(), lastError, updatedAt: new Date().toISOString() }
+      : entry,
+  );
+}
+
 function trackingToShipmentStatus(status: TrackingCheckpoint['status']): ShipmentRecord['status'] {
   if (status === 'DELIVERED') return 'DELIVERED';
   if (status === 'CUSTOMS') return 'CUSTOMS';
@@ -3271,7 +3420,7 @@ export async function addSwimTrackingCheckpoint(
   warehouseId: string,
   shipmentId: string,
   checkpoint: TrackingCheckpoint & { id: string; payloadHash?: string },
-): Promise<TrackingCheckpoint> {
+): Promise<{ checkpoint: TrackingCheckpoint; inserted: boolean }> {
   const shipment = await getSwimShipment(warehouseId, shipmentId);
   if (!shipment) throw new Error('Shipment not found in this workspace.');
   const nextShipmentStatus = trackingToShipmentStatus(checkpoint.status);
@@ -3320,8 +3469,8 @@ export async function addSwimTrackingCheckpoint(
         updatedAt: new Date().toISOString(),
       } : entry);
     }
+    return { checkpoint, inserted: !duplicate };
   }
-  return checkpoint;
 }
 
 export async function listSwimTrackingCheckpoints(warehouseId: string, shipmentId: string): Promise<TrackingCheckpoint[]> {
