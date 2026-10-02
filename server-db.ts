@@ -3089,6 +3089,21 @@ export async function getSwimShipment(warehouseId: string, shipmentId: string): 
   return memShipments.find((shipment) => shipment.warehouseId === warehouseId && shipment.id === shipmentId) || null;
 }
 
+export async function listSwimChildShipments(warehouseId: string, masterShipmentId: string): Promise<ShipmentRecord[]> {
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT * FROM swim_shipments
+       WHERE warehouse_id=$1 AND parent_shipment_id=$2
+       ORDER BY updated_at DESC`,
+      [warehouseId, masterShipmentId],
+    );
+    return result.rows.map(mapShipmentRow);
+  }
+  return memShipments
+    .filter((shipment) => shipment.warehouseId === warehouseId && shipment.parentShipmentId === masterShipmentId)
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt));
+}
+
 export async function listSwimShipmentLegs(warehouseId: string, shipmentId: string): Promise<ShipmentLeg[]> {
   if (!await getSwimShipment(warehouseId, shipmentId)) throw new Error('Shipment not found in this workspace.');
   if (usePostgres) {
