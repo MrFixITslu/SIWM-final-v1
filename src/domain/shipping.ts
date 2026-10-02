@@ -41,6 +41,7 @@ export interface ShipmentRecord {
   purchaseOrderId?: string;
   supplierId?: string;
   customerOrderReference?: string;
+  parentShipmentId?: string;
   origin?: string;
   destination?: string;
   estimatedArrivalAt?: string;
@@ -68,4 +69,45 @@ export function shipmentNeedsAttention(shipment: Pick<ShipmentRecord, 'status' |
   if (!shipment.estimatedArrivalAt) return false;
   const eta = Date.parse(shipment.estimatedArrivalAt);
   return Number.isFinite(eta) && eta < now.getTime();
+}
+
+export function validateShipmentLegSequence(legs: ShipmentLeg[]): { valid: true } | { valid: false; reason: string } {
+  if (!legs.length) return { valid: true };
+  const ordered = [...legs].sort((a, b) => a.sequence - b.sequence);
+  const seen = new Set<number>();
+  for (let index = 0; index < ordered.length; index += 1) {
+    const leg = ordered[index];
+    if (!Number.isInteger(leg.sequence) || leg.sequence < 1) {
+      return { valid: false, reason: 'Shipment leg sequence numbers must be positive integers.' };
+    }
+    if (seen.has(leg.sequence)) {
+      return { valid: false, reason: 'Shipment leg sequence numbers must be unique.' };
+    }
+    seen.add(leg.sequence);
+    if (!leg.origin.trim() || !leg.destination.trim()) {
+      return { valid: false, reason: 'Each shipment leg requires an origin and destination.' };
+    }
+    if (index > 0) {
+      const previous = ordered[index - 1];
+      if (previous.destination.trim().toLowerCase() !== leg.origin.trim().toLowerCase()) {
+        return { valid: false, reason: 'Shipment legs must form a continuous journey.' };
+      }
+    }
+  }
+  return { valid: true };
+}
+
+export function canConsolidateShipment(
+  master: Pick<ShipmentRecord, 'id' | 'status' | 'parentShipmentId'>,
+  child: Pick<ShipmentRecord, 'id' | 'status' | 'parentShipmentId'>,
+): { allowed: true } | { allowed: false; reason: string } {
+  if (master.id === child.id) return { allowed: false, reason: 'A shipment cannot contain itself.' };
+  if (child.parentShipmentId) return { allowed: false, reason: 'This shipment is already part of a consolidation.' };
+  if (['DELIVERED', 'RECEIVED', 'CANCELLED'].includes(master.status)) {
+    return { allowed: false, reason: 'Completed or cancelled master shipments cannot accept new child shipments.' };
+  }
+  if (['DELIVERED', 'RECEIVED', 'CANCELLED'].includes(child.status)) {
+    return { allowed: false, reason: 'Completed or cancelled shipments cannot be consolidated.' };
+  }
+  return { allowed: true };
 }
