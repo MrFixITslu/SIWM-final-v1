@@ -187,3 +187,14 @@ export interface AutomationApproval {
   decidedAt?: string;
   decidedBy?: string;
 }
+
+export interface TrackingProviderRegistration {
+  id: string;
+  warehouseId: string;
+  shipmentId: string;
+  providerCode: string;
+  providerTrackingId: string;
+  trackingNumber: string;
+  carrierCode?: string;
+  createdAt: string;
+}
