@@ -80,7 +80,7 @@ export async function buildReplenishmentForecast(
     UNCONFIGURED: 5,
   };
 
-  const forecasts: ReplenishmentForecastRow[] = items.map((item: any) => {
+  const forecasts: ReplenishmentForecastRow[] = items.map((item: any): ReplenishmentForecastRow => {
     const policy = (item.supplierId && policyBySupplier.get(item.supplierId)) || defaultPolicy;
     const inbound = inboundByItemId.get(item.id) || inboundBySku.get(String(item.sku || '').toUpperCase()) || 0;
     if (!policy) {
@@ -121,7 +121,7 @@ export async function buildReplenishmentForecast(
       },
       ...forecast,
     };
-  }).sort((a, b) =>
+  }).sort((a: ReplenishmentForecastRow, b: ReplenishmentForecastRow) =>
     (riskOrder[a.risk] ?? 99) - (riskOrder[b.risk] ?? 99) ||
     (a.stockoutInDays ?? Number.POSITIVE_INFINITY) - (b.stockoutInDays ?? Number.POSITIVE_INFINITY)
   );
