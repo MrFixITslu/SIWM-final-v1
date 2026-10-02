@@ -2004,6 +2004,38 @@ async function startServer() {
             return rate;
           };
 
+          const allowedBaseComponents = new Set([
+            'CUSTOMS_VALUE',
+            'IMPORT_DUTY',
+            'CUSTOMS_SERVICE_CHARGE',
+            'EXCISE',
+            'ENVIRONMENTAL_LEVY',
+            'OTHER_TAXES'
+          ]);
+          const rawPolicy = raw?.calculationPolicy;
+          if (!rawPolicy || typeof rawPolicy !== 'object' || Array.isArray(rawPolicy)) {
+            throw new Error(`Rule ${index + 1}: calculationPolicy is required for verified tariff imports.`);
+          }
+          const parseBase = (value: unknown, label: string) => {
+            if (value === undefined) return undefined;
+            if (!Array.isArray(value) || value.length < 1) {
+              throw new Error(`Rule ${index + 1}: ${label} must be a non-empty array.`);
+            }
+            const components = value.map((item) => String(item).trim().toUpperCase());
+            if (components.some((item) => !allowedBaseComponents.has(item))) {
+              throw new Error(`Rule ${index + 1}: ${label} contains an unsupported tax-base component.`);
+            }
+            return components;
+          };
+          const calculationPolicy = {
+            importDutyBase: parseBase(rawPolicy.importDutyBase, 'importDutyBase'),
+            customsServiceBase: parseBase(rawPolicy.customsServiceBase, 'customsServiceBase'),
+            exciseBase: parseBase(rawPolicy.exciseBase, 'exciseBase'),
+            environmentalLevyBase: parseBase(rawPolicy.environmentalLevyBase, 'environmentalLevyBase'),
+            otherTaxBase: parseBase(rawPolicy.otherTaxBase, 'otherTaxBase'),
+            vatBase: parseBase(rawPolicy.vatBase, 'vatBase')
+          };
+
           const safeVersion = version.replace(/[^a-zA-Z0-9._-]/g, '-').slice(0, 40);
           const id = String(raw?.id || `customs-${jurisdictionCode}-${hsCodePrefix}-${safeVersion}`).slice(0, 100);
 
@@ -2023,7 +2055,8 @@ async function startServer() {
             officialSourceUrl: sourceUrl.toString(),
             sourceTitle,
             verifiedAt: verifiedAt.toISOString(),
-            version
+            version,
+            calculationPolicy
           };
         });
 
