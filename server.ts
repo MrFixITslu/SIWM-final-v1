@@ -55,8 +55,30 @@ import {
   getWarehouseUsers,
   updateWarehouseUserRole,
   removeUserFromWarehouse,
-  inviteUserToWarehouse
+  inviteUserToWarehouse,
+  isPersistentDatabaseAvailable
 } from './server-db.js';
+import {
+  initSwimPlatformStore,
+  appendSwimEvent,
+  createShipment,
+  listShipments,
+  addTrackingCheckpoint,
+  listTrackingCheckpoints,
+  listCustomsRules
+} from './swim/platform-store.js';
+import {
+  newSwimId,
+  normalizeCountryCode,
+  normalizeHsCode,
+  normalizeTrackingNumber,
+  requireNonNegativeMoney,
+  requireSafeId
+} from './swim/security.js';
+import { calculateLandedCost, findApplicableCustomsRule } from './swim/customs.js';
+import { listCarrierAdapters, normalizeProviderStatus } from './swim/tracking.js';
+import type { ShipmentRecord, TrackingCheckpoint } from './swim/domain.js';
+
 
 function resolveJwtSecret(): string {
   if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
@@ -115,6 +137,20 @@ function authenticateToken(req: any, res: any, next: any) {
   });
 }
 
+function requireRoles(...allowedRoles: string[]) {
+  return (req: any, res: any, next: any) => {
+    const role = String(req.user?.role || '').toLowerCase();
+    if (!allowedRoles.includes(role)) {
+      res.status(403).json({
+        error: 'This operation is not permitted for your workspace role.',
+        code: 'ROLE_FORBIDDEN'
+      });
+      return;
+    }
+    next();
+  };
+}
+
 // Rate limiter for authentication routes
 const authRateLimiter = rateLimit({
   windowMs: 15 * 60 * 1000, // 15 minutes
@@ -141,6 +177,11 @@ async function startServer() {
 
   // Initialize PostgreSQL database connection and migrations
   await initDb();
+  if (isPersistentDatabaseAvailable()) {
+    await initSwimPlatformStore();
+  } else {
+    console.warn('SWIM enterprise modules are disabled because persistent PostgreSQL storage is unavailable.');
+  }
 
   // --- Public API Endpoints ---
   
@@ -1483,7 +1524,280 @@ async function startServer() {
     const distPath = path.join(process.cwd(), 'dist');
     const indexPath = path.join(distPath, 'index.html');
     if (fs.existsSync(indexPath)) {
-      app.use(express.static(distPath));
+    
+  // --- SWIM Enterprise Logistics APIs ---
+  // All data is scoped from the authenticated token's active warehouse. Client-
+  // supplied warehouse IDs are never accepted for authorization decisions.
+
+  app.get('/api/swim/capabilities', authenticateToken, async (req: any, res) => {
+    res.json({
+      product: 'SWIM',
+      name: 'Shipping, Warehouse & Inventory Management',
+      modules: {
+        shipments: true,
+        trackingGateway: true,
+        customsEngine: true,
+        eventLedger: true,
+        approvals: true,
+        carrierAdapters: listCarrierAdapters()
+      }
+    });
+  });
+
+  app.get('/api/swim/shipments', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = requireSafeId(req.user.warehouseId, 'warehouseId');
+      const shipments = await listShipments(warehouseId);
+      res.json({ shipments });
+    } catch (err: any) {
+      console.error('SWIM shipment list error:', err);
+      res.status(500).json({ error: 'Unable to load shipments.' });
+    }
+  });
+
+  app.post(
+    '/api/swim/shipments',
+    authenticateToken,
+    requireRoles('admin', 'manager', 'operator'),
+    async (req: any, res) => {
+      try {
+        const warehouseId = requireSafeId(req.user.warehouseId, 'warehouseId');
+        const body = req.body || {};
+        const reference = String(body.reference || '').trim();
+        if (!reference || reference.length > 120) {
+          res.status(400).json({ error: 'A shipment reference is required and must be 120 characters or fewer.' });
+          return;
+        }
+
+        const allowedDirections = new Set(['INBOUND', 'OUTBOUND', 'TRANSFER', 'RETURN']);
+        const allowedModes = new Set(['AIR', 'OCEAN', 'GROUND', 'COURIER', 'OTHER']);
+        const direction = String(body.direction || 'INBOUND').toUpperCase();
+        const mode = String(body.mode || 'OTHER').toUpperCase();
+        if (!allowedDirections.has(direction) || !allowedModes.has(mode)) {
+          res.status(400).json({ error: 'Shipment direction or transport mode is invalid.' });
+          return;
+        }
+
+        const shipment: ShipmentRecord = {
+          id: newSwimId('shp'),
+          warehouseId,
+          reference,
+          direction: direction as ShipmentRecord['direction'],
+          mode: mode as ShipmentRecord['mode'],
+          status: 'PLANNED',
+          originCountry: normalizeCountryCode(body.originCountry),
+          originLocation: body.originLocation ? String(body.originLocation).trim().slice(0, 500) : undefined,
+          destinationCountry: normalizeCountryCode(body.destinationCountry),
+          destinationLocation: body.destinationLocation ? String(body.destinationLocation).trim().slice(0, 500) : undefined,
+          supplierId: body.supplierId ? requireSafeId(body.supplierId, 'supplierId') : undefined,
+          purchaseOrderId: body.purchaseOrderId ? requireSafeId(body.purchaseOrderId, 'purchaseOrderId') : undefined,
+          customerReference: body.customerReference ? String(body.customerReference).trim().slice(0, 160) : undefined,
+          freightForwarder: body.freightForwarder ? String(body.freightForwarder).trim().slice(0, 200) : undefined,
+          masterTrackingNumber: body.masterTrackingNumber ? normalizeTrackingNumber(body.masterTrackingNumber) : undefined,
+          carrierCode: body.carrierCode ? String(body.carrierCode).trim().toUpperCase().slice(0, 40) : undefined,
+          estimatedArrival: body.estimatedArrival ? new Date(body.estimatedArrival).toISOString() : undefined,
+          currency: body.currency ? String(body.currency).trim().toUpperCase().slice(0, 3) : undefined,
+          goodsValue: body.goodsValue === undefined ? undefined : requireNonNegativeMoney(body.goodsValue, 'goodsValue'),
+          freightCost: body.freightCost === undefined ? undefined : requireNonNegativeMoney(body.freightCost, 'freightCost'),
+          insuranceCost: body.insuranceCost === undefined ? undefined : requireNonNegativeMoney(body.insuranceCost, 'insuranceCost'),
+          notes: body.notes ? String(body.notes).trim().slice(0, 4000) : undefined
+        };
+
+        const saved = await createShipment(shipment);
+        await appendSwimEvent({
+          warehouseId,
+          eventType: 'SHIPMENT_CREATED',
+          category: 'SHIPMENT',
+          aggregateType: 'SHIPMENT',
+          aggregateId: saved.id,
+          actorId: req.user.id,
+          actorName: req.user.name || req.user.email,
+          metadata: {
+            reference: saved.reference,
+            direction: saved.direction,
+            mode: saved.mode
+          }
+        });
+        res.status(201).json({ shipment: saved });
+      } catch (err: any) {
+        console.error('SWIM shipment create error:', err);
+        const message = String(err?.message || '');
+        res.status(message.includes('invalid') || message.includes('required') ? 400 : 500).json({
+          error: message.includes('invalid') || message.includes('required')
+            ? message
+            : 'Unable to create shipment.'
+        });
+      }
+    }
+  );
+
+  app.get('/api/swim/shipments/:shipmentId/tracking', authenticateToken, async (req: any, res) => {
+    try {
+      const warehouseId = requireSafeId(req.user.warehouseId, 'warehouseId');
+      const shipmentId = requireSafeId(req.params.shipmentId, 'shipmentId');
+      const checkpoints = await listTrackingCheckpoints(warehouseId, shipmentId);
+      res.json({ checkpoints });
+    } catch (err: any) {
+      console.error('SWIM tracking history error:', err);
+      res.status(400).json({ error: err.message || 'Unable to load tracking history.' });
+    }
+  });
+
+  app.post(
+    '/api/swim/shipments/:shipmentId/tracking',
+    authenticateToken,
+    requireRoles('admin', 'manager', 'operator'),
+    async (req: any, res) => {
+      try {
+        const warehouseId = requireSafeId(req.user.warehouseId, 'warehouseId');
+        const shipmentId = requireSafeId(req.params.shipmentId, 'shipmentId');
+        const trackingNumber = normalizeTrackingNumber(req.body?.trackingNumber);
+        const carrierCode = String(req.body?.carrierCode || '').trim().toUpperCase();
+        if (!carrierCode || carrierCode.length > 40) {
+          res.status(400).json({ error: 'carrierCode is required.' });
+          return;
+        }
+        const rawStatus = String(req.body?.status || req.body?.rawProviderStatus || 'UNKNOWN');
+        const eventTime = req.body?.eventTime ? new Date(req.body.eventTime) : new Date();
+        if (Number.isNaN(eventTime.getTime())) {
+          res.status(400).json({ error: 'eventTime is invalid.' });
+          return;
+        }
+
+        const checkpoint: TrackingCheckpoint = {
+          id: newSwimId('trk'),
+          warehouseId,
+          shipmentId,
+          trackingNumber,
+          carrierCode,
+          status: normalizeProviderStatus(rawStatus),
+          statusDetail: req.body?.statusDetail ? String(req.body.statusDetail).trim().slice(0, 1000) : undefined,
+          location: req.body?.location ? String(req.body.location).trim().slice(0, 500) : undefined,
+          countryCode: normalizeCountryCode(req.body?.countryCode),
+          eventTime: eventTime.toISOString(),
+          source: req.body?.source ? String(req.body.source).trim().slice(0, 120) : 'MANUAL',
+          rawProviderStatus: rawStatus.slice(0, 160),
+          providerEventId: req.body?.providerEventId ? String(req.body.providerEventId).trim().slice(0, 200) : newSwimId('manual-event')
+        };
+
+        const saved = await addTrackingCheckpoint(checkpoint);
+        await appendSwimEvent({
+          warehouseId,
+          eventType: 'TRACKING_CHECKPOINT_RECORDED',
+          category: 'TRACKING',
+          aggregateType: 'SHIPMENT',
+          aggregateId: shipmentId,
+          severity: saved.status === 'EXCEPTION' ? 'WARNING' : 'INFO',
+          actorId: req.user.id,
+          actorName: req.user.name || req.user.email,
+          source: saved.source,
+          metadata: {
+            trackingNumber: saved.trackingNumber,
+            carrierCode: saved.carrierCode,
+            status: saved.status,
+            location: saved.location
+          }
+        });
+        res.status(201).json({ checkpoint: saved });
+      } catch (err: any) {
+        console.error('SWIM tracking checkpoint error:', err);
+        res.status(400).json({ error: err.message || 'Unable to record tracking checkpoint.' });
+      }
+    }
+  );
+
+  app.post(
+    '/api/swim/customs/estimate',
+    authenticateToken,
+    requireRoles('admin', 'manager'),
+    async (req: any, res) => {
+      try {
+        const jurisdictionCode = String(req.body?.jurisdictionCode || '').trim().toUpperCase();
+        if (!jurisdictionCode || jurisdictionCode.length > 8) {
+          res.status(400).json({ error: 'jurisdictionCode is required.' });
+          return;
+        }
+        const hsCode = normalizeHsCode(req.body?.hsCode);
+        const rules = await listCustomsRules(jurisdictionCode);
+        const rule = findApplicableCustomsRule(rules, jurisdictionCode, hsCode);
+        if (!rule) {
+          res.status(404).json({
+            error: 'No verified customs rule is available for this jurisdiction and HS code.',
+            code: 'CUSTOMS_RULE_NOT_FOUND'
+          });
+          return;
+        }
+
+        const estimate = calculateLandedCost(
+          {
+            jurisdictionCode,
+            hsCode,
+            goodsValue: req.body?.goodsValue,
+            freight: req.body?.freight || 0,
+            insurance: req.body?.insurance || 0,
+            otherDutiableCharges: req.body?.otherDutiableCharges || 0,
+            brokerage: req.body?.brokerage || 0,
+            portFees: req.body?.portFees || 0,
+            localDelivery: req.body?.localDelivery || 0,
+            concessionPercent: req.body?.concessionPercent || 0
+          },
+          rule,
+          hsCode.length >= 6 ? 'HIGH' : 'REVIEW_REQUIRED'
+        );
+
+        await appendSwimEvent({
+          warehouseId: requireSafeId(req.user.warehouseId, 'warehouseId'),
+          eventType: 'CUSTOMS_ESTIMATE_CALCULATED',
+          category: 'CUSTOMS',
+          aggregateType: 'CUSTOMS_ESTIMATE',
+          aggregateId: newSwimId('estimate'),
+          actorId: req.user.id,
+          actorName: req.user.name || req.user.email,
+          metadata: {
+            jurisdictionCode,
+            hsCode,
+            ruleId: rule.id,
+            ruleVersion: rule.version,
+            confidence: estimate.confidence
+          }
+        });
+
+        res.json({
+          estimate,
+          source: {
+            title: rule.sourceTitle,
+            url: rule.officialSourceUrl,
+            verifiedAt: rule.verifiedAt,
+            version: rule.version
+          },
+          disclaimer: 'Estimate only. Final customs classification and assessment by the relevant authority takes precedence.'
+        });
+      } catch (err: any) {
+        console.error('SWIM customs estimate error:', err);
+        res.status(400).json({ error: err.message || 'Unable to calculate customs estimate.' });
+      }
+    }
+  );
+
+  app.get(
+    '/api/swim/events',
+    authenticateToken,
+    requireRoles('admin', 'manager'),
+    async (req: any, res) => {
+      try {
+        const warehouseId = requireSafeId(req.user.warehouseId, 'warehouseId');
+        const limit = Math.min(250, Math.max(1, Number(req.query.limit || 100)));
+        const { listSwimEvents } = await import('./swim/platform-store.js');
+        const events = await listSwimEvents(warehouseId, limit);
+        res.json({ events });
+      } catch (err: any) {
+        console.error('SWIM event ledger error:', err);
+        res.status(500).json({ error: 'Unable to load event ledger.' });
+      }
+    }
+  );
+
+  app.use(express.static(distPath));
       app.get('*all', (req, res) => {
         res.sendFile(indexPath);
       });
