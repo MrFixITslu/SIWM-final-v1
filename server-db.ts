@@ -12,6 +12,7 @@ import { sealEvent, verifyEventChain, type SwimBusinessEvent } from './src/domai
 import { canConsolidateShipment, validateShipmentLegSequence, type ShipmentRecord, type LogisticsUnit, type ShipmentLeg } from './src/domain/shipping.js';
 import type { TrackingCheckpoint } from './src/domain/tracking.js';
 import type { CustomsChargeRule, CustomsEstimate, CustomsEstimateInput } from './src/domain/customs.js';
+import type { LeadTimePolicy } from './src/domain/replenishment.js';
 import { normalizeRole } from './src/domain/permissions.js';
 import {
   WORKSPACE_INVITE_TTL_HOURS,
@@ -183,6 +184,7 @@ let memTrackingEvents: any[] = [];
 let memLogisticsUnits: any[] = [];
 let memCustomsRules: any[] = [];
 let memCustomsEstimates: any[] = [];
+let memReplenishmentPolicies: any[] = [];
 let memWebhookReceipts: any[] = [];
 let memBusinessEvents: SwimBusinessEvent[] = [];
 let memWorkspaceInvitations: any[] = [];
@@ -578,6 +580,32 @@ async function runMigrations() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
     )
   `);
+
+  // Workspace/supplier lead-time profiles. No implicit production default is created.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_replenishment_policies (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      scope_key VARCHAR(120) NOT NULL,
+      supplier_id VARCHAR(50),
+      name VARCHAR(160) NOT NULL,
+      supplier_processing_days INTEGER NOT NULL CHECK (supplier_processing_days >= 0),
+      origin_transport_days INTEGER NOT NULL CHECK (origin_transport_days >= 0),
+      forwarder_handling_days INTEGER NOT NULL CHECK (forwarder_handling_days >= 0),
+      international_transit_days INTEGER NOT NULL CHECK (international_transit_days >= 0),
+      customs_clearance_days INTEGER NOT NULL CHECK (customs_clearance_days >= 0),
+      local_delivery_days INTEGER NOT NULL CHECK (local_delivery_days >= 0),
+      safety_stock_days INTEGER NOT NULL CHECK (safety_stock_days >= 0),
+      target_coverage_days INTEGER NOT NULL CHECK (target_coverage_days >= 0),
+      demand_window_days INTEGER NOT NULL DEFAULT 90 CHECK (demand_window_days BETWEEN 1 AND 3650),
+      created_by VARCHAR(50),
+      updated_by VARCHAR(50),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (warehouse_id, scope_key)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_replenishment_supplier ON swim_replenishment_policies(warehouse_id, supplier_id)`);
 
   // 18. Tamper-evident operational event ledger. HMAC chain protects against silent DB-only edits.
   await pool.query(`
@@ -3349,6 +3377,139 @@ export async function listSwimLogisticsUnits(warehouseId: string, shipmentId: st
     return result.rows.map((row: any) => ({ id: row.id, shipmentId: row.shipment_id, parentUnitId: row.parent_unit_id || undefined, type: row.unit_type, reference: row.reference || undefined, quantity: row.quantity ?? undefined, weightGrams: row.weight_grams ?? undefined }));
   }
   return memLogisticsUnits.filter((unit) => unit.warehouseId === warehouseId && unit.shipmentId === shipmentId);
+}
+
+export interface StoredReplenishmentPolicy extends LeadTimePolicy {
+  id: string;
+  warehouseId: string;
+  scopeKey: string;
+  supplierId?: string;
+  name: string;
+  demandWindowDays: number;
+  updatedAt: string;
+}
+
+function mapReplenishmentPolicy(row: any): StoredReplenishmentPolicy {
+  return {
+    id: row.id,
+    warehouseId: row.warehouse_id || row.warehouseId,
+    scopeKey: row.scope_key || row.scopeKey,
+    supplierId: row.supplier_id || row.supplierId || undefined,
+    name: row.name,
+    supplierProcessingDays: Number(row.supplier_processing_days ?? row.supplierProcessingDays),
+    originTransportDays: Number(row.origin_transport_days ?? row.originTransportDays),
+    forwarderHandlingDays: Number(row.forwarder_handling_days ?? row.forwarderHandlingDays),
+    internationalTransitDays: Number(row.international_transit_days ?? row.internationalTransitDays),
+    customsClearanceDays: Number(row.customs_clearance_days ?? row.customsClearanceDays),
+    localDeliveryDays: Number(row.local_delivery_days ?? row.localDeliveryDays),
+    safetyStockDays: Number(row.safety_stock_days ?? row.safetyStockDays),
+    targetCoverageDays: Number(row.target_coverage_days ?? row.targetCoverageDays),
+    demandWindowDays: Number(row.demand_window_days ?? row.demandWindowDays ?? 90),
+    updatedAt: new Date(row.updated_at || row.updatedAt || Date.now()).toISOString(),
+  };
+}
+
+export async function listSwimReplenishmentPolicies(warehouseId: string): Promise<StoredReplenishmentPolicy[]> {
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT * FROM swim_replenishment_policies WHERE warehouse_id=$1 ORDER BY supplier_id NULLS FIRST, name ASC`,
+      [warehouseId],
+    );
+    return result.rows.map(mapReplenishmentPolicy);
+  }
+  return memReplenishmentPolicies
+    .filter((policy) => policy.warehouseId === warehouseId)
+    .map(mapReplenishmentPolicy);
+}
+
+export async function getSwimReplenishmentPolicy(
+  warehouseId: string,
+  supplierId?: string,
+): Promise<StoredReplenishmentPolicy | null> {
+  if (usePostgres) {
+    if (supplierId) {
+      const supplierSpecific = await pool.query(
+        `SELECT * FROM swim_replenishment_policies
+         WHERE warehouse_id=$1 AND supplier_id=$2
+         ORDER BY updated_at DESC LIMIT 1`,
+        [warehouseId, supplierId],
+      );
+      if (supplierSpecific.rows[0]) return mapReplenishmentPolicy(supplierSpecific.rows[0]);
+    }
+    const fallback = await pool.query(
+      `SELECT * FROM swim_replenishment_policies
+       WHERE warehouse_id=$1 AND supplier_id IS NULL
+       ORDER BY updated_at DESC LIMIT 1`,
+      [warehouseId],
+    );
+    return fallback.rows[0] ? mapReplenishmentPolicy(fallback.rows[0]) : null;
+  }
+
+  const scoped = supplierId
+    ? memReplenishmentPolicies.find((policy) => policy.warehouseId === warehouseId && policy.supplierId === supplierId)
+    : undefined;
+  const fallback = memReplenishmentPolicies.find((policy) => policy.warehouseId === warehouseId && !policy.supplierId);
+  return scoped ? mapReplenishmentPolicy(scoped) : fallback ? mapReplenishmentPolicy(fallback) : null;
+}
+
+export async function upsertSwimReplenishmentPolicy(input: {
+  id: string;
+  warehouseId: string;
+  supplierId?: string;
+  name: string;
+  policy: LeadTimePolicy;
+  demandWindowDays: number;
+  actorId: string;
+}): Promise<StoredReplenishmentPolicy> {
+  const scopeKey = input.supplierId ? `SUPPLIER:${input.supplierId}` : 'DEFAULT';
+  if (usePostgres) {
+    const result = await pool.query(
+      `INSERT INTO swim_replenishment_policies (
+        id, warehouse_id, scope_key, supplier_id, name,
+        supplier_processing_days, origin_transport_days, forwarder_handling_days,
+        international_transit_days, customs_clearance_days, local_delivery_days,
+        safety_stock_days, target_coverage_days, demand_window_days, created_by, updated_by
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$15)
+      ON CONFLICT (warehouse_id, scope_key) DO UPDATE SET
+        supplier_id=EXCLUDED.supplier_id,
+        name=EXCLUDED.name,
+        supplier_processing_days=EXCLUDED.supplier_processing_days,
+        origin_transport_days=EXCLUDED.origin_transport_days,
+        forwarder_handling_days=EXCLUDED.forwarder_handling_days,
+        international_transit_days=EXCLUDED.international_transit_days,
+        customs_clearance_days=EXCLUDED.customs_clearance_days,
+        local_delivery_days=EXCLUDED.local_delivery_days,
+        safety_stock_days=EXCLUDED.safety_stock_days,
+        target_coverage_days=EXCLUDED.target_coverage_days,
+        demand_window_days=EXCLUDED.demand_window_days,
+        updated_by=EXCLUDED.updated_by,
+        updated_at=CURRENT_TIMESTAMP
+      RETURNING *`,
+      [input.id, input.warehouseId, scopeKey, input.supplierId || null, input.name,
+       input.policy.supplierProcessingDays, input.policy.originTransportDays, input.policy.forwarderHandlingDays,
+       input.policy.internationalTransitDays, input.policy.customsClearanceDays, input.policy.localDeliveryDays,
+       input.policy.safetyStockDays, input.policy.targetCoverageDays, input.demandWindowDays, input.actorId],
+    );
+    return mapReplenishmentPolicy(result.rows[0]);
+  }
+
+  const now = new Date().toISOString();
+  const record = {
+    id: input.id,
+    warehouseId: input.warehouseId,
+    scopeKey,
+    supplierId: input.supplierId,
+    name: input.name,
+    ...input.policy,
+    demandWindowDays: input.demandWindowDays,
+    updatedAt: now,
+  };
+  const index = memReplenishmentPolicies.findIndex((policy) =>
+    policy.warehouseId === input.warehouseId && policy.scopeKey === scopeKey,
+  );
+  if (index >= 0) memReplenishmentPolicies[index] = record;
+  else memReplenishmentPolicies.push(record);
+  return mapReplenishmentPolicy(record);
 }
 
 export async function getSwimCustomsRules(destinationCountry: string, valuationDate: string): Promise<CustomsChargeRule[]> {
