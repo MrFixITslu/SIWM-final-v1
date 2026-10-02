@@ -8,6 +8,10 @@ import {
   INITIAL_ITEMS, 
   INITIAL_TRANSACTIONS 
 } from './src/mockData.js';
+import { sealEvent, verifyEventChain, type SwimBusinessEvent } from './src/domain/events.js';
+import type { ShipmentRecord, LogisticsUnit } from './src/domain/shipping.js';
+import type { TrackingCheckpoint } from './src/domain/tracking.js';
+import type { CustomsChargeRule, CustomsEstimate, CustomsEstimateInput } from './src/domain/customs.js';
 
 const { Pool } = pg;
 
@@ -37,6 +41,17 @@ function resolveDataEncryptionSecret(): string {
 }
 
 const DATA_ENCRYPTION_SECRET = resolveDataEncryptionSecret();
+
+function resolveEventLedgerSecret(): string {
+  const configured = process.env.EVENT_LEDGER_SECRET?.trim();
+  if (configured && Buffer.byteLength(configured, 'utf8') >= 32) return configured;
+  if (process.env.NODE_ENV === 'production') {
+    throw new Error('FATAL: EVENT_LEDGER_SECRET must be configured with at least 32 bytes in production.');
+  }
+  console.warn('WARNING: EVENT_LEDGER_SECRET is using a development-only fallback.');
+  return 'swim-development-only-event-ledger-secret-change-before-production';
+}
+const EVENT_LEDGER_SECRET = resolveEventLedgerSecret();
 
 // Historical key derivation retained only for decrypting encv2 records created
 // before SWIM introduced HKDF-separated tenant encryption keys.
@@ -152,6 +167,12 @@ let memPurchaseOrders: any[] = [];
 let memAuditLogs: any[] = [];
 
 let memDispatchRecords: any[] = [];
+let memShipments: any[] = [];
+let memTrackingEvents: any[] = [];
+let memLogisticsUnits: any[] = [];
+let memCustomsRules: any[] = [];
+let memCustomsEstimates: any[] = [];
+let memBusinessEvents: SwimBusinessEvent[] = [];
 
 export async function initDb() {
   console.log('Initializing database connectivity...');
@@ -401,6 +422,125 @@ async function runMigrations() {
   } catch (err: any) {
     console.warn('⚠️ Non-critical migration warning:', err.message);
   }
+
+  // 13. SWIM shipment control tower
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_shipments (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      reference VARCHAR(120) NOT NULL,
+      mode VARCHAR(30) NOT NULL,
+      status VARCHAR(30) NOT NULL DEFAULT 'PLANNED',
+      carrier VARCHAR(100),
+      tracking_number VARCHAR(220),
+      tracking_provider VARCHAR(80),
+      purchase_order_id VARCHAR(50),
+      supplier_id VARCHAR(50),
+      customer_order_reference VARCHAR(120),
+      origin TEXT,
+      destination TEXT,
+      estimated_arrival_at TIMESTAMPTZ,
+      latest_location TEXT,
+      latest_tracking_status VARCHAR(40),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (warehouse_id, reference)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_warehouse_status ON swim_shipments(warehouse_id, status)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_tracking ON swim_shipments(warehouse_id, tracking_number)`);
+
+  // 14. Normalized carrier checkpoints. Raw provider payloads are not retained by default.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_tracking_events (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      shipment_id VARCHAR(80) NOT NULL REFERENCES swim_shipments(id) ON DELETE CASCADE,
+      carrier_event_id VARCHAR(180),
+      status VARCHAR(40) NOT NULL,
+      description TEXT NOT NULL,
+      location TEXT,
+      occurred_at TIMESTAMPTZ NOT NULL,
+      estimated_delivery_at TIMESTAMPTZ,
+      source VARCHAR(80) NOT NULL,
+      payload_hash VARCHAR(64),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (shipment_id, carrier_event_id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_tracking_shipment_time ON swim_tracking_events(warehouse_id, shipment_id, occurred_at DESC)`);
+
+  // 15. Item/carton/package/pallet/container hierarchy for consolidation and 3PL workflows.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_logistics_units (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      shipment_id VARCHAR(80) NOT NULL REFERENCES swim_shipments(id) ON DELETE CASCADE,
+      parent_unit_id VARCHAR(80) REFERENCES swim_logistics_units(id) ON DELETE CASCADE,
+      unit_type VARCHAR(30) NOT NULL,
+      reference VARCHAR(180),
+      quantity INTEGER,
+      weight_grams INTEGER,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_units_shipment ON swim_logistics_units(warehouse_id, shipment_id)`);
+
+  // 16. Platform-curated, effective-dated customs rules. Tenant users can read/use but not edit them.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_customs_rules (
+      id VARCHAR(100) PRIMARY KEY,
+      destination_country VARCHAR(3) NOT NULL,
+      hs_code_prefix VARCHAR(20) NOT NULL,
+      charge_code VARCHAR(60) NOT NULL,
+      label VARCHAR(160) NOT NULL,
+      sequence INTEGER NOT NULL,
+      basis VARCHAR(40) NOT NULL,
+      rate_bps INTEGER,
+      fixed_amount_minor BIGINT,
+      effective_from DATE NOT NULL,
+      effective_to DATE,
+      eligible_origins JSONB,
+      excluded_origins JSONB,
+      required_concession_code VARCHAR(100),
+      authority VARCHAR(200) NOT NULL,
+      source_url TEXT NOT NULL,
+      verified_at TIMESTAMPTZ NOT NULL,
+      active BOOLEAN NOT NULL DEFAULT TRUE
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_customs_lookup ON swim_customs_rules(destination_country, hs_code_prefix, effective_from, effective_to)`);
+
+  // 17. Saved estimates keep the exact calculation result/rule provenance used at the time.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_customs_estimates (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      shipment_id VARCHAR(80) REFERENCES swim_shipments(id) ON DELETE SET NULL,
+      input_json JSONB NOT NULL,
+      result_json JSONB NOT NULL,
+      created_by VARCHAR(50),
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
+    )
+  `);
+
+  // 18. Tamper-evident operational event ledger. HMAC chain protects against silent DB-only edits.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_business_events (
+      sequence_id BIGSERIAL PRIMARY KEY,
+      event_id VARCHAR(80) NOT NULL UNIQUE,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      event_type VARCHAR(80) NOT NULL,
+      aggregate_type VARCHAR(40) NOT NULL,
+      aggregate_id VARCHAR(100) NOT NULL,
+      actor_id VARCHAR(50),
+      occurred_at TIMESTAMPTZ NOT NULL,
+      payload_json JSONB NOT NULL,
+      previous_hash VARCHAR(64),
+      event_hash VARCHAR(64) NOT NULL
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_events_aggregate ON swim_business_events(warehouse_id, aggregate_type, aggregate_id, sequence_id)`);
 
   // Demo account/warehouse seeding is opt-in only (SEED_DEMO_DATA=true). It used
   // to run unconditionally on every boot, which meant a well-known credential
@@ -2572,4 +2712,295 @@ export async function inviteUserToWarehouse(warehouseId: string, email: string, 
 
   await associateUserWithWarehouse(user.id, warehouseId, role);
   return { user, isNewUser, tempPassword };
+}
+
+// ---------------------------------------------------------------------------
+// SWIM enterprise logistics repositories
+// ---------------------------------------------------------------------------
+
+function mapShipmentRow(row: any): ShipmentRecord {
+  return {
+    id: row.id,
+    warehouseId: row.warehouse_id || row.warehouseId,
+    reference: row.reference,
+    mode: row.mode,
+    status: row.status,
+    carrier: row.carrier || undefined,
+    trackingNumber: row.tracking_number || row.trackingNumber || undefined,
+    trackingProvider: row.tracking_provider || row.trackingProvider || undefined,
+    purchaseOrderId: row.purchase_order_id || row.purchaseOrderId || undefined,
+    supplierId: row.supplier_id || row.supplierId || undefined,
+    customerOrderReference: row.customer_order_reference || row.customerOrderReference || undefined,
+    origin: row.origin || undefined,
+    destination: row.destination || undefined,
+    estimatedArrivalAt: row.estimated_arrival_at ? new Date(row.estimated_arrival_at).toISOString() : row.estimatedArrivalAt,
+    latestLocation: row.latest_location || row.latestLocation || undefined,
+    latestTrackingStatus: row.latest_tracking_status || row.latestTrackingStatus || undefined,
+    createdAt: new Date(row.created_at || row.createdAt).toISOString(),
+    updatedAt: new Date(row.updated_at || row.updatedAt).toISOString(),
+  };
+}
+
+export async function createSwimShipment(
+  warehouseId: string,
+  shipment: Omit<ShipmentRecord, 'warehouseId' | 'createdAt' | 'updatedAt'>,
+): Promise<ShipmentRecord> {
+  const now = new Date().toISOString();
+  if (usePostgres) {
+    const result = await pool.query(
+      `INSERT INTO swim_shipments (
+        id, warehouse_id, reference, mode, status, carrier, tracking_number, tracking_provider,
+        purchase_order_id, supplier_id, customer_order_reference, origin, destination,
+        estimated_arrival_at, latest_location, latest_tracking_status, created_at, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$17)
+      RETURNING *`,
+      [shipment.id, warehouseId, shipment.reference, shipment.mode, shipment.status,
+       shipment.carrier || null, shipment.trackingNumber || null, shipment.trackingProvider || null,
+       shipment.purchaseOrderId || null, shipment.supplierId || null, shipment.customerOrderReference || null,
+       shipment.origin || null, shipment.destination || null, shipment.estimatedArrivalAt || null,
+       shipment.latestLocation || null, shipment.latestTrackingStatus || null, now],
+    );
+    return mapShipmentRow(result.rows[0]);
+  }
+  const record: ShipmentRecord = { ...shipment, warehouseId, createdAt: now, updatedAt: now };
+  memShipments.push(record);
+  return record;
+}
+
+export async function listSwimShipments(warehouseId: string, limit = 100): Promise<ShipmentRecord[]> {
+  const safeLimit = Math.min(Math.max(Math.trunc(limit) || 100, 1), 500);
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT * FROM swim_shipments WHERE warehouse_id = $1 ORDER BY updated_at DESC LIMIT $2`,
+      [warehouseId, safeLimit],
+    );
+    return result.rows.map(mapShipmentRow);
+  }
+  return memShipments.filter((shipment) => shipment.warehouseId === warehouseId)
+    .sort((a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt)).slice(0, safeLimit);
+}
+
+export async function getSwimShipment(warehouseId: string, shipmentId: string): Promise<ShipmentRecord | null> {
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT * FROM swim_shipments WHERE warehouse_id = $1 AND id = $2`,
+      [warehouseId, shipmentId],
+    );
+    return result.rows[0] ? mapShipmentRow(result.rows[0]) : null;
+  }
+  return memShipments.find((shipment) => shipment.warehouseId === warehouseId && shipment.id === shipmentId) || null;
+}
+
+function trackingToShipmentStatus(status: TrackingCheckpoint['status']): ShipmentRecord['status'] {
+  if (status === 'DELIVERED') return 'DELIVERED';
+  if (status === 'CUSTOMS') return 'CUSTOMS';
+  if (status === 'EXCEPTION' || status === 'RETURNED') return 'EXCEPTION';
+  if (status === 'LABEL_CREATED') return 'BOOKED';
+  return 'IN_TRANSIT';
+}
+
+export async function addSwimTrackingCheckpoint(
+  warehouseId: string,
+  shipmentId: string,
+  checkpoint: TrackingCheckpoint & { id: string; payloadHash?: string },
+): Promise<TrackingCheckpoint> {
+  const shipment = await getSwimShipment(warehouseId, shipmentId);
+  if (!shipment) throw new Error('Shipment not found in this workspace.');
+  const nextShipmentStatus = trackingToShipmentStatus(checkpoint.status);
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query(
+        `INSERT INTO swim_tracking_events (
+          id, warehouse_id, shipment_id, carrier_event_id, status, description, location,
+          occurred_at, estimated_delivery_at, source, payload_hash
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+        ON CONFLICT (shipment_id, carrier_event_id) DO NOTHING`,
+        [checkpoint.id, warehouseId, shipmentId, checkpoint.carrierEventId || null, checkpoint.status,
+         checkpoint.description, checkpoint.location || null, checkpoint.occurredAt,
+         checkpoint.estimatedDeliveryAt || null, checkpoint.source, checkpoint.payloadHash || null],
+      );
+      await client.query(
+        `UPDATE swim_shipments SET status=$1, latest_tracking_status=$2, latest_location=COALESCE($3, latest_location),
+         estimated_arrival_at=COALESCE($4, estimated_arrival_at), updated_at=CURRENT_TIMESTAMP
+         WHERE id=$5 AND warehouse_id=$6`,
+        [nextShipmentStatus, checkpoint.status, checkpoint.location || null, checkpoint.estimatedDeliveryAt || null, shipmentId, warehouseId],
+      );
+      await client.query('COMMIT');
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  } else {
+    const duplicate = checkpoint.carrierEventId && memTrackingEvents.some((event) =>
+      event.shipmentId === shipmentId && event.carrierEventId === checkpoint.carrierEventId,
+    );
+    if (!duplicate) memTrackingEvents.push({ ...checkpoint, warehouseId, shipmentId });
+    memShipments = memShipments.map((entry) => entry.warehouseId === warehouseId && entry.id === shipmentId ? {
+      ...entry,
+      status: nextShipmentStatus,
+      latestTrackingStatus: checkpoint.status,
+      latestLocation: checkpoint.location || entry.latestLocation,
+      estimatedArrivalAt: checkpoint.estimatedDeliveryAt || entry.estimatedArrivalAt,
+      updatedAt: new Date().toISOString(),
+    } : entry);
+  }
+  return checkpoint;
+}
+
+export async function listSwimTrackingCheckpoints(warehouseId: string, shipmentId: string): Promise<TrackingCheckpoint[]> {
+  if (!await getSwimShipment(warehouseId, shipmentId)) throw new Error('Shipment not found in this workspace.');
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT id, carrier_event_id, status, description, location, occurred_at, estimated_delivery_at, source
+       FROM swim_tracking_events WHERE warehouse_id=$1 AND shipment_id=$2 ORDER BY occurred_at ASC`,
+      [warehouseId, shipmentId],
+    );
+    return result.rows.map((row: any) => ({
+      id: row.id,
+      carrierEventId: row.carrier_event_id || undefined,
+      status: row.status,
+      description: row.description,
+      location: row.location || undefined,
+      occurredAt: new Date(row.occurred_at).toISOString(),
+      estimatedDeliveryAt: row.estimated_delivery_at ? new Date(row.estimated_delivery_at).toISOString() : undefined,
+      source: row.source,
+    }));
+  }
+  return memTrackingEvents.filter((event) => event.warehouseId === warehouseId && event.shipmentId === shipmentId)
+    .sort((a, b) => Date.parse(a.occurredAt) - Date.parse(b.occurredAt));
+}
+
+export async function saveSwimLogisticsUnit(warehouseId: string, unit: LogisticsUnit): Promise<LogisticsUnit> {
+  if (!await getSwimShipment(warehouseId, unit.shipmentId)) throw new Error('Shipment not found in this workspace.');
+  if (unit.parentUnitId) {
+    const parent = usePostgres
+      ? (await pool.query(`SELECT id, shipment_id FROM swim_logistics_units WHERE id=$1 AND warehouse_id=$2`, [unit.parentUnitId, warehouseId])).rows[0]
+      : memLogisticsUnits.find((candidate) => candidate.id === unit.parentUnitId && candidate.warehouseId === warehouseId);
+    if (!parent || (parent.shipment_id || parent.shipmentId) !== unit.shipmentId) throw new Error('Parent logistics unit is not part of this shipment.');
+  }
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO swim_logistics_units (id, warehouse_id, shipment_id, parent_unit_id, unit_type, reference, quantity, weight_grams)
+       VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
+      [unit.id, warehouseId, unit.shipmentId, unit.parentUnitId || null, unit.type, unit.reference || null, unit.quantity || null, unit.weightGrams || null],
+    );
+  } else {
+    memLogisticsUnits.push({ ...unit, warehouseId });
+  }
+  return unit;
+}
+
+export async function listSwimLogisticsUnits(warehouseId: string, shipmentId: string): Promise<LogisticsUnit[]> {
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT id, shipment_id, parent_unit_id, unit_type, reference, quantity, weight_grams
+       FROM swim_logistics_units WHERE warehouse_id=$1 AND shipment_id=$2 ORDER BY created_at ASC`,
+      [warehouseId, shipmentId],
+    );
+    return result.rows.map((row: any) => ({ id: row.id, shipmentId: row.shipment_id, parentUnitId: row.parent_unit_id || undefined, type: row.unit_type, reference: row.reference || undefined, quantity: row.quantity ?? undefined, weightGrams: row.weight_grams ?? undefined }));
+  }
+  return memLogisticsUnits.filter((unit) => unit.warehouseId === warehouseId && unit.shipmentId === shipmentId);
+}
+
+export async function getSwimCustomsRules(destinationCountry: string, valuationDate: string): Promise<CustomsChargeRule[]> {
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT * FROM swim_customs_rules
+       WHERE active=TRUE AND destination_country=$1 AND effective_from <= $2::date
+       AND (effective_to IS NULL OR effective_to >= $2::date)
+       ORDER BY sequence ASC, id ASC`,
+      [destinationCountry.toUpperCase(), valuationDate],
+    );
+    return result.rows.map((row: any) => ({
+      id: row.id, destinationCountry: row.destination_country, hsCodePrefix: row.hs_code_prefix,
+      chargeCode: row.charge_code, label: row.label, sequence: row.sequence, basis: row.basis,
+      rateBps: row.rate_bps ?? undefined, fixedAmountMinor: row.fixed_amount_minor == null ? undefined : Number(row.fixed_amount_minor),
+      effectiveFrom: row.effective_from.toISOString?.().slice(0,10) || String(row.effective_from),
+      effectiveTo: row.effective_to ? (row.effective_to.toISOString?.().slice(0,10) || String(row.effective_to)) : undefined,
+      eligibleOrigins: row.eligible_origins || undefined, excludedOrigins: row.excluded_origins || undefined,
+      requiredConcessionCode: row.required_concession_code || undefined,
+      source: { authority: row.authority, sourceUrl: row.source_url, verifiedAt: new Date(row.verified_at).toISOString() },
+    }));
+  }
+  return memCustomsRules.filter((rule) => rule.destinationCountry === destinationCountry.toUpperCase());
+}
+
+export async function saveSwimCustomsEstimate(
+  id: string,
+  warehouseId: string,
+  shipmentId: string | undefined,
+  input: CustomsEstimateInput,
+  result: CustomsEstimate,
+  createdBy: string,
+): Promise<void> {
+  if (shipmentId && !await getSwimShipment(warehouseId, shipmentId)) throw new Error('Shipment not found in this workspace.');
+  if (usePostgres) {
+    await pool.query(
+      `INSERT INTO swim_customs_estimates (id, warehouse_id, shipment_id, input_json, result_json, created_by)
+       VALUES ($1,$2,$3,$4::jsonb,$5::jsonb,$6)`,
+      [id, warehouseId, shipmentId || null, JSON.stringify(input), JSON.stringify(result), createdBy],
+    );
+  } else {
+    memCustomsEstimates.push({ id, warehouseId, shipmentId, input, result, createdBy, createdAt: new Date().toISOString() });
+  }
+}
+
+export async function appendSwimBusinessEvent(
+  event: Omit<SwimBusinessEvent, 'previousHash' | 'eventHash'>,
+): Promise<SwimBusinessEvent> {
+  if (usePostgres) {
+    const client = await pool.connect();
+    try {
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [`swim-ledger:${event.warehouseId}`]);
+      const previous = await client.query(
+        `SELECT event_hash FROM swim_business_events WHERE warehouse_id=$1 ORDER BY sequence_id DESC LIMIT 1`,
+        [event.warehouseId],
+      );
+      const sealed = sealEvent(EVENT_LEDGER_SECRET, { ...event, previousHash: previous.rows[0]?.event_hash || null });
+      await client.query(
+        `INSERT INTO swim_business_events (
+          event_id, warehouse_id, event_type, aggregate_type, aggregate_id, actor_id,
+          occurred_at, payload_json, previous_hash, event_hash
+        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8::jsonb,$9,$10)`,
+        [sealed.eventId, sealed.warehouseId, sealed.eventType, sealed.aggregateType, sealed.aggregateId,
+         sealed.actorId || null, sealed.occurredAt, JSON.stringify(sealed.payload), sealed.previousHash || null, sealed.eventHash],
+      );
+      await client.query('COMMIT');
+      return sealed;
+    } catch (error) {
+      await client.query('ROLLBACK');
+      throw error;
+    } finally {
+      client.release();
+    }
+  }
+  const previous = [...memBusinessEvents].reverse().find((entry) => entry.warehouseId === event.warehouseId);
+  const sealed = sealEvent(EVENT_LEDGER_SECRET, { ...event, previousHash: previous?.eventHash || null });
+  memBusinessEvents.push(sealed);
+  return sealed;
+}
+
+export async function listSwimBusinessEvents(warehouseId: string, limit = 100): Promise<SwimBusinessEvent[]> {
+  const safeLimit = Math.min(Math.max(Math.trunc(limit) || 100, 1), 500);
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT event_id, warehouse_id, event_type, aggregate_type, aggregate_id, actor_id, occurred_at, payload_json, previous_hash, event_hash
+       FROM swim_business_events WHERE warehouse_id=$1 ORDER BY sequence_id DESC LIMIT $2`,
+      [warehouseId, safeLimit],
+    );
+    return result.rows.reverse().map((row: any) => ({ eventId: row.event_id, warehouseId: row.warehouse_id, eventType: row.event_type, aggregateType: row.aggregate_type, aggregateId: row.aggregate_id, actorId: row.actor_id || undefined, occurredAt: new Date(row.occurred_at).toISOString(), payload: row.payload_json || {}, previousHash: row.previous_hash, eventHash: row.event_hash }));
+  }
+  return memBusinessEvents.filter((entry) => entry.warehouseId === warehouseId).slice(-safeLimit);
+}
+
+export async function verifySwimBusinessEventLedger(warehouseId: string): Promise<{ valid: boolean; brokenAt?: string }> {
+  const events = usePostgres
+    ? (await pool.query(`SELECT event_id, warehouse_id, event_type, aggregate_type, aggregate_id, actor_id, occurred_at, payload_json, previous_hash, event_hash FROM swim_business_events WHERE warehouse_id=$1 ORDER BY sequence_id ASC`, [warehouseId])).rows.map((row: any) => ({ eventId: row.event_id, warehouseId: row.warehouse_id, eventType: row.event_type, aggregateType: row.aggregate_type, aggregateId: row.aggregate_id, actorId: row.actor_id || undefined, occurredAt: new Date(row.occurred_at).toISOString(), payload: row.payload_json || {}, previousHash: row.previous_hash, eventHash: row.event_hash }))
+    : memBusinessEvents.filter((entry) => entry.warehouseId === warehouseId);
+  return verifyEventChain(EVENT_LEDGER_SECRET, events);
 }
