@@ -28,6 +28,7 @@ import { calculateCustomsEstimate } from '../src/domain/customs.js';
 import { canContain, type LogisticsUnitType } from '../src/domain/shipping.js';
 import { detectCarrier, summarizeTracking } from '../src/domain/tracking.js';
 import { buildReplenishmentForecast } from './replenishment-service.js';
+import { buildOperationsInbox } from './operations-service.js';
 
 const shipmentStatus = z.enum(['PLANNED','BOOKED','IN_TRANSIT','CUSTOMS','RECEIVED','DELIVERED','EXCEPTION','CANCELLED']);
 const shipmentMode = z.enum(['PARCEL','AIR','OCEAN','GROUND','COURIER','INTER_ISLAND']);
@@ -130,6 +131,15 @@ function invalid(res: any, error: z.ZodError) {
 export function createSwimRouter() {
   const router = Router();
   router.use(authenticateToken);
+
+  router.get('/operations/inbox', requirePermission('operations.read'), async (req: any, res) => {
+    try {
+      res.json(await buildOperationsInbox(req.user.warehouseId));
+    } catch (error) {
+      console.error('SWIM operations inbox error:', error);
+      res.status(500).json({ error: 'Unable to build the operations inbox.' });
+    }
+  });
 
   router.get('/shipments', requirePermission('shipments.read'), async (req: any, res) => {
     try {
