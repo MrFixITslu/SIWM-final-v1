@@ -13,6 +13,7 @@ import { canConsolidateShipment, validateShipmentLegSequence, type ShipmentRecor
 import type { TrackingCheckpoint } from './src/domain/tracking.js';
 import type { CustomsChargeRule, CustomsEstimate, CustomsEstimateInput } from './src/domain/customs.js';
 import type { LeadTimePolicy } from './src/domain/replenishment.js';
+import type { FreightForwarderRecord } from './src/domain/forwarders.js';
 import { normalizeRole } from './src/domain/permissions.js';
 import {
   WORKSPACE_INVITE_TTL_HOURS,
@@ -178,6 +179,7 @@ let memPurchaseOrders: any[] = [];
 let memAuditLogs: any[] = [];
 
 let memDispatchRecords: any[] = [];
+let memFreightForwarders: any[] = [];
 let memShipments: any[] = [];
 let memShipmentLegs: any[] = [];
 let memTrackingSubscriptions: any[] = [];
@@ -439,7 +441,30 @@ async function runMigrations() {
     console.warn('⚠️ Non-critical migration warning:', err.message);
   }
 
-  // 13. SWIM shipment control tower
+  // 13. Tenant-scoped freight forwarders. Sensitive partner fields are encrypted per workspace.
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS swim_freight_forwarders (
+      id VARCHAR(80) PRIMARY KEY,
+      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      country_code VARCHAR(3) NOT NULL,
+      facility_code TEXT,
+      address TEXT,
+      contact_name TEXT,
+      email TEXT,
+      phone TEXT,
+      account_reference TEXT,
+      receiving_instructions TEXT,
+      service_modes JSONB NOT NULL DEFAULT '[]'::jsonb,
+      active BOOLEAN NOT NULL DEFAULT true,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE (warehouse_id, id)
+    )
+  `);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_forwarders_warehouse_active ON swim_freight_forwarders(warehouse_id, active)`);
+
+  // 14. SWIM shipment control tower
   await pool.query(`
     CREATE TABLE IF NOT EXISTS swim_shipments (
       id VARCHAR(80) PRIMARY KEY,
@@ -452,6 +477,7 @@ async function runMigrations() {
       tracking_provider VARCHAR(80),
       purchase_order_id VARCHAR(50),
       supplier_id VARCHAR(50),
+      freight_forwarder_id VARCHAR(80),
       customer_order_reference VARCHAR(120),
       origin TEXT,
       destination TEXT,
@@ -466,6 +492,8 @@ async function runMigrations() {
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_warehouse_status ON swim_shipments(warehouse_id, status)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_tracking ON swim_shipments(warehouse_id, tracking_number)`);
   await pool.query(`ALTER TABLE swim_shipments ADD COLUMN IF NOT EXISTS parent_shipment_id VARCHAR(80) REFERENCES swim_shipments(id) ON DELETE SET NULL`);
+  await pool.query(`ALTER TABLE swim_shipments ADD COLUMN IF NOT EXISTS freight_forwarder_id VARCHAR(80)`);
+  await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_forwarder ON swim_shipments(warehouse_id, freight_forwarder_id)`);
   await pool.query(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_parent ON swim_shipments(warehouse_id, parent_shipment_id)`);
 
   // Multi-leg journey model: supplier -> forwarder -> air/ocean -> customs -> final warehouse.
@@ -3030,6 +3058,140 @@ export async function registerWithWorkspaceInvitation(params: {
 // SWIM enterprise logistics repositories
 // ---------------------------------------------------------------------------
 
+function mapFreightForwarder(row: any): FreightForwarderRecord {
+  const warehouseId = row.warehouse_id || row.warehouseId;
+  const serviceModes = Array.isArray(row.service_modes)
+    ? row.service_modes
+    : Array.isArray(row.serviceModes)
+      ? row.serviceModes
+      : [];
+  return {
+    id: row.id,
+    warehouseId,
+    name: decryptText(row.name, warehouseId),
+    countryCode: String(row.country_code || row.countryCode || '').toUpperCase(),
+    facilityCode: decryptText(row.facility_code || row.facilityCode, warehouseId) || undefined,
+    address: decryptText(row.address, warehouseId) || undefined,
+    contactName: decryptText(row.contact_name || row.contactName, warehouseId) || undefined,
+    email: decryptText(row.email, warehouseId) || undefined,
+    phone: decryptText(row.phone, warehouseId) || undefined,
+    accountReference: decryptText(row.account_reference || row.accountReference, warehouseId) || undefined,
+    receivingInstructions: decryptText(row.receiving_instructions || row.receivingInstructions, warehouseId) || undefined,
+    serviceModes,
+    active: row.active !== false,
+    createdAt: new Date(row.created_at || row.createdAt).toISOString(),
+    updatedAt: new Date(row.updated_at || row.updatedAt).toISOString(),
+  };
+}
+
+export async function listSwimFreightForwarders(
+  warehouseId: string,
+  includeInactive = false,
+): Promise<FreightForwarderRecord[]> {
+  if (usePostgres) {
+    const result = await pool.query(
+      `SELECT * FROM swim_freight_forwarders
+       WHERE warehouse_id=$1 AND ($2::boolean OR active=true)
+       ORDER BY updated_at DESC`,
+      [warehouseId, includeInactive],
+    );
+    return result.rows.map(mapFreightForwarder);
+  }
+  return memFreightForwarders
+    .filter((entry) => entry.warehouseId === warehouseId && (includeInactive || entry.active !== false))
+    .map(mapFreightForwarder)
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export async function getSwimFreightForwarder(
+  warehouseId: string,
+  forwarderId: string,
+): Promise<FreightForwarderRecord | null> {
+  if (usePostgres) {
+    const result = await pool.query(
+      'SELECT * FROM swim_freight_forwarders WHERE warehouse_id=$1 AND id=$2',
+      [warehouseId, forwarderId],
+    );
+    return result.rows[0] ? mapFreightForwarder(result.rows[0]) : null;
+  }
+  const record = memFreightForwarders.find((entry) =>
+    entry.warehouseId === warehouseId && entry.id === forwarderId,
+  );
+  return record ? mapFreightForwarder(record) : null;
+}
+
+export async function saveSwimFreightForwarder(input: {
+  id: string;
+  warehouseId: string;
+  name: string;
+  countryCode: string;
+  facilityCode?: string;
+  address?: string;
+  contactName?: string;
+  email?: string;
+  phone?: string;
+  accountReference?: string;
+  receivingInstructions?: string;
+  serviceModes: ShipmentRecord['mode'][];
+  active?: boolean;
+}): Promise<FreightForwarderRecord> {
+  const now = new Date().toISOString();
+  if (usePostgres) {
+    const result = await pool.query(
+      `INSERT INTO swim_freight_forwarders (
+        id, warehouse_id, name, country_code, facility_code, address, contact_name, email, phone,
+        account_reference, receiving_instructions, service_modes, active, created_at, updated_at
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12::jsonb,$13,$14,$14)
+      ON CONFLICT (id) DO UPDATE SET
+        name=EXCLUDED.name,
+        country_code=EXCLUDED.country_code,
+        facility_code=EXCLUDED.facility_code,
+        address=EXCLUDED.address,
+        contact_name=EXCLUDED.contact_name,
+        email=EXCLUDED.email,
+        phone=EXCLUDED.phone,
+        account_reference=EXCLUDED.account_reference,
+        receiving_instructions=EXCLUDED.receiving_instructions,
+        service_modes=EXCLUDED.service_modes,
+        active=EXCLUDED.active,
+        updated_at=CURRENT_TIMESTAMP
+      WHERE swim_freight_forwarders.warehouse_id=EXCLUDED.warehouse_id
+      RETURNING *`,
+      [
+        input.id,
+        input.warehouseId,
+        encryptText(input.name.trim(), input.warehouseId),
+        input.countryCode.trim().toUpperCase(),
+        encryptText(input.facilityCode, input.warehouseId),
+        encryptText(input.address, input.warehouseId),
+        encryptText(input.contactName, input.warehouseId),
+        encryptText(input.email, input.warehouseId),
+        encryptText(input.phone, input.warehouseId),
+        encryptText(input.accountReference, input.warehouseId),
+        encryptText(input.receivingInstructions, input.warehouseId),
+        JSON.stringify(input.serviceModes || []),
+        input.active !== false,
+        now,
+      ],
+    );
+    if (!result.rows[0]) throw new Error('Freight forwarder could not be saved in this workspace.');
+    return mapFreightForwarder(result.rows[0]);
+  }
+
+  const existing = memFreightForwarders.findIndex((entry) =>
+    entry.warehouseId === input.warehouseId && entry.id === input.id,
+  );
+  const record = {
+    ...input,
+    active: input.active !== false,
+    createdAt: existing >= 0 ? memFreightForwarders[existing].createdAt : now,
+    updatedAt: now,
+  };
+  if (existing >= 0) memFreightForwarders[existing] = record;
+  else memFreightForwarders.push(record);
+  return mapFreightForwarder(record);
+}
+
 function mapShipmentRow(row: any): ShipmentRecord {
   return {
     id: row.id,
@@ -3042,6 +3204,7 @@ function mapShipmentRow(row: any): ShipmentRecord {
     trackingProvider: row.tracking_provider || row.trackingProvider || undefined,
     purchaseOrderId: row.purchase_order_id || row.purchaseOrderId || undefined,
     supplierId: row.supplier_id || row.supplierId || undefined,
+    freightForwarderId: row.freight_forwarder_id || row.freightForwarderId || undefined,
     customerOrderReference: row.customer_order_reference || row.customerOrderReference || undefined,
     parentShipmentId: row.parent_shipment_id || row.parentShipmentId || undefined,
     origin: row.origin || undefined,
@@ -3103,17 +3266,21 @@ export async function createSwimShipment(
   shipment: Omit<ShipmentRecord, 'warehouseId' | 'createdAt' | 'updatedAt'>,
 ): Promise<ShipmentRecord> {
   const now = new Date().toISOString();
+  if (shipment.freightForwarderId) {
+    const forwarder = await getSwimFreightForwarder(warehouseId, shipment.freightForwarderId);
+    if (!forwarder || !forwarder.active) throw new Error('Freight forwarder is not available in this workspace.');
+  }
   if (usePostgres) {
     const result = await pool.query(
       `INSERT INTO swim_shipments (
         id, warehouse_id, reference, mode, status, carrier, tracking_number, tracking_provider,
-        purchase_order_id, supplier_id, customer_order_reference, parent_shipment_id, origin, destination,
+        purchase_order_id, supplier_id, freight_forwarder_id, customer_order_reference, parent_shipment_id, origin, destination,
         estimated_arrival_at, latest_location, latest_tracking_status, created_at, updated_at
-      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$18)
+      ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19,$19)
       RETURNING *`,
       [shipment.id, warehouseId, shipment.reference, shipment.mode, shipment.status,
        shipment.carrier || null, shipment.trackingNumber || null, shipment.trackingProvider || null,
-       shipment.purchaseOrderId || null, shipment.supplierId || null, shipment.customerOrderReference || null,
+       shipment.purchaseOrderId || null, shipment.supplierId || null, shipment.freightForwarderId || null, shipment.customerOrderReference || null,
        shipment.parentShipmentId || null, shipment.origin || null, shipment.destination || null, shipment.estimatedArrivalAt || null,
        shipment.latestLocation || null, shipment.latestTrackingStatus || null, now],
     );
