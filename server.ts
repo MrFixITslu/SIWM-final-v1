@@ -1,10 +1,17 @@
 import express from 'express';
 import path from 'path';
 import fs from 'fs';
-import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import helmet from 'helmet';
-import rateLimit from 'express-rate-limit';
+import {
+  authenticateToken,
+  authRateLimiter,
+  newId,
+  newWarehouseCode,
+  signSessionToken,
+  validatePassword,
+  writeRateLimiter,
+} from './server/security.js';
 import { 
   initDb, 
   getItems, 
@@ -31,7 +38,6 @@ import {
   receivePurchaseOrderPartial,
   deletePurchaseOrder,
   getZoneCapacity,
-  verifyLiveUserAccess,
   resetDb,
   createUser,
   findUserByEmail,
@@ -58,82 +64,37 @@ import {
   inviteUserToWarehouse
 } from './server-db.js';
 
-function resolveJwtSecret(): string {
-  if (process.env.JWT_SECRET) return process.env.JWT_SECRET;
-  if (process.env.NODE_ENV === 'production') {
-    throw new Error(
-      'FATAL: JWT_SECRET environment variable is required in production. ' +
-      'Refusing to start with a hardcoded/default secret. Set JWT_SECRET in your .env file.'
-    );
-  }
-  console.warn('⚠️  JWT_SECRET not set - using an insecure development-only default. Never deploy this way.');
-  return 'dev-only-insecure-secret-do-not-use-in-production';
-}
-
-const JWT_SECRET = resolveJwtSecret();
-
-// Middleware to authenticate JWT access tokens with live membership validation
-function authenticateToken(req: any, res: any, next: any) {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    res.status(401).json({ error: 'Access token required. Please sign in.' });
-    return;
-  }
-
-  jwt.verify(token, JWT_SECRET, async (err: any, decoded: any) => {
-    if (err) {
-      res.status(403).json({ error: 'Session expired or invalid token. Please sign in again.' });
-      return;
-    }
-    
-    // Validate live authorization against current tenant database
-    try {
-      const liveStatus = await verifyLiveUserAccess(decoded.id, decoded.warehouseId, decoded.tokenVersion);
-      if (!liveStatus.valid) {
-        if (liveStatus.reason === 'SESSION_REVOKED') {
-          res.status(401).json({ error: 'Password was changed on this account. Please sign in with your new password.', code: 'SESSION_REVOKED' });
-          return;
-        }
-        res.status(403).json({ error: 'Clearance revoked or membership is no longer active for this warehouse.' });
-        return;
-      }
-      req.user = {
-        ...decoded,
-        role: liveStatus.role
-      };
-      next();
-    } catch (checkErr) {
-      req.user = decoded;
-      next();
-    }
-  });
-}
-
-// Rate limiter for authentication routes
-const authRateLimiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 40, // 40 requests per 15 minutes per IP
-  message: { error: 'Too many authentication attempts. Please try again in 15 minutes.' },
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-
 async function startServer() {
   const app = express();
   
-  // Configure HTTP Security Headers (relaxed CSP to permit Vite hot reload & iframe preview)
+  if (process.env.NODE_ENV === 'production') app.set('trust proxy', 1);
+  app.disable('x-powered-by');
+
   app.use(helmet({
-    contentSecurityPolicy: false,
-    crossOriginEmbedderPolicy: false
+    contentSecurityPolicy: process.env.NODE_ENV === 'production' ? {
+      directives: {
+        defaultSrc: ["'self'"],
+        scriptSrc: ["'self'"],
+        styleSrc: ["'self'", "'unsafe-inline'"],
+        imgSrc: ["'self'", 'data:', 'blob:'],
+        fontSrc: ["'self'", 'data:'],
+        connectSrc: ["'self'"],
+        objectSrc: ["'none'"],
+        frameAncestors: ["'none'"],
+        baseUri: ["'self'"],
+        formAction: ["'self'"],
+      },
+    } : false,
+    crossOriginEmbedderPolicy: false,
+    referrerPolicy: { policy: 'no-referrer' },
   }));
 
   // Configure the port: runs on PORT (3000) inside AI Studio
   const PORT = parseInt(process.env.PORT || '3000', 10);
 
   // Middleware for parsing JSON requests
-  app.use(express.json());
+  app.use(express.json({ limit: '1mb', strict: true }));
+  app.use('/api', writeRateLimiter);
 
   // Initialize PostgreSQL database connection and migrations
   await initDb();
@@ -152,8 +113,13 @@ async function startServer() {
     try {
       const { email, password, name, warehouseOption, warehouseName, warehouseAddress, warehouseCode } = req.body;
       
-      if (!email || !name) {
-        res.status(400).json({ error: 'Email and Name are required.' });
+      if (!email || !name || !password) {
+        res.status(400).json({ error: 'Email, name, and password are required.' });
+        return;
+      }
+      const passwordCheck = validatePassword(password);
+      if (!passwordCheck.ok) {
+        res.status(400).json({ error: passwordCheck.error });
         return;
       }
 
@@ -175,9 +141,8 @@ async function startServer() {
           res.status(400).json({ error: 'Warehouse name is required to create a new warehouse.' });
           return;
         }
-        warehouseId = `wh-${Date.now()}`;
-        // Generate code: e.g. WH-123456
-        const code = `WH-${Math.floor(100000 + Math.random() * 900000)}`;
+        warehouseId = newId('wh');
+        const code = newWarehouseCode();
         warehouseDetails = await createWarehouse({
           id: warehouseId,
           name: warehouseName,
@@ -187,6 +152,10 @@ async function startServer() {
         // Seed default dataset for this warehouse so they have a fully functioning baseline setup
         await seedWarehouseData(warehouseId);
       } else if (warehouseOption === 'join') {
+        if (process.env.ALLOW_LEGACY_WAREHOUSE_CODE_JOIN !== 'true') {
+          res.status(403).json({ error: 'Direct warehouse-code joining is disabled. Use an approved workspace invitation.' });
+          return;
+        }
         if (!warehouseCode) {
           res.status(400).json({ error: 'Warehouse access code is required to join.' });
           return;
@@ -203,9 +172,9 @@ async function startServer() {
         return;
       }
 
-      const passwordHash = password ? await bcrypt.hash(password, 10) : undefined;
+      const passwordHash = await bcrypt.hash(password, 12);
       const newUser = {
-        id: `usr-${Date.now()}`,
+        id: newId('usr'),
         email: normEmail,
         passwordHash,
         name,
@@ -214,13 +183,9 @@ async function startServer() {
       };
 
       await createUser(newUser);
-      await associateUserWithWarehouse(newUser.id, warehouseId);
+      await associateUserWithWarehouse(newUser.id, warehouseId, warehouseOption === 'create' ? 'admin' : 'operator');
 
-      const token = jwt.sign(
-        { id: newUser.id, email: newUser.email, name: newUser.name, warehouseId, tokenVersion: 1 },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-      );
+      const token = signSessionToken({ id: newUser.id, email: newUser.email, name: newUser.name, warehouseId, tokenVersion: 1 });
 
       await logSystemAudit({
         warehouseId,
@@ -290,11 +255,7 @@ async function startServer() {
 
       const activeWarehouse = warehouses.find((w: any) => w.id === activeWhId) || warehouses[0];
 
-      const token = jwt.sign(
-        { id: user.id, email: user.email, name: user.name, warehouseId: activeWhId, tokenVersion: user.tokenVersion || 1 },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-      );
+      const token = signSessionToken({ id: user.id, email: user.email, name: user.name, warehouseId: activeWhId, tokenVersion: user.tokenVersion || 1 });
 
       await logSystemAudit({
         warehouseId: activeWhId,
@@ -327,8 +288,9 @@ async function startServer() {
         return;
       }
 
-      if (newPassword.length < 6) {
-        res.status(400).json({ error: 'New password must be at least 6 characters long.' });
+      const passwordCheck = validatePassword(newPassword);
+      if (!passwordCheck.ok) {
+        res.status(400).json({ error: passwordCheck.error });
         return;
       }
 
@@ -342,11 +304,7 @@ async function startServer() {
       );
 
       // Issue fresh JWT with updated tokenVersion
-      const freshToken = jwt.sign(
-        { id: req.user.id, email: req.user.email, name: req.user.name, warehouseId: req.user.warehouseId, tokenVersion: result.tokenVersion },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-      );
+      const freshToken = signSessionToken({ id: req.user.id, email: req.user.email, name: req.user.name, warehouseId: req.user.warehouseId, tokenVersion: result.tokenVersion });
 
       res.json({
         status: 'success',
@@ -406,8 +364,8 @@ async function startServer() {
         return;
       }
 
-      const warehouseId = `wh-${Date.now()}`;
-      const code = `WH-${Math.floor(100000 + Math.random() * 900000)}`;
+      const warehouseId = newId('wh');
+      const code = newWarehouseCode();
       const warehouseDetails = await createWarehouse({
         id: warehouseId,
         name,
@@ -419,17 +377,13 @@ async function startServer() {
       await seedWarehouseData(warehouseId);
 
       // Associate
-      await associateUserWithWarehouse(req.user.id, warehouseId);
+      await associateUserWithWarehouse(req.user.id, warehouseId, 'admin');
 
       // Set active
       await updateUserActiveWarehouse(req.user.id, warehouseId);
 
       // Issue new token with updated active warehouseId
-      const token = jwt.sign(
-        { id: req.user.id, email: req.user.email, name: req.user.name, warehouseId },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-      );
+      const token = signSessionToken({ id: req.user.id, email: req.user.email, name: req.user.name, warehouseId, tokenVersion: req.user.tokenVersion });
 
       res.status(201).json({
         status: 'success',
@@ -446,6 +400,10 @@ async function startServer() {
   // Join an existing warehouse via access clearance code (max 2 warehouses per account)
   app.post('/api/auth/warehouses/join', authenticateToken, async (req: any, res) => {
     try {
+      if (process.env.ALLOW_LEGACY_WAREHOUSE_CODE_JOIN !== 'true') {
+        res.status(403).json({ error: 'Direct warehouse-code joining is disabled. Use an approved workspace invitation.' });
+        return;
+      }
       const { code } = req.body;
       if (!code) {
         res.status(400).json({ error: 'Warehouse clearance access code is required.' });
@@ -473,17 +431,13 @@ async function startServer() {
       }
 
       // Associate
-      await associateUserWithWarehouse(req.user.id, matchedWh.id);
+      await associateUserWithWarehouse(req.user.id, matchedWh.id, 'operator');
 
       // Set active
       await updateUserActiveWarehouse(req.user.id, matchedWh.id);
 
       // Issue new token with updated active warehouseId
-      const token = jwt.sign(
-        { id: req.user.id, email: req.user.email, name: req.user.name, warehouseId: matchedWh.id },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-      );
+      const token = signSessionToken({ id: req.user.id, email: req.user.email, name: req.user.name, warehouseId: matchedWh.id, tokenVersion: req.user.tokenVersion });
 
       res.json({
         status: 'success',
@@ -523,11 +477,7 @@ async function startServer() {
       await updateUserActiveWarehouse(req.user.id, warehouseId);
 
       // Issue new token with updated active warehouseId
-      const token = jwt.sign(
-        { id: req.user.id, email: req.user.email, name: req.user.name, warehouseId },
-        JWT_SECRET,
-        { expiresIn: '24h' }
-      );
+      const token = signSessionToken({ id: req.user.id, email: req.user.email, name: req.user.name, warehouseId, tokenVersion: req.user.tokenVersion });
 
       res.json({
         status: 'success',
@@ -583,7 +533,7 @@ async function startServer() {
       }
 
       if (!supplier.id) {
-        supplier.id = `sup-${Date.now()}`;
+        supplier.id = newId('sup');
       }
 
       await saveSupplier(supplier, warehouseId);
@@ -615,7 +565,7 @@ async function startServer() {
 
       if (!zone.id) {
         const cleanName = zone.name.trim().replace(/\s+/g, '-');
-        zone.id = `${cleanName}-${Date.now()}`;
+        zone.id = `${cleanName}-${newId('zone')}`;
       }
 
       await saveZone(zone, warehouseId);
@@ -669,7 +619,7 @@ async function startServer() {
 
       if (!category.id) {
         const cleanName = category.name.trim().replace(/\s+/g, '-').toLowerCase();
-        category.id = `${cleanName}-${Date.now()}`;
+        category.id = `${cleanName}-${newId('cat')}`;
       }
 
       await saveCategory(category, warehouseId);
@@ -726,7 +676,7 @@ async function startServer() {
       // If initial quantity is greater than 0, log an ingestion transaction
       if (item.quantity > 0) {
         const newTx = {
-          id: `tx-init-${Date.now()}`,
+          id: newId('tx-init'),
           itemId: item.id,
           itemName: item.name,
           sku: item.sku,
@@ -812,7 +762,7 @@ async function startServer() {
 
       // Log transaction for audit compliance
       const tx = {
-        id: `tx-arch-${Date.now()}`,
+        id: newId('tx-arch'),
         itemId: id,
         itemName: updatedItem?.name || id,
         sku: updatedItem?.sku || '',
@@ -1492,7 +1442,7 @@ async function startServer() {
 
   app.listen(PORT, '0.0.0.0', () => {
     console.log(`\n======================================================`);
-    console.log(`🚀 Smart Warehouse Management System full-stack server`);
+    console.log(`🚀 SWIM - Shipping, Warehouse & Inventory Management API`);
     console.log(`🟢 Running at: http://localhost:${PORT}`);
     console.log(`🌍 Network Access: http://0.0.0.0:${PORT}`);
     console.log(`======================================================\n`);
