@@ -150,3 +150,30 @@ export function newId(prefix: string): string {
 export function newWarehouseCode(): string {
   return `SW-${crypto.randomInt(10_000_000, 100_000_000)}`;
 }
+
+export function isPlatformAdminEmail(
+  email: string | null | undefined,
+  configured = process.env.SWIM_PLATFORM_ADMIN_EMAILS || '',
+): boolean {
+  const normalized = (email || '').trim().toLowerCase();
+  if (!normalized) return false;
+  const allowed = new Set(
+    configured.split(',')
+      .map((value) => value.trim().toLowerCase())
+      .filter(Boolean),
+  );
+  return allowed.has(normalized);
+}
+
+export const requirePlatformAdmin: RequestHandler = (req: any, res, next) => {
+  const configured = (process.env.SWIM_PLATFORM_ADMIN_EMAILS || '').trim();
+  if (!configured) {
+    res.status(503).json({ error: 'Platform administration is not configured.' });
+    return;
+  }
+  if (!req.user || !isPlatformAdminEmail(req.user.email, configured)) {
+    res.status(403).json({ error: 'Platform administrator access is required.' });
+    return;
+  }
+  next();
+};
