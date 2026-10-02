@@ -63,6 +63,7 @@ import { PersonnelDispatchesView } from './components/PersonnelDispatchesView';
 import { PurchaseOrdersManager } from './components/PurchaseOrdersManager';
 import { ShippingControlTower } from './components/ShippingControlTower';
 import { CustomsLandedCost } from './components/CustomsLandedCost';
+import { ReplenishmentIntelligence } from './components/ReplenishmentIntelligence';
 
 import { 
   InventoryItem, 
@@ -453,7 +454,7 @@ export default function App() {
   };
 
   // --- UI Navigation ---
-  const [activeTab, setActiveTab] = useState<'dashboard' | 'shipping' | 'customs' | 'inventory' | 'map' | 'history' | 'suppliers' | 'settings'>('dashboard');
+  const [activeTab, setActiveTab] = useState<'dashboard' | 'shipping' | 'customs' | 'inventory' | 'replenishment' | 'map' | 'history' | 'suppliers' | 'settings'>('dashboard');
   const [historySubTab, setHistorySubTab] = useState<'movements' | 'dispatches' | 'audit'>('movements');
 
   // --- Search & Filter States ---
@@ -1927,6 +1928,22 @@ export default function App() {
                 )}
               </button>
 
+              <button
+                id="btn_nav_replenishment"
+                onClick={() => setActiveTab('replenishment')}
+                className={`w-full flex items-center justify-between px-4 py-3 rounded-xl text-sm font-semibold transition-all duration-200 group ${
+                  activeTab === 'replenishment'
+                    ? 'bg-gradient-to-r from-amber-500/18 to-[#0A86FF]/10 text-white border border-amber-500/25'
+                    : 'text-slate-400 hover:bg-white/[0.045] hover:text-white border border-transparent'
+                }`}
+              >
+                <div className="flex items-center gap-3">
+                  <Activity className={`h-4.5 w-4.5 ${activeTab === 'replenishment' ? 'text-amber-300' : 'text-slate-400 group-hover:text-amber-300'}`} />
+                  <span>Replenishment Intelligence</span>
+                </div>
+                <ChevronRight className="h-4 w-4 opacity-40 group-hover:opacity-100 transition-opacity" />
+              </button>
+
               <button 
                 id="btn_nav_map"
                 onClick={() => setActiveTab('map')}
@@ -2058,6 +2075,7 @@ export default function App() {
                 {activeTab === 'shipping' && 'Shipping Control Tower'}
                 {activeTab === 'customs' && 'Caribbean Duties & Landed Cost'}
                 {activeTab === 'inventory' && 'Stock Directory & Inventory Control'}
+                {activeTab === 'replenishment' && 'Replenishment Intelligence'}
                 {activeTab === 'map' && 'Location Mapping & Bay Allocation'}
                 {activeTab === 'history' && 'Stock Movement & Audit History'}
                 {activeTab === 'suppliers' && 'Suppliers & Procurement'}
@@ -2068,6 +2086,7 @@ export default function App() {
                 {activeTab === 'shipping' && 'Track inbound and outbound shipments, carrier events, ETAs, customs stages and exceptions in one view.'}
                 {activeTab === 'customs' && 'Estimate import duties, taxes, clearance costs and true landed cost using verified effective-dated rules.'}
                 {activeTab === 'inventory' && 'Browse, search, edit, and quickly log inbound shipments or outbound customer orders.'}
+                {activeTab === 'replenishment' && 'Forecast stockouts using actual demand, inbound stock, supplier lead time, freight, customs and safety stock.'}
                 {activeTab === 'map' && 'Interactive rack layout of specific aisles, shelves and bin allocations. Occupancy heatmap.'}
                 {activeTab === 'history' && 'Comprehensive historical audit logs of item receipts, shipments, safety dispenses, and disposals.'}
                 {activeTab === 'suppliers' && 'Group low stock elements by suppliers and automatically transmit mock purchase order requests.'}
@@ -2118,6 +2137,14 @@ export default function App() {
 
             {activeTab === 'customs' && token && (
               <CustomsLandedCost token={token} />
+            )}
+
+            {activeTab === 'replenishment' && token && (
+              <ReplenishmentIntelligence
+                token={token}
+                suppliers={suppliers}
+                canManage={userRole === 'admin' || userRole === 'manager'}
+              />
             )}
 
             {/* 1. DASHBOARD VIEW PANEL */}
