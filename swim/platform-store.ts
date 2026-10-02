@@ -14,7 +14,7 @@ export async function initSwimPlatformStore(): Promise<void> {
   await swimDbQuery(`
     CREATE TABLE IF NOT EXISTS swim_events (
       id VARCHAR(80) PRIMARY KEY,
-      warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
+      warehouse_id VARCHAR(50) NOT NULL,
       organization_id VARCHAR(80),
       event_type VARCHAR(120) NOT NULL,
       category VARCHAR(40) NOT NULL,
@@ -78,7 +78,8 @@ export async function initSwimPlatformStore(): Promise<void> {
       notes TEXT,
       created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      UNIQUE(warehouse_id, reference)
+      UNIQUE(warehouse_id, reference),
+      UNIQUE(warehouse_id, id)
     )
   `);
   await swimDbQuery(`CREATE INDEX IF NOT EXISTS idx_swim_shipments_tenant_status ON swim_shipments(warehouse_id, status, updated_at DESC)`);
@@ -87,7 +88,9 @@ export async function initSwimPlatformStore(): Promise<void> {
     CREATE TABLE IF NOT EXISTS swim_tracking_checkpoints (
       id VARCHAR(80) PRIMARY KEY,
       warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
-      shipment_id VARCHAR(80) NOT NULL REFERENCES swim_shipments(id) ON DELETE CASCADE,
+      shipment_id VARCHAR(80) NOT NULL,
+      FOREIGN KEY (warehouse_id, shipment_id)
+        REFERENCES swim_shipments(warehouse_id, id) ON DELETE CASCADE,
       tracking_number VARCHAR(120) NOT NULL,
       carrier_code VARCHAR(40) NOT NULL,
       status VARCHAR(40) NOT NULL,
@@ -108,8 +111,10 @@ export async function initSwimPlatformStore(): Promise<void> {
     CREATE TABLE IF NOT EXISTS swim_tracking_registrations (
       id VARCHAR(80) PRIMARY KEY,
       warehouse_id VARCHAR(50) NOT NULL REFERENCES warehouses(id) ON DELETE CASCADE,
-      shipment_id VARCHAR(80) NOT NULL REFERENCES swim_shipments(id) ON DELETE CASCADE,
+      shipment_id VARCHAR(80) NOT NULL,
       provider_code VARCHAR(40) NOT NULL,
+      FOREIGN KEY (warehouse_id, shipment_id)
+        REFERENCES swim_shipments(warehouse_id, id) ON DELETE CASCADE,
       provider_tracking_id VARCHAR(160) NOT NULL,
       tracking_number VARCHAR(120) NOT NULL,
       carrier_code VARCHAR(40),
@@ -290,6 +295,47 @@ export async function listShipments(warehouseId: string): Promise<ShipmentRecord
     [requireSafeId(warehouseId, 'warehouseId')]
   );
   return result.rows.map(mapShipment);
+}
+
+export async function getShipment(
+  warehouseId: string,
+  shipmentId: string
+): Promise<ShipmentRecord | undefined> {
+  const result = await swimDbQuery<any>(
+    `SELECT * FROM swim_shipments WHERE warehouse_id = $1 AND id = $2 LIMIT 1`,
+    [requireSafeId(warehouseId, 'warehouseId'), requireSafeId(shipmentId, 'shipmentId')]
+  );
+  return result.rows[0] ? mapShipment(result.rows[0]) : undefined;
+}
+
+export async function updateShipmentTrackingState(
+  warehouseId: string,
+  shipmentId: string,
+  status: ShipmentRecord['status'],
+  carrierCode?: string,
+  masterTrackingNumber?: string,
+  estimatedArrival?: string
+): Promise<ShipmentRecord | undefined> {
+  const result = await swimDbQuery<any>(
+    `UPDATE swim_shipments
+       SET status = $3,
+           carrier_code = COALESCE($4, carrier_code),
+           master_tracking_number = COALESCE($5, master_tracking_number),
+           estimated_arrival = COALESCE($6::timestamptz, estimated_arrival),
+           actual_arrival = CASE WHEN $3 = 'DELIVERED' THEN COALESCE(actual_arrival, CURRENT_TIMESTAMP) ELSE actual_arrival END,
+           updated_at = CURRENT_TIMESTAMP
+     WHERE warehouse_id = $1 AND id = $2
+     RETURNING *`,
+    [
+      requireSafeId(warehouseId, 'warehouseId'),
+      requireSafeId(shipmentId, 'shipmentId'),
+      status,
+      carrierCode || null,
+      masterTrackingNumber || null,
+      estimatedArrival || null
+    ]
+  );
+  return result.rows[0] ? mapShipment(result.rows[0]) : undefined;
 }
 
 export async function addTrackingCheckpoint(checkpoint: TrackingCheckpoint): Promise<TrackingCheckpoint> {
